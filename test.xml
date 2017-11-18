@@ -1,0 +1,30 @@
+<big_container>
+<person age="16" eye_color="blue">
+<name>sally</name>
+<lastname>kellerman</lastname>
+<hobby>skiing</hobby>
+</person>
+<person age="16">
+<name>sally</name>
+<lastname>mott</lastname>
+<hobby>swimming</hobby>
+</person>
+<person>
+<name>sally</name>
+<lastname>supado</lastname>
+<hobby>world domination</hobby>
+</person>
+<person>
+<name>mike</name>
+<lastname>nawakido</lastname>
+<hobby>fishing</hobby>
+</person>
+<person age="999">
+<name>tom</name>
+<lastname>blabbo</lastname>
+<hobby>sleeping</hobby>
+</person>
+<tag1><tag2><tag3><tag4><tag5><name>deep one</name></tag5></tag4></tag3></tag2></tag1>
+<tag1><tag2><tag3><tag4><tag5><notaname>abyss</notaname></tag5></tag4></tag3></tag2></tag1>
+<tag4><tag5><name>shallow one</name></tag5></tag4>
+</big_countainer>

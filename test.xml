@@ -27,4 +27,14 @@
 <tag1><tag2><tag3><tag4><tag5><name>deep one</name></tag5></tag4></tag3></tag2></tag1>
 <tag1><tag2><tag3><tag4><tag5><notaname>abyss</notaname></tag5></tag4></tag3></tag2></tag1>
 <tag4><tag5><name>shallow one</name></tag5></tag4>
-</big_countainer>
+<a id="0"><b><c>tagvalue1</c></b></a>
+<a id="1"><b><c>tagvalue1</c></b></a>
+<a id="2"><b att1="attvalue1"><c>tagvalue1</c></b></a>
+<a id="3"><b att1="attvalue2"><c>tagvalue2</c></b></a>
+<a id="4"><b att1="attvalue3"><c>tagvalue2</c></b></a>
+<a id="5"><b><c att2="attvalue4">tagvalue2</c></b></a>
+<a id="6"><b><c att2="attvalue5">tagvalue3</c></b></a>
+<a id="7"><b><c att2="attvalue6">tagvalue3</c></b></a>
+<a id="8"><b><c>tagvalue3</c></b></a>
+<a id="9"><b><c>tagvalue4</c></b></a>
+</big_container>

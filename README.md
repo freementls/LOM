@@ -1,4 +1,13 @@
 # LOM
+
+Version 0.2
+
+If you are manipulating XML with PHP then this is the code you want. LOM used to use array-based internal data structure but now uses string-based internal data structure. With this type of optimization it's about 10 times faster. Another improvement is that the external data structure (that which is accesible as the results of queries) is now the more familiar (to users of PHP regular expressions) string-offset pairs.
+
+See test.php for usage examples.
+
+Version 0.1
+
 LOM is an XML querying language; or slang, if you prefer. In terms of other querying languages: this one would be said to use a 
 dynamic, rather than static, context. So query results depend on code-wise previous query results. Basically, it allows a coder 
 to write code more lazily by having LOM assume that something not very specifically referenced should be looked for within the most relevant 

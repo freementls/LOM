@@ -6,6 +6,10 @@ If you are manipulating XML with PHP then this is the code you want. LOM used to
 
 See test.php for usage examples.
 
+To see an example of what's possible with LOM, check out a game made using it:
+
+http://flaurora-sonora.000webhostapp.com/infini/bbalof.php?scenario=0
+
 Version 0.1
 
 LOM is an XML querying language; or slang, if you prefer. In terms of other querying languages: this one would be said to use a 

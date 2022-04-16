@@ -1,5 +1,9 @@
 # LOM
 
+Version 0.4
+
+This is an excellent version. Writing works properly now. It's now fractal and refinements could still be made. Forked from <a href="https://github.com/flaurora-sonora/LOM">LOM</a>.
+
 Version 0.2
 
 If you are manipulating XML with PHP then this is the code you want. LOM used to use array-based internal data structure but now uses string-based internal data structure. With this type of optimization it's about 10 times faster. Another improvement is that the external data structure (that which is accesible as the results of queries) is now the more familiar (to users of PHP regular expressions) string-offset pairs.

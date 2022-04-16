@@ -25,7 +25,7 @@ print('& in the query string acts as a logical and to select by more than one ta
 print('person with name sally and lastname blabbo (should be 0 matches): ');var_dump($O->_('.person_name=sally&lastname=blabbo'));
 print('age of $person variable (should be 999): ');var_dump($O->get_attribute('age', $person));
 print('hobby of $person variable (should be sleeping): ');var_dump($O->_('hobby', $person));
-print('setting hobby to waking up (should say waking up): ');var_dump($O->set('hobby', 'waking up'));
+print('setting hobby to waking up (should be true): ');var_dump($O->set('hobby', 'waking up'));
 print('hobby (should be waking up): ');var_dump($O->_('hobby'));
 // reset the change after testing
 //$O->set('hobby', 'sleeping');

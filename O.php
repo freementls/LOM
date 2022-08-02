@@ -14,6 +14,19 @@
 
 // worth noting that XML files being processed by LOM shouldn't have "true" or "false" in tags since LOM is unable to discern these properly when tagvalues in in queries as cast as strings?
 
+// should handle operators other than = such as < > != ~= not equal etc all the operators from CSS, jquery, PHP, XSLT selectors in version 0.5
+// https://www.php.net/manual/en/language.operators.php
+// https://www.w3schools.com/jquery/jquery_ref_selectors.asp
+// https://www.w3schools.com/cssref/css_selectors.asp
+// https://www.w3schools.com/xml/xpath_syntax.asp
+
+/* whether to properly percolate $offset_depths through where needed instead of jsut using $this->offset_depths all the time, needs attention
+if($offset_depths == false) {
+		//print('creating $offset_depths in expand()<br />' . PHP_EOL);
+		// offset_depths can be off by 1 (probably -1) when inserting into text rather than at a set offset_depth but this isn't a problem since offset_depths stays inside expand() and the error doesn't propagate
+		//$offset_depths = $this->offset_depths;
+	*/
+
 class O {
 
 function __construct($file_to_parse, $use_context = true, $array_blocks = false, $array_inline = false) {
@@ -52,7 +65,8 @@ function __construct($file_to_parse, $use_context = true, $array_blocks = false,
 	$this->file = $file_to_parse;
 	if(file_exists($file_to_parse)) {
 		$this->code = file_get_contents($file_to_parse);
-	} elseif(O::file_extension($file_to_parse) === '.xml' || O::file_extension($file_to_parse) === '.html') { // others?
+	//} elseif(O::file_extension($file_to_parse) === '.xml' || O::file_extension($file_to_parse) === '.html') { // others?
+	} elseif(O::file_extension($file_to_parse) === 'xml' || O::file_extension($file_to_parse) === 'html') { // others?
 		$this->code = '';
 		// assume it will be saved later? no. just properly work from the no found contents.
 	} else {
@@ -65,7 +79,7 @@ function __construct($file_to_parse, $use_context = true, $array_blocks = false,
 	//print('$this->must_check_for_self_closing, $this->must_check_for_non_parsed_character_data, $this->must_check_for_comment, $this->must_check_for_programming_instruction, $this->must_check_for_ASP: ');var_dump($this->must_check_for_self_closing, $this->must_check_for_non_parsed_character_data, $this->must_check_for_comment, $this->must_check_for_programming_instruction, $this->must_check_for_ASP);
 	//$this->zero_offsets = array();
 	O::set_offset_depths();
-	//print('$this->offset_depths after set_offset_depths(): ');O::var_dump_full($this->offset_depths);exit(0);
+	//print('$this->offset_depths after set_offset_depths(): ');O::var_dump_full($this->offset_depths);
 	O::set_LOM_operators();
 	//O::debug();
 }
@@ -118,7 +132,7 @@ function set_offset_depths() {
 	return true;
 	/*$depth = 0;
 	//$this->offset_depths = array();
-	//$this->offset_depths = array(0 => 0); // good thinking for initialization but don't do this because adjust_offset_depths() only expect the depths of offsets with '<' to be in the array
+	//$this->offset_depths = array(0 => 0); // good thinking for initialization but don't do this because adjust_offsets() only expect the depths of offsets with '<' to be in the array
 	//preg_match_all('/</', $this->code, $matches, PREG_OFFSET_CAPTURE);
 	//foreach($matches[0] as $index => $value) {
 	//	$this->offset_depths[$value[1]] = $depth;
@@ -133,25 +147,25 @@ function set_offset_depths() {
 	while(($position = strpos($this->code, '<', $position + 1)) !== false) {
 		//print('$position: ');var_dump($position);
 		if($this->code[$position + 1] === '/') { // closing tag
-			//print('closing tag at position: ' . $position . '<br />');
+			//print('closing tag at position: ' . $position . '<br />' . PHP_EOL);
 			$depth--;
 		} elseif($this->must_check_for_self_closing && $this->code[strpos($this->code, '>', $position + 1) - 1] === '/') { // self-closing tag
-			//print('self-closing tag at position: ' . $position . '<br />');
+			//print('self-closing tag at position: ' . $position . '<br />' . PHP_EOL);
 			$this->offset_depths[$position] = $depth;
 		} elseif($this->must_check_for_non_parsed_character_data && substr($this->code, $position + 1, 8) === '![CDATA[') { // non-parsed character data
-			//print('non-parsed character data at position: ' . $position . '<br />');
+			//print('non-parsed character data at position: ' . $position . '<br />' . PHP_EOL);
 			$this->offset_depths[$position] = $depth;
 		} elseif($this->must_check_for_comment && substr($this->code, $position + 1, 3) === '!--') { // comment
-			//print('comment at position: ' . $position . '<br />');
+			//print('comment at position: ' . $position . '<br />' . PHP_EOL);
 			$this->offset_depths[$position] = $depth;
 		} elseif($this->must_check_for_programming_instruction && $this->code[$position + 1] === '?') { // programming instruction
-			//print('programming instruction at position: ' . $position . '<br />');
+			//print('programming instruction at position: ' . $position . '<br />' . PHP_EOL);
 			$this->offset_depths[$position] = $depth;
 		} elseif($this->must_check_for_ASP && $this->code[$position + 1] === '%') { // ASP
-			//print('ASP at position: ' . $position . '<br />');
+			//print('ASP at position: ' . $position . '<br />' . PHP_EOL);
 			$this->offset_depths[$position] = $depth;
 		} else { // opening tag
-			//print('opening tag at position: ' . $position . '<br />');
+			//print('opening tag at position: ' . $position . '<br />' . PHP_EOL);
 			$this->offset_depths[$position] = $depth;
 			$depth++;
 		}
@@ -172,7 +186,7 @@ function set_offset_depths() {
 	*/
 }
 
-function get_offset_depths_of_selector_matches($selector_matches) {
+function get_offset_depths_of_matches($selector_matches) {
 	$offset_depths = array();
 	foreach($selector_matches as $index => $value) {
 		$offset_depths[] = O::get_offset_depths($value[0], $value[1], O::depth($value[1]));
@@ -197,6 +211,7 @@ function get_offset_depths($code = false, $offset_to_add = 0, $depth_to_add = 0,
 		return $this->offset_depths;
 	}
 	//print('$code, $offset_to_add, $depth_to_add at start of get_offset_depths: ');var_dump($code, $offset_to_add, $depth_to_add);
+	//print('substr($code, 9900, 600): ');var_dump(substr($code, 9900, 600)); // debug
 	$depth = 0;
 	$offset_depths = array();
 	$position = -1;
@@ -209,12 +224,20 @@ function get_offset_depths($code = false, $offset_to_add = 0, $depth_to_add = 0,
 			$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
 		} elseif($this->must_check_for_non_parsed_character_data && substr($code, $position + 1, 8) === '![CDATA[') { // non-parsed character data
 			$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
+			$position = strpos($code, ']]>', $position + 1) + 3;
+			continue;
 		} elseif($this->must_check_for_comment && substr($code, $position + 1, 3) === '!--') { // comment
 			$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
+			$position = strpos($code, '-->', $position + 1) + 3;
+			continue;
 		} elseif($this->must_check_for_programming_instruction && $code[$position + 1] === '?') { // programming instruction
 			$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
+			$position = strpos($code, '?>', $position + 1) + 2;
+			continue;
 		} elseif($this->must_check_for_ASP && $code[$position + 1] === '%') { // ASP
 			$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
+			$position = strpos($code, '%>', $position + 1) + 2;
+			continue;
 		} else { // opening tag
 			$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
 			$depth++;
@@ -243,26 +266,42 @@ function offset_depths($code = false, $offset_to_add = 0, $depth_to_add = 0) { /
 	return O::get_offset_depths($code, $offset_to_add, $depth_to_add);
 }
 
-function replace_offset_depths($old_value, $new_value, $offset, $depth_of_offset = 0) {
+function replace_offsets_and_depths($old_value, $new_value, $offset, $offset_adjust, $depth_of_offset = 0) {
 	// could check if old_value === new_value but it's a waste since there's a condition on the only place this function is called with $this->string_operation_made_a_change
+	// $this->variables do not keep their own separate offset_depths, nor does included_array
 	if($depth_of_offset == false) {
 		$depth_of_offset = 0;
 	}
-	//print('$old_value, $new_value, $offset, $depth_of_offset at start of replace_offset_depths(): ');var_dump($old_value, $new_value, $offset, $depth_of_offset);
+	//print('$old_value, $new_value, $offset, $depth_of_offset at start of replace_offsets_and_depths(): ');var_dump($old_value, $new_value, $offset, $depth_of_offset);
 	$old_value_offset_depths = O::get_offset_depths($old_value, $offset, $depth_of_offset);
+	$new_value_offset_depths = O::get_offset_depths($new_value, $offset, $depth_of_offset, true); // parameter specifying that new values are being written
+	$this->offset_depths = O::internal_replace_offsets_and_depths($this->offset_depths, $offset, $offset_adjust, $old_value_offset_depths, $new_value_offset_depths);
+	foreach($this->context as $context_index => $context_value) {
+		//print('here rep002<br />' . PHP_EOL);
+		if($context_value[3] === false) { // false here means use $this->offset_depths
+			continue;
+		}
+		foreach($this->context[$context_index][3] as $context3_index => $context3_value) {
+			if($context3_value === false) { // false here means use $this->offset_depths
+				continue;
+			}
+			$this->context[$context_index][3][$context3_index] = O::internal_replace_offsets_and_depths($this->context[$context_index][3][$context3_index], $offset, $offset_adjust, $old_value_offset_depths, $new_value_offset_depths);
+		}
+	}
+
 	//print('$old_value_offset_depths: ');var_dump($old_value_offset_depths);
-	//print('$this->offset_depths before replace in replace_offset_depths(): ');var_dump($this->offset_depths);
-	foreach($old_value_offset_depths as $old_value_offset => $old_value_depth) {
-		//print('here rep001<br />');
+	//print('$this->offset_depths before replace in replace_offsets_and_depths(): ');var_dump($this->offset_depths);
+	/*foreach($old_value_offset_depths as $old_value_offset => $old_value_depth) {
+		//print('here rep001<br />' . PHP_EOL);
 		unset($this->offset_depths[$old_value_offset]);
 		foreach($this->context as $context_index => $context_value) {
-			//print('here rep002<br />');
+			//print('here rep002<br />' . PHP_EOL);
 			if($context_value[3] === false) { // false here means use $this->offset_depths
 				continue;
 			}
 			foreach($context_value[1] as $context1_index => $context1_value) {
 				if($context1_value[0] <= $offset && $context1_value[0] + $context1_value[1] > $offset) {
-					foreach($this->context[$context_index][3] as $context3_index => $context3_value) {	
+					foreach($this->context[$context_index][3] as $context3_index => $context3_value) {
 						if($context3_value === false) { // false here means use $this->offset_depths
 							continue;
 						}
@@ -272,22 +311,21 @@ function replace_offset_depths($old_value, $new_value, $offset, $depth_of_offset
 			}
 		}
 	}
-	$new_value_offset_depths = O::get_offset_depths($new_value, $offset, $depth_of_offset, true); // parameter specifying that new values are being written
 	//print('$new_value_offset_depths: ');var_dump($new_value_offset_depths);
 	foreach($new_value_offset_depths as $new_value_offset => $new_value_depth) {
-		//print('here rep003<br />');
+		//print('here rep003<br />' . PHP_EOL);
 		$this->offset_depths[$new_value_offset] = $new_value_depth;
 		foreach($this->context as $context_index => $context_value) {
-			//print('here rep004<br />');
+			//print('here rep004<br />' . PHP_EOL);
 			if($context_value[3] === false) { // false here means use $this->offset_depths
 				continue;
 			}
 			foreach($context_value[1] as $context1_index => $context1_value) {
-				//print('here rep005<br />');
+				//print('here rep005<br />' . PHP_EOL);
 				if($context1_value[0] <= $offset && $context1_value[0] + $context1_value[1] > $offset) {
-					//print('here rep006<br />');
+					//print('here rep006<br />' . PHP_EOL);
 					foreach($this->context[$context_index][3] as $context3_index => $context3_value) {	
-						//print('here rep007<br />');
+						//print('here rep007<br />' . PHP_EOL);
 						if($context3_value === false) { // false here means use $this->offset_depths
 							continue;
 						}
@@ -298,70 +336,132 @@ function replace_offset_depths($old_value, $new_value, $offset, $depth_of_offset
 			}
 		}
 	}
-	ksort($this->offset_depths);
-	//print('$this->offset_depths after replace in replace_offset_depths(): ');var_dump($this->offset_depths);
+	ksort($this->offset_depths);*/
+	//print('$this->offset_depths after replace in replace_offsets_and_depths(): ');var_dump($this->offset_depths);
 	// debug
 	if($this->debug) { // consider validate()
 		/*$last_offset = 0;
 		foreach($this->offset_depths as $offset => $depth) {
-			//print($offset . ': ' . htmlentities(substr($this->code, $last_offset, $offset - $last_offset)) . '<br />');
+			//print($offset . ': ' . htmlentities(substr($this->code, $last_offset, $offset - $last_offset)) . '<br />' . PHP_EOL);
 			if($this->code[$offset] !== '<' && $this->code[$offset - 1] !== '>') {
 				print('$this->code, $this->offset_depths, $offset, $depth: ');O::var_dump_full($this->code, $this->offset_depths, $offset, $depth);
-				O::fatal_error('$this->offset_depths (in replace_offset_depths) should never point to anything other than &lt; or text right after &gt;');
+				O::fatal_error('$this->offset_depths (in replace_offsets_and_depths) should never point to anything other than &lt; or text right after &gt;');
 			}
 			$last_offset = $offset;
 		}*/
 	}
-	//print('$this->offset_depths after adjustment in replace_offset_depths: ');O::var_dump_full($this->offset_depths);
+	//print('$this->offset_depths after adjustment in replace_offsets_and_depths: ');O::var_dump_full($this->offset_depths);
 	return true;
 }
 
-function adjust_offset_depths($offset, $offset_adjust, $included_array = false) {
+private function internal_replace_offsets_and_depths($offset_depths, $offset, $offset_adjust, $old_value_offset_depths, $new_value_offset_depths) {
+	/*end($offset_depths);
+	//print('key($offset_depths) after end: ');var_dump(key($offset_depths));
+	$prev_result = true;
+	while($prev_result !== false) {
+		//print('$prev_result: ');var_dump($prev_result);
+		if(key($offset_depths) >= $offset) {
+			//print('her278487<br />' . PHP_EOL);
+			if(key($offset_depths) + $offset_adjust >= $offset) {
+				$offset_depths[key($offset_depths) + $offset_adjust] = current($offset_depths);
+			} // delete offsets when offset_adjust is negative and they are within its magnitude
+			// may leave artifacts from deleting or changing values in the offset_depths array but this seems insurmoutable with how LOM is currently coded... MAAAAYBE version 0.9 ;p
+			unset($offset_depths[key($offset_depths)]);
+		} else {
+			//print('her278488<br />' . PHP_EOL);
+			break;
+		}
+		//print('her278489<br />' . PHP_EOL);
+		$prev_result = prev($offset_depths);
+		//print('$prev_result2: ');var_dump($prev_result);
+	}
+	ksort($offset_depths);*/
+	//print('$offset, $offset_adjust, $old_value_offset_depths, $new_value_offset_depths in internal_replace_offsets_and_depths: ');var_dump($offset, $offset_adjust, $old_value_offset_depths, $new_value_offset_depths);
+	$initial_offset_depths = $offset_depths; // debug
+	foreach($old_value_offset_depths as $old_value_offset => $old_value_depth) {
+		unset($offset_depths[$old_value_offset]);
+	}
+	if($this->offsets_need_adjusting) {
+		if($offset_adjust > 0) { // very important to go in reverse order
+			end($offset_depths);
+			//print('key($offset_depths) after end: ');var_dump(key($offset_depths));
+			$prev_result = true;
+			while($prev_result !== false) {
+				//print('$prev_result: ');var_dump($prev_result);
+				//if(key($offset_depths) >= $offset) {
+				if(key($offset_depths) > $offset) { // only subsequent offsets are affected
+					$offset_depths[key($offset_depths) + $offset_adjust] = current($offset_depths);
+					//print('her278487<br />' . PHP_EOL);
+					//if(key($offset_depths) + $offset_adjust === $offset) { // keep if it's not text right after text as a result of deleting intervening offsets
+					//	if($code[key($offset_depths) + $offset_adjust] === '<' || $code[key($offset_depths) + $offset_adjust - 1] === '>') {
+					//		$offset_depths[key($offset_depths) + $offset_adjust] = current($offset_depths);
+					//	}
+					//} elseif(key($offset_depths) + $offset_adjust >= $offset) {
+					//	$offset_depths[key($offset_depths) + $offset_adjust] = current($offset_depths);
+					//} // delete offsets when offset_adjust is negative and they are within its magnitude
+					// may leave artifacts from deleting or changing values in the offset_depths array but this seems insurmoutable with how LOM is currently coded... MAAAAYBE version 0.9 ;p
+					unset($offset_depths[key($offset_depths)]);
+				} else {
+					//print('her278488<br />' . PHP_EOL);
+					break;
+				}
+				//print('her278489<br />' . PHP_EOL);
+				$prev_result = prev($offset_depths);
+				//print('$prev_result2: ');var_dump($prev_result);
+			}
+		} elseif($offset_adjust < 0) { // very important to go in forward order
+			reset($offset_depths);
+			$new_offset_depths = array(); // going forward is apparently quite a bit more difficult than going backwards (because adding elements causes them to be caught later if uncarefully iterating and trying to change values while doing so)!
+			$next_result = true;
+			while($next_result !== false) {
+				if(key($offset_depths) <= $offset) {
+					$new_offset_depths[key($offset_depths)] = current($offset_depths);
+				} elseif(key($offset_depths) > $offset) { // only subsequent offsets are affected
+					$new_offset_depths[key($offset_depths) + $offset_adjust] = current($offset_depths);
+					//unset($offset_depths[key($offset_depths)]);
+				}
+				$next_result = next($offset_depths);
+			}
+			//$offset_depths = array_merge($offset_depths, $new_offset_depths);
+			$offset_depths = $new_offset_depths;
+		}
+	}
+	foreach($new_value_offset_depths as $new_value_offset => $new_value_depth) {
+		$offset_depths[$new_value_offset] = $new_value_depth;
+	}
+	ksort($offset_depths);
+	//if(sizeof($initial_offset_depths) !== sizeof($offset_depths)) { // debug
+	//	print('$initial_offset_depths, $offset_depths: ');var_dump($initial_offset_depths, $offset_depths);
+	//	O::fatal_error('some error in internal_replace_offsets_and_depths; sizes of offset_depths before and after are different...');
+	//}
+	return $offset_depths;
+}
+function adjust_offsets($offset, $offset_adjust, $included_array = false) {
 	if($offset_adjust == 0) {
 		return true;
 	}
-	//print('$offset, $offset_adjust in adjust_offset_depths: ');var_dump($offset, $offset_adjust);
-	//print('$this->offset_depths before adjustment in adjust_offset_depths: ');O::var_dump_full($this->offset_depths);
+	//print('$offset, $offset_adjust in adjust_offsets: ');var_dump($offset, $offset_adjust);
+	//print('$this->offset_depths before adjustment in adjust_offsets: ');O::var_dump_full($this->offset_depths);
 	//if($offset_adjust > 0) {
 		//print('key($this->offset_depths) before end: ');var_dump(key($this->offset_depths));
-		end($this->offset_depths);
-		//print('key($this->offset_depths) after end: ');var_dump(key($this->offset_depths));
-		$prev_result = true;
-		while($prev_result !== false) {
-			//print('$prev_result: ');var_dump($prev_result);
-			if(key($this->offset_depths) >= $offset) {
-				//print('her278487<br />');
-				/*if(key($this->offset_depths) + $offset_adjust === $offset) { // keep if it's not text right after text as a result of deleting intervening offsets
-					if($this->code[key($this->offset_depths) + $offset_adjust] === '<' || $this->code[key($this->offset_depths) + $offset_adjust - 1] === '>') {
-						$this->offset_depths[key($this->offset_depths) + $offset_adjust] = current($this->offset_depths);
-					}
-				} else*/if(key($this->offset_depths) + $offset_adjust >= $offset) {
-					$this->offset_depths[key($this->offset_depths) + $offset_adjust] = current($this->offset_depths);
-				} // delete offsets when offset_adjust is negative and they are within its magnitude
-				// may leave artifacts from deleting or changing values in the offset_depths array but this seems insurmoutable with how LOM is currently coded... MAAAAYBE version 0.9 ;p
-				unset($this->offset_depths[key($this->offset_depths)]);
-			} else {
-				//print('her278488<br />');
-				break;
-			}
-			//print('her278489<br />');
-			$prev_result = prev($this->offset_depths);
-			//print('$prev_result2: ');var_dump($prev_result);
-		}
-		if($this->debug) { // notice that this has the potential to create different results since it's resetting the pointer
-			//end($this->offset_depths);
-			//if(current($this->offset_depths) > 1) {
-			//	print('$this->offset_depths: ');var_dump($this->offset_depths);
-			//	O::fatal_error('last entry of $this->offset_depths > 1 in adjust_offset_depths');
-			//}
-			reset($this->offset_depths);
-			if(sizeof($this->offset_depths) > 0 && current($this->offset_depths) !== 0) {
-				print('$this->offset_depths: ');var_dump($this->offset_depths);
-				O::fatal_error('first entry of $this->offset_depths !== 0 in adjust_offset_depths');
-			}
-		}
+	//	$this->offset_depths = O::internal_replace_offsets_and_depths($this->offset_depths, $offset, $offset_adjust);
+	//	if($this->debug) { // notice that this has the potential to create different results since it's resetting the pointer
+	//		//end($this->offset_depths);
+	//		//if(current($this->offset_depths) > 1) {
+	//		//	print('$this->offset_depths: ');var_dump($this->offset_depths);
+	//		//	O::fatal_error('last entry of $this->offset_depths > 1 in adjust_offsets');
+	//		//}
+	//		reset($this->offset_depths);
+	//		if(sizeof($this->offset_depths) > 0 && current($this->offset_depths) !== 0) {
+	//			print('$this->offset_depths: ');var_dump($this->offset_depths);
+	//			O::fatal_error('first entry of $this->offset_depths !== 0 in adjust_offsets');
+	//		}
+	//	}
 		foreach($this->context as $context_index => $context_value) {
 			//print('$this->context[$context_index] before adjusting offsets: ');var_dump($this->context[$context_index]);
+			if($context_value[3] === false) { // false here means use $this->offset_depths
+				continue;
+			}
 			if($context_value[1] !== false) {
 				foreach($context_value[1] as $context1_index => $context1_value) {
 					//if($context1_value[0] <= $offset && $context1_value[0] + $context1_value[1] > $offset) {
@@ -374,10 +474,19 @@ function adjust_offset_depths($offset, $offset_adjust, $included_array = false) 
 					}
 				}
 			}
-			foreach($this->context[$context_index][3] as $context3_index => $context3_value) {	
-				if($context3_value === false) { // false here means use $this->offset_depths
-					continue;
+			foreach($context_value[2] as $context2_index => $context2_value) {
+				if($context2_value[0] >= $offset) {
+					$this->context[$context_index][2][$context2_index][0] += $offset_adjust;
 				}
+				if($offset >= $context2_value[0] && $offset <= $context2_value[0] + $context2_value[1]) {
+					$this->context[$context_index][2][$context2_index][1] += $offset_adjust;
+				}
+			}
+		//	foreach($this->context[$context_index][3] as $context3_index => $context3_value) {
+		//		if($context3_value === false) { // false here means use $this->offset_depths
+		//			continue;
+		//		}
+		//		$this->context[$context_index][3][$context3_index] = O::internal_replace_offsets_and_depths($this->context[$context_index][3][$context3_index], $offset, $offset_adjust);
 				/*$depth = end($this->context[$context_index][3][$context3_index]);
 				if($offset > key($this->context[$context_index][3][$context3_index])) { // this context entry is unaffected
 					continue 2; // assumes that the context3 entries are in offset order
@@ -394,30 +503,30 @@ function adjust_offset_depths($offset, $offset_adjust, $included_array = false) 
 				}
 				ksort($this->context[$context_index][3][$context3_index]);*/
 				// making a working array maybe something like 20% faster
-				$context_depth_array = $this->context[$context_index][3][$context3_index];
-				end($context_depth_array);
-				if($offset > key($context_depth_array)) { // this context entry is unaffected
-					continue 2; // assumes that the context3 entries are in offset order
-				}
-				//$new_context_depth_array = array();
-				$prev_result = true;
-				while($prev_result !== false) {
-					if(key($context_depth_array) >= $offset) {
-						//$context_depth_array[key($context_depth_array) + $offset_adjust] = current($context_depth_array);
-						if(key($context_depth_array) + $offset_adjust >= $offset) {
-							$context_depth_array[key($context_depth_array) + $offset_adjust] = current($context_depth_array);
-						} // delete offsets when offset_adjust is negative and they are within its magnitude
-						// may leave artifacts from deleting or changing values in the offset_depths array but this seems insurmoutable with how LOM is currently coded... MAAAAYBE version 0.9 ;p
-						unset($context_depth_array[key($context_depth_array)]);
-					} else {
-						//$context_depth_array[key($context_depth_array)] = current($context_depth_array);
-						break;
-					}
-					$prev_result = prev($context_depth_array);
-				}
-				ksort($context_depth_array); // since we are going in reverse order, and partially rewriting values on the fly
-				$this->context[$context_index][3][$context3_index] = $context_depth_array;
-			}
+// 				$context_depth_array = $this->context[$context_index][3][$context3_index];
+// 				end($context_depth_array);
+// 				if($offset > key($context_depth_array)) { // this context entry is unaffected
+// 					continue 2; // assumes that the context3 entries are in offset order
+// 				}
+// 				//$new_context_depth_array = array();
+// 				$prev_result = true;
+// 				while($prev_result !== false) {
+// 					if(key($context_depth_array) >= $offset) {
+// 						//$context_depth_array[key($context_depth_array) + $offset_adjust] = current($context_depth_array);
+// 						if(key($context_depth_array) + $offset_adjust >= $offset) {
+// 							$context_depth_array[key($context_depth_array) + $offset_adjust] = current($context_depth_array);
+// 						} // delete offsets when offset_adjust is negative and they are within its magnitude
+// 						// may leave artifacts from deleting or changing values in the offset_depths array but this seems insurmoutable with how LOM is currently coded... MAAAAYBE version 0.9 ;p
+// 						unset($context_depth_array[key($context_depth_array)]);
+// 					} else {
+// 						//$context_depth_array[key($context_depth_array)] = current($context_depth_array);
+// 						break;
+// 					}
+// 					$prev_result = prev($context_depth_array);
+// 				}
+// 				ksort($context_depth_array); // since we are going in reverse order, and partially rewriting values on the fly
+// 				$this->context[$context_index][3][$context3_index] = $context_depth_array;
+		//	}
 			//print('$this->context[$context_index] after adjusting offsets: ');var_dump($this->context[$context_index]);
 		}
 	/*} else {
@@ -434,7 +543,7 @@ function adjust_offset_depths($offset, $offset_adjust, $included_array = false) 
 			}
 		}
 	}*/
-	/*foreach($this->variables as $variable_index => $variable_value) {
+	foreach($this->variables as $variable_index => $variable_value) {
 		if(is_array($this->variables[$variable_index])) {
 			if(is_array($this->variables[$variable_index][0])) {
 				foreach($this->variables[$variable_index] as $index => $value) {
@@ -448,44 +557,44 @@ function adjust_offset_depths($offset, $offset_adjust, $included_array = false) 
 				}
 			}
 		}
-	}*/
+	}
 	if(is_array($included_array)) {
-		//print('here4569703<br />');
+		//print('here4569703<br />' . PHP_EOL);
 		if(is_array($included_array[0])) {
-			//print('here4569704<br />');
+			//print('here4569704<br />' . PHP_EOL);
 			foreach($included_array as $index => $value) {
-				//print('here4569705<br />');
-				//print('here4569707<br />');
+				//print('here4569705<br />' . PHP_EOL);
+				//print('here4569707<br />' . PHP_EOL);
 				if($included_array[$index][1] >= $offset) {
-					//print('here4569708<br />');
+					//print('here4569708<br />' . PHP_EOL);
 					$included_array[$index][1] += $offset_adjust;
 				}
 			}
 		} else {
-			//print('here4569709<br />');
+			//print('here4569709<br />' . PHP_EOL);
 			//foreach($included_array as $index => $value) {
 			//	$included_array[$index] = $new_value;
 			//}
 			if($included_array[1] >= $offset) {
-				//print('here4569711<br />');
+				//print('here4569711<br />' . PHP_EOL);
 				$included_array[1] += $offset_adjust;
 			}
 		}
 	}
-	ksort($this->offset_depths);
+//	ksort($this->offset_depths);
 	// debug
 	if($this->debug) { // consider validate()
 		/*$last_offset = 0;
 		foreach($this->offset_depths as $offset => $depth) {
-			//print($offset . ': ' . htmlentities(substr($this->code, $last_offset, $offset - $last_offset)) . '<br />');
+			//print($offset . ': ' . htmlentities(substr($this->code, $last_offset, $offset - $last_offset)) . '<br />' . PHP_EOL);
 			if($this->code[$offset] !== '<' && $this->code[$offset - 1] !== '>') {
 				print('$this->code, $this->offset_depths, $offset, $depth: ');O::var_dump_full($this->code, $this->offset_depths, $offset, $depth);
-				O::fatal_error('$this->offset_depths (in adjust_offset_depths) should never point to anything other than &lt; or text right after &gt;');
+				O::fatal_error('$this->offset_depths (in adjust_offsets) should never point to anything other than &lt; or text right after &gt;');
 			}
 			$last_offset = $offset;
 		}*/
 	}
-	//print('$this->offset_depths after adjustment in adjust_offset_depths: ');O::var_dump_full($this->offset_depths);
+	//print('$this->offset_depths after adjustment in adjust_offsets: ');O::var_dump_full($this->offset_depths);
 	return $included_array;
 }
 
@@ -687,11 +796,11 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 	}
 	//print('$matching_array, sizeof($matching_array) in get: ');var_dump($matching_array, sizeof($matching_array));
 	//$used_context = false;
-	//print('here374859---0000<br />');
+	//print('here374859---0000<br />' . PHP_EOL);
 	//print('$selector, $matching_array before selector type determination in get: ');var_dump($selector, $matching_array);
 	//print('$selector at start of get: ');var_dump($selector);
 	if(is_numeric($selector)) { // treat it as an offset
-		//print('is_numeric($selector) in get<br />');
+		//print('is_numeric($selector) in get<br />' . PHP_EOL);
 		$selector = (int)$selector;
 	//	if($this->LOM[$selector][0] === 0) { // assume that if it's text we want the text value
 			//$selector_matches = array($matching_array[$selector][1]);
@@ -721,20 +830,20 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 	//	}
 		//$add_to_context = false;
 	} elseif(is_string($selector)) { // do XPath-type processing
-		//print('is_string($selector) in get<br />');
+		//print('is_string($selector) in get<br />' . PHP_EOL);
 		$normalized_selector = O::normalize_selector($selector);
-		//print('here26344<br />');
+		//print('here26344<br />' . PHP_EOL);
 		$selector_matches = array();
 		// check the context first
 		if($this->use_context && !$ignore_context) {
 			$context_counter = sizeof($this->context) - 1;
 			//print('$this->context at the start of is_string($selector) in get: ');O::var_dump_full($this->context);
 			while($context_counter > -1 && sizeof($selector_matches) === 0 && !is_string($selector_matches)) {
-				//print('looking in context ($context_counter is ' . $context_counter . ') for selector_matches<br />');
+				//print('looking in context ($context_counter is ' . $context_counter . ') for selector_matches<br />' . PHP_EOL);
 				//print('$normalized_selector, $this->context[$context_counter][0], $matching_array: ');var_dump($normalized_selector, $this->context[$context_counter][0], $matching_array);
 				$matching_array_context_array = O::context_array($matching_array);
 				if($normalized_selector === $this->context[$context_counter][0] && ($matching_array === false || $matching_array_context_array === $this->context[$context_counter][1])) {
-					//print('found a match by same selector and $this->context[$context_counter][1]<br />');
+					//print('found a match by same selector and $this->context[$context_counter][1]<br />' . PHP_EOL);
 					//print('found a match from context $this->context[$context_counter][0], $this->context[$context_counter][1], $this->context[$context_counter][2], $this->context[$context_counter][3]: ');var_dump($this->context[$context_counter][0], $this->context[$context_counter][1], $this->context[$context_counter][2], $this->context[$context_counter][3]);
 					//print('$this->context overview: ');O::var_dump_short($this->context);
 					//if(is_array($this->context[$context_counter][2])) {
@@ -772,26 +881,26 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 					}
 					return $this->context[$context_counter][3];*/
 				} elseif(is_array($matching_array) && sizeof($matching_array) > 0) { // don't look for anything other than exact matches in the context if a matching_array has been provided
-					//print('skipping this context entry since matching array was provided but not matched<br />');
+					//print('skipping this context entry since matching array was provided but not matched<br />' . PHP_EOL);
 					//print('O::context_array($matching_array), $this->context[$context_counter][2]: ');var_dump(O::context_array($matching_array), $this->context[$context_counter][2]);
 					if($matching_array_context_array === $this->context[$context_counter][2]) {
-						//print('found $offset_depths for this matching array from context<br />');
+						//print('found $offset_depths for this matching array from context<br />' . PHP_EOL);
 						$offset_depths = $this->context[$context_counter][3];
 						break;
 					}
 					if(sizeof($matching_array_context_array) === 1) {
 						foreach($this->context[$context_counter][2] as $context_index2 => $context_value2) {
 							if($matching_array_context_array[0] === $this->context[$context_counter][2][$context_index2]) {
-								//print('found $offset_depths for this matching array from an element in context<br />');
+								//print('found $offset_depths for this matching array from an element in context<br />' . PHP_EOL);
 								$offset_depths = array($this->context[$context_counter][3][$context_index2]);
 								break;
 							}
 						}
 					}
 				} /*elseif(!is_array($this->context[$context_counter][3])) { // skip context entries with only a single value
-					print('here26349<br />');
+					print('here26349<br />' . PHP_EOL);
 				} */elseif($matching_array === false) {
-					//print('$matching_array === false<br />');
+					//print('$matching_array === false<br />' . PHP_EOL);
 					// need to only look in the context here if the selector is a subset of the selector in the context but how can this be known without knowing the format of the XML? could get away with it if it is assumed that tags do not contain themselves?
 					// this (unusually) falls into the category of grammar rather than syntax as computers are mostly concerned with but seems to make sense given the desire to query using imprecise statements that is the purpose of this code
 					/*$context_selector_is_too_specific = false;
@@ -852,10 +961,10 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 						$selected_selector_piece < $selected_context_selector_piece ||
 						(strpos($unselected_first_context_selector_tag, $unselected_first_selector_tag) === 0 && strlen($unselected_first_context_selector_tag) > strlen($unselected_first_selector_tag))))) {
 					if($context_selector_is_too_specific) {
-						print('context selector is too specific than selector so we go to a broader context<br />');
+						print('context selector is too specific than selector so we go to a broader context<br />' . PHP_EOL);
 					//} elseif(is_array($this->context[$context_counter][2]) && O::all_entries_are_arrays($this->context[$context_counter][2])) {
 					} else {*/
-						//print('using context entry to search for match<br />');
+						//print('using context entry to search for match<br />' . PHP_EOL);
 						//print('$this->context[$context_counter][3]: ');var_dump($this->context[$context_counter][3]);
 						//print('O::LOM_array($this->context[$context_counter][2]): ');var_dump(O::LOM_array($this->context[$context_counter][2]));
 						$selector_matches = O::select($normalized_selector, O::LOM_array($this->context[$context_counter][2]), $this->context[$context_counter][3]);
@@ -865,7 +974,7 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 							$offset_depths = $this->context[$context_counter][3];
 							break;
 						}
-						//print('found a match by doing a query in $this->context[$context_counter][3]<br />');
+						//print('found a match by doing a query in $this->context[$context_counter][3]<br />' . PHP_EOL);
 						// breaks things...
 						/*$overscoped = false;
 						foreach($matching_array as $first_index => $first_value) { break; }
@@ -890,30 +999,32 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 		//	return array();
 		//}
 		// if nothing's found in the context, then we have to do a fresh check
-		//print('finished looking through context<br />');
+		//print('finished looking through context<br />' . PHP_EOL);
 		if(is_array($selector_matches) && sizeof($selector_matches) === 0) {
-			//print('nothing was found from context<br />');
+			//print('nothing was found from context<br />' . PHP_EOL);
 			// and garbage-collect the context
 			if($matching_array === false) {
-				//print('getting selector_matches by doing a straight query (on the whole code) instead of using context<br />');
+				//print('getting selector_matches by doing a straight query (on the whole code) instead of using context<br />' . PHP_EOL);
 				//$selector_matches = O::select($normalized_selector, array(array($this->code, 0)));
 				$selector_matches = O::select($normalized_selector, array(array($this->code, 0)));
 				if(is_array($selector_matches) && sizeof($selector_matches) > 0) {
 					// if a raw query on the whole code is done then the context is completely reset
-					//print('reseting context<br />');
+					//print('reseting context<br />' . PHP_EOL);
 					$this->context = array();
 				}
 			} else {
-				//print('getting selector_matches by looking in matching_array (not the whole code)<br />');
+				//print('getting selector_matches by looking in matching_array (not the whole code)<br />' . PHP_EOL);
 				//print('$offset_depths: ');var_dump($offset_depths);exit(0);
 				if($offset_depths === NULL) {
 					//O::fatal_error('$offset_depths === NULL when getting selector_matches by looking in matching_array (not the whole code)');
-					$offset_depths = O::get_offset_depths_of_selector_matches($matching_array);
+					//$offset_depths = O::get_offset_depths_of_matches($matching_array);
+					$offset_depths = $this->offset_depths;
 				}
+				//print('$offset_depths (of matching array): ');var_dump($offset_depths);
 				$selector_matches = O::select($normalized_selector, $matching_array, $offset_depths);
 				//print('$selector_matches in get: ');var_dump($selector_matches);
 				if(is_array($selector_matches) && sizeof($selector_matches) > 0) {
-					//print('checking to see if we need to cull obsolete context entries after successful matching_array search<br />');
+					//print('checking to see if we need to cull obsolete context entries after successful matching_array search<br />' . PHP_EOL);
 					// go in reverse order and see which context entries the one that will be created includes and makes obsolete
 					//$first_entry = $matching_array[0][0];
 					$first_offset = $matching_array[0][1];
@@ -929,7 +1040,7 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 							break;
 						//} elseif($this->context[$context_counter][1][0][1] >= $first_offset && $this->context[$context_counter][1][sizeof($this->context[$context_counter][1]) - 1][1] <= $last_offset + strlen($last_entry)) {
 						} elseif($this->context[$context_counter][1][0][0] >= $first_offset && $this->context[$context_counter][1][sizeof($this->context[$context_counter][1]) - 1][0] <= $last_offset + strlen($last_entry)) {
-							//print('context entry at ($context_counter is ' . $context_counter . ') is obsolete<br />');
+							//print('context entry at ($context_counter is ' . $context_counter . ') is obsolete<br />' . PHP_EOL);
 							unset($this->context[$context_counter]);
 							//$culled_context_entry = true;
 						}
@@ -941,12 +1052,12 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 				}
 			}
 		} else {
-			//print('something was found from context<br />');
+			//print('something was found from context<br />' . PHP_EOL);
 			//$culled_context_entry = false;
 			$context_counter++;
 			$pre_cull_context_size = sizeof($this->context);
 			while($context_counter < $pre_cull_context_size) {
-				//print('culling an obsolete context entry after successful context search<br />');
+				//print('culling an obsolete context entry after successful context search<br />' . PHP_EOL);
 				unset($this->context[$context_counter]);
 				//$culled_context_entry = true;
 				$context_counter++;
@@ -975,7 +1086,7 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 		O::var_dump_full($this->code);
 		O::fatal_error('Unknown selector type in get');
 	}
-	//print('here374859---0042<br />');
+	//print('here374859---0042<br />' . PHP_EOL);
 	//print('$selector_matches, $this->context mid get: ');var_dump($selector_matches, $this->context);
 	//print('$selector, $selector_matches mid get: ');var_dump($selector, $selector_matches);
 	//print('$selector_matches mid get: ');var_dump($selector_matches);
@@ -984,7 +1095,7 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 
 	if(sizeof($selector_matches) === 0 || (sizeof($selector_matches) === 1 && ($selector_matches[0] === NULL || $selector_matches[0] === false))) {
 	//if(sizeof($selector_matches) === 0 && ($selector_matches[0] === NULL || $selector_matches[0] === false)) {
-		//print('here374859---0044<br />');
+		//print('here374859---0044<br />' . PHP_EOL);
 		//print('$selector_matches: ');var_dump($selector_matches);
 		//return false;
 		// debateable whether it's better to return false or an empty array when nothing is found; coder expectation doens't really exist so ease of checking against a boolean and having different data type based on success will prevail, I guess
@@ -996,19 +1107,19 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 	}
 	//if($add_to_context) {
 		//print('$selector_matches in add_to_context: ');var_dump($selector_matches);
-		//print('here374859---0045<br />');
+		//print('here374859---0045<br />' . PHP_EOL);
 		//if(sizeof($selector_matches) > 0) {
-			//print('here374859---0047<br />');
+			//print('here374859---0047<br />' . PHP_EOL);
 			//$text_only_value = false;
 			//$text_only_index = false;
 			// debug
 			//if(!is_array($selector_matches[0])) {
-				//print('here374859---0048<br />');
+				//print('here374859---0048<br />' . PHP_EOL);
 				if(is_int($selector)) {
-					//print('here374859---0049<br />');
+					//print('here374859---0049<br />' . PHP_EOL);
 					$new_start_indices = array($selector);
 				} elseif($used_context) {
-					//print('here374859---0050<br />');
+					//print('here374859---0050<br />' . PHP_EOL);
 					$new_start_indices = $this->context[$context_counter + 1][2];
 				//} else {
 				//	print('$selector, $selector_matches, $this->context: ');var_dump($selector, $selector_matches, $this->context);
@@ -1016,22 +1127,22 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 				//}
 			} else {
 				// this seems wonky
-				//print('here374859---0051<br />');
+				//print('here374859---0051<br />' . PHP_EOL);
 				$start_offsets = array();
 				$new_start_indices = array();
 				$new_selector_matches = array();
 				$did_a_text_only_value = false;
 				foreach($selector_matches as $index => $value) {
-					//print('here374859---0052<br />');
+					//print('here374859---0052<br />' . PHP_EOL);
 					$value_counter = 0;
 					foreach($value as $value_index => $value_value) {
-						//print('here374859---0053<br />');
+						//print('here374859---0053<br />' . PHP_EOL);
 						if($value_counter === 0) {
-							//print('here374859---0054<br />');
+							//print('here374859---0054<br />' . PHP_EOL);
 							$start_offsets[] = $value_index;
 						}
 						if($value_counter === 1) {
-							//print('here374859---0055<br />');
+							//print('here374859---0055<br />' . PHP_EOL);
 							$text_only_index = $value_index;
 							$text_only_value = $value_value[1];
 						}
@@ -1039,7 +1150,7 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 					}
 					if($value_counter === 3 && strlen(trim($text_only_value)) > 0) { // making the assumption that existing tags with nothing in them should only be populated with tags rather than raw text
 					//if($value_counter === 3) {
-						//print('here374859---0056<br />');
+						//print('here374859---0056<br />' . PHP_EOL);
 						$new_start_indices[] = $text_only_index;
 						$new_selector_matches[$text_only_index] = $text_only_value;
 						$did_a_text_only_value = true;
@@ -1047,14 +1158,14 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 				}
 				//print('$new_selector_matches1: ');var_dump($new_selector_matches);
 				if(!$did_a_text_only_value) {
-					//print('here374859---0057<br />');
+					//print('here374859---0057<br />' . PHP_EOL);
 					$new_start_indices = $start_offsets;
 					$new_selector_matches = $selector_matches;
 				}
 				// if the selection resolves to a single value then that is what's desired rather than the array of thar single value
 				if(sizeof($new_selector_matches) === 1 && (is_string($new_selector_matches[$text_only_index]) || is_int($new_selector_matches[$text_only_index]) || is_float($new_selector_matches[$text_only_index]))) {
 				//if(sizeof($new_selector_matches) === 1) {
-					//print('here374859---0058<br />');
+					//print('here374859---0058<br />' . PHP_EOL);
 					$new_start_indices = $text_only_index;
 					$new_selector_matches = $text_only_value;
 				}
@@ -1063,10 +1174,10 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 		//print('$new_selector_matches2: ');var_dump($new_selector_matches);
 		*/
 	// debug
-	if($this->debug && sizeof($new_start_indices) !== sizeof($new_selector_matches)) {
-		print('$selector, $matching_array, $new_start_indices, $new_selector_matches, sizeof($new_start_indices), sizeof($new_selector_matches): ');var_dump($selector, $matching_array, $new_start_indices, $new_selector_matches, sizeof($new_start_indices), sizeof($new_selector_matches));
-		O::fatal_error('sizeof($new_start_indices) !== sizeof($new_selector_matches)');
-	}
+// 	if($this->debug && sizeof($new_start_indices) !== sizeof($new_selector_matches)) {
+// 		print('$selector, $matching_array, $new_start_indices, $new_selector_matches, sizeof($new_start_indices), sizeof($new_selector_matches): ');var_dump($selector, $matching_array, $new_start_indices, $new_selector_matches, sizeof($new_start_indices), sizeof($new_selector_matches));
+// 		O::fatal_error('sizeof($new_start_indices) !== sizeof($new_selector_matches)');
+// 	}
 
 	// may be duplication of functionality of offset_depths but it does have the property of easy iteration that $this->offset_depths does not have
 	//$this->offsets_from_get = array();
@@ -1077,7 +1188,7 @@ function get($selector, $matching_array = false, $add_to_context = true, $ignore
 	//if(sizeof($selector_matches) > 0 && $add_to_context && $this->use_context && !$ignore_context && !$used_context) { // non-results (tested by sizeof) are not added to the context because the code could be updated and the context using this selector wouldn't "know". sizeof(empty string) returns 1 wierdly but conveniently
 	if(sizeof($selector_matches) > 0 && $add_to_context && $this->use_context && !$ignore_context) { // non-results (tested by sizeof) are not added to the context because the code could be updated and the context using this selector wouldn't "know". sizeof(empty string) returns 1 wierdly but conveniently
 		//$this->context[] = array($normalized_selector, O::context_array($matching_array), O::context_array($selector_matches));
-		$offset_depths_of_selector_matches = O::get_offset_depths_of_selector_matches($selector_matches);
+		$offset_depths_of_selector_matches = O::get_offset_depths_of_matches($selector_matches);
 		$all_text = true;
 		foreach($offset_depths_of_selector_matches as $offset_depths) {
 			if(sizeof($offset_depths) === 2) {
@@ -1238,11 +1349,16 @@ function tagless($variable) {
 	return preg_replace('/<[^>]*>/is', '', $variable);
 }
 
-function tagvalue($string) {
-	if(is_array($string)) {
-		O::fatal_error('tagvalue() expects string input');
+function tagvalue($variable) {
+	if(is_array($variable)) {
+		if(sizeof($variable) === 2) {
+			$variable = $variable[0];
+		} else {
+			print('$variable: ');var_dump($O->tagname($tag));
+			O::fatal_error('not sure how to handle $variable in tagvalue()');
+		}
 	}
-	return O::preg_replace_first('/<[^>]+>/is', '', O::preg_replace_last('/<[^>]+>/is', '', $string));
+	return O::preg_replace_first('/<[^>]+>/is', '', O::preg_replace_last('/<[^>]+>/is', '', $variable));
 }
 
 function preg_search_escape($string) { // alias
@@ -1338,18 +1454,18 @@ function reverse_preg_pattern($string) {
 		print('$string in reverse_preg_pattern: ');var_dump($string);
 		O::fatal_error('reverse_preg_pattern assumes that the limiter used is / when any limiter could be used to separate the modifiers');
 	}
-	if(strpos($string, '+') !== false) {
-		print('$string in reverse_preg_pattern: ');var_dump($string);
-		O::fatal_error('+ not properly handled in reverse_preg_pattern');
-	}
+	//if(strpos($string, '+') !== false) {
+	//	print('$string in reverse_preg_pattern: ');var_dump($string);
+	//	O::fatal_error('+ not properly handled in reverse_preg_pattern');
+	//}
 	if(strpos($string, '|') !== false) {
 		print('$string in reverse_preg_pattern: ');var_dump($string);
 		O::fatal_error('| not properly handled in reverse_preg_pattern');
 	}
-	if(strpos($string, '*') !== false) {
-		print('$string in reverse_preg_pattern: ');var_dump($string);
-		O::fatal_error('* not properly handled in reverse_preg_pattern');
-	}
+	//if(strpos($string, '*') !== false) {
+	//	print('$string in reverse_preg_pattern: ');var_dump($string);
+	//	O::fatal_error('* not properly handled in reverse_preg_pattern');
+	//}
 	//print('$string at start of reverse_preg_pattern(): ');var_dump($string);
 	// woah there fella
 	//preg_match('/\/(.*?)\/(.*)/', $string, $matches);
@@ -1447,6 +1563,7 @@ function reverse_preg_pattern($string) {
 // flags resupported? (2011-12-02) naw...
 // welp, over 10 years later (2022-02-21), gotta do it; fractal_get needs it ;p
 function preg_match_last($pattern, $subject, &$matches, $flags = false, $offset = 0) {
+	//print('$pattern, $subject, $matches, $flags in preg_match_last(): ');var_dump($pattern, $subject, $matches, $flags);
 	if($offset !== 0) {
 		print('$pattern, $subject, $matches, $flags, $offset in preg_match_last: ');var_dump($pattern, $subject, $matches, $flags, $offset);
 		O::fatal_error('$offset has not been written into preg_match_last');
@@ -1651,25 +1768,25 @@ function get_offsets($selector, $matching_array = false, $add_to_context = true,
 		//print('$selector_matches in get_offsets0: ');var_dump($selector_matches);
 		if($this->use_context && !$ignore_context) {
 			$context_counter = sizeof($this->context) - 1;
-			//print('here249702667-9<br />');
+			//print('here249702667-9<br />' . PHP_EOL);
 			while($context_counter > -1 && sizeof($selector_matches) === 0 && !is_string($selector_matches)) {
-				//print('here249702668-0<br />');
-				//print('getting selector_matches from context in get_offsets<br />');
+				//print('here249702668-0<br />' . PHP_EOL);
+				//print('getting selector_matches from context in get_offsets<br />' . PHP_EOL);
 				//print('$context_counter: ');var_dump($context_counter);
 				//print('$this->context: ');O::var_dump_full($this->context);
 				if($normalized_selector === $this->context[$context_counter][0] && $matching_array === $this->context[$context_counter][1]) {
-					//print('here249702668-1<br />');
+					//print('here249702668-1<br />' . PHP_EOL);
 					if(is_array($this->context[$context_counter][2])) {
-						//print('here249702668-1.1<br />');
+						//print('here249702668-1.1<br />' . PHP_EOL);
 						return $this->context[$context_counter][2];
 					} else {
-						//print('here249702668-1.2<br />');
+						//print('here249702668-1.2<br />' . PHP_EOL);
 						return array($this->context[$context_counter][2]);
 					}
 				} elseif(!is_array($this->context[$context_counter][3])) { // skip context entries with only a single value
-					//print('here249702668-2<br />');
+					//print('here249702668-2<br />' . PHP_EOL);
 				} else {
-					//print('here249702668-3<br />');
+					//print('here249702668-3<br />' . PHP_EOL);
 					$first_selector_tag = O::parse_selector_string($normalized_selector)[0][0];
 					$cleaned_first_selector_tag = O::clean_selector_tag_for_context_comparison($first_selector_tag);
 					$first_context_selector_tag = O::parse_selector_string($this->context[$context_counter][0])[0][0];
@@ -1677,9 +1794,9 @@ function get_offsets($selector, $matching_array = false, $add_to_context = true,
 					//print('$first_selector_tag, $cleaned_first_selector_tag, $first_context_selector_tag, $cleaned_first_context_selector_tag: ');var_dump($first_selector_tag, $cleaned_first_selector_tag, $first_context_selector_tag, $cleaned_first_context_selector_tag);
 					//print('$this->context: ');var_dump($this->context);
 					if($cleaned_first_selector_tag === $cleaned_first_context_selector_tag || $cleaned_first_selector_tag === '*' || $cleaned_first_context_selector_tag === '*') {
-						//print('here249702668-3.1<br />');
+						//print('here249702668-3.1<br />' . PHP_EOL);
 					} else {
-						//print('here249702668-3.2<br />');
+						//print('here249702668-3.2<br />' . PHP_EOL);
 						$selector_matches = O::select($normalized_selector, $this->context[$context_counter][3]);
 						// guard against overscoping
 						// breaks things...
@@ -1701,31 +1818,31 @@ function get_offsets($selector, $matching_array = false, $add_to_context = true,
 				$context_counter--;
 			}
 		}
-		//print('here249702668-4<br />');
+		//print('here249702668-4<br />' . PHP_EOL);
 		//print('$selector_matches in get_offsets1: ');var_dump($selector_matches);
 		if(sizeof($selector_matches) === 0) {
-			//print('here249702668-5<br />');
-			//print('getting selector_matches from $this->LOM in get_offsets<br />');
+			//print('here249702668-5<br />' . PHP_EOL);
+			//print('getting selector_matches from $this->LOM in get_offsets<br />' . PHP_EOL);
 			// ??
 			$selector_matches = O::select($normalized_selector, $matching_array);
 			//foreach($matching_array as $first_index => $first_value) { break; }
 			//if(is_array($matching_array[$first_index])) {
-			//	print('here249702668-5.1<br />');
+			//	print('here249702668-5.1<br />' . PHP_EOL);
 			//	$selector_matches = O::select($normalized_selector, array($matching_array));
 			//} else {
-			//	print('here249702668-5.2<br />');
+			//	print('here249702668-5.2<br />' . PHP_EOL);
 			//	$selector_matches = O::select($normalized_selector, $matching_array);
 			//}
 		}
-		//print('here249702668-6<br />');
+		//print('here249702668-6<br />' . PHP_EOL);
 		//print('$selector_matches in get_offsets2: ');var_dump($selector_matches);
 		if(sizeof($selector_matches) === 1 && (strpos($normalized_selector, '_') !== false || $matching_array !== false || sizeof($selector_matches[0] === 3))) {
-			//print('here249702668-7<br />');
+			//print('here249702668-7<br />' . PHP_EOL);
 			$value_counter = 0;
 			$text_only_value = false;
 			$text_only_index = false;
 			foreach($selector_matches[0] as $value_index => $value_value) {
-				//print('here249702668-8<br />');
+				//print('here249702668-8<br />' . PHP_EOL);
 				if($value_counter === 1) {
 					$text_only_value = $value_value[1];
 					$text_only_index = $value_index;
@@ -1734,7 +1851,7 @@ function get_offsets($selector, $matching_array = false, $add_to_context = true,
 			}
 			if($value_counter === 3 && strlen(trim($text_only_value)) > 0) { // making the assumption that existing tags with nothing in them should only be populated with tags rather than raw text
 			//if($value_counter === 3) {
-				//print('here249702668-9<br />');
+				//print('here249702668-9<br />' . PHP_EOL);
 				return array($text_only_index);
 			}
 		}
@@ -1815,43 +1932,43 @@ function is_in_opening_tag($offset, $code = false) {
 	while(($position = strpos($code, '>', $position + 1)) !== false) {
 		//print('$position: ');var_dump($position);
 		if($this->must_check_for_self_closing && $code[$position - 1] === '/') { // self-closing tag
-			//print('self-closing tag at position: ' . $position . '<br />');
+			//print('self-closing tag at position: ' . $position . '<br />' . PHP_EOL);
 			return false;
 		} elseif($this->must_check_for_non_parsed_character_data && substr($code, $position - 2, 2) === ']]') { // non-parsed character data
-			//print('non-parsed character data at position: ' . $position . '<br />');
+			//print('non-parsed character data at position: ' . $position . '<br />' . PHP_EOL);
 			return false;
 		} elseif($this->must_check_for_comment && substr($code, $position - 2, 2) === '--') { // comment
-			//print('comment at position: ' . $position . '<br />');
+			//print('comment at position: ' . $position . '<br />' . PHP_EOL);
 			return false;
 		} elseif($this->must_check_for_programming_instruction && $code[$position - 1] === '?') { // programming instruction
-			//print('programming instruction at position: ' . $position . '<br />');
+			//print('programming instruction at position: ' . $position . '<br />' . PHP_EOL);
 			return false;
 		} elseif($this->must_check_for_ASP && $code[$position - 1] === '%') { // ASP
-			//print('ASP at position: ' . $position . '<br />');
+			//print('ASP at position: ' . $position . '<br />' . PHP_EOL);
 			return false;
 		} else { // closing or opening tag
-			//print('closing or opening tag at position2: ' . $position2 . '<br />');
+			//print('closing or opening tag at position2: ' . $position2 . '<br />' . PHP_EOL);
 			$code = strrev(substr($code, 0, $offset));
 			$position2 = 0;
 			while(($position2 = strpos($code, '<', $position2 + 1)) !== false) {
 				//print('$position2: ');var_dump($position2);
 				if($code[$position2 - 1] === '/') { // closing tag
-					//print('closing tag at position2: ' . $position2 . '<br />');
+					//print('closing tag at position2: ' . $position2 . '<br />' . PHP_EOL);
 					return false;
 				} elseif($this->must_check_for_non_parsed_character_data && substr($code, $position2 - 8, 8) === '[ATADC[!') { // non-parsed character data
-					//print('non-parsed character data at position2: ' . $position2 . '<br />');
+					//print('non-parsed character data at position2: ' . $position2 . '<br />' . PHP_EOL);
 					return false;
 				} elseif($this->must_check_for_comment && substr($code, $position2 - 3, 3) === '--!') { // comment
-					//print('comment at position2: ' . $position2 . '<br />');
+					//print('comment at position2: ' . $position2 . '<br />' . PHP_EOL);
 					return false;
 				} elseif($this->must_check_for_programming_instruction && $code[$position2 - 1] === '?') { // programming instruction
-					//print('programming instruction at position2: ' . $position2 . '<br />');
+					//print('programming instruction at position2: ' . $position2 . '<br />' . PHP_EOL);
 					return false;
 				} elseif($this->must_check_for_ASP && $code[$position2 - 1] === '%') { // ASP
-					//print('ASP at position2: ' . $position2 . '<br />');
+					//print('ASP at position2: ' . $position2 . '<br />' . PHP_EOL);
 					return false;
 				} else { // opening tag
-					//print('opening tag at position2: ' . $position2 . '<br />');
+					//print('opening tag at position2: ' . $position2 . '<br />' . PHP_EOL);
 					return true;
 				}
 			}
@@ -1981,7 +2098,7 @@ function new_attribute($attribute_name, $new_value, $selector) {
 }
 
 function set_attribute($attribute_name, $new_value, $selector) {
-	//print('set attribute0001<br />');
+	//print('set attribute0001<br />' . PHP_EOL);
 	$attribute_name = (string)$attribute_name;
 	$new_value = (string)$new_value;
 	//print('$attribute_name, $new_value, $selector before swapping in set_attribute: ');var_dump($attribute_name, $new_value, $selector);
@@ -2001,7 +2118,7 @@ function set_attribute($attribute_name, $new_value, $selector) {
 		$new_value = $attribute_name;
 		$attribute_name = $temp_new_value;
 	}*/
-	//print('set attribute0002<br />');
+	//print('set attribute0002<br />' . PHP_EOL);
 	
 	$selector_matches = O::get_tagged($selector);
 	// needs personalized attention and can't use replace()?
@@ -2032,10 +2149,10 @@ function set_attribute($attribute_name, $new_value, $selector) {
 			}
 			$attribute_offset = $closing_position + $offset;
 		}
-		//print('set attribute0003<br />');
+		//print('set attribute0003<br />' . PHP_EOL);
 		//print('$attribute_name, $new_value, $offset, $offset_adjust, $tagname, $string in set_attribute: ');var_dump($attribute_name, $new_value, $offset, $offset_adjust, $tagname, $string);
-		//print('before adjust_offset_depths in set_attribute<br />');
-		//O::adjust_offset_depths($offset + 1, $offset_adjust); // +1 since we're dealing with attributes after the start of the tag
+		//print('before adjust_offsets in set_attribute<br />' . PHP_EOL);
+		//O::adjust_offsets($offset + 1, $offset_adjust); // +1 since we're dealing with attributes after the start of the tag
 		//print('$selector_matches[$index][0], $attribute_name, $new_value, $tagname, $offset, $this->context[sizeof($this->context) - 1][3][$index]: ');var_dump($selector_matches[$index][0], $attribute_name, $new_value, $tagname, $offset, $this->context[sizeof($this->context) - 1][3][$index]);
 		//$selector_matches[$index][0] = O::set_tag_attribute($selector_matches[$index][0], $attribute_name, $new_value, $tagname, $offset, $this->context[sizeof($this->context) - 1][3][$index]); // assumes that get_tagged above put the offest_depths we want into the context
 		//$selector_matches[$index][0] = O::set_tag_attribute($selector_matches[$index][0], $attribute_name, $new_value, $tagname, 0, $offset, $this->context[sizeof($this->context) - 1][3][$index]); // assumes that get_tagged above put the offest_depths we want into the context
@@ -2044,10 +2161,11 @@ function set_attribute($attribute_name, $new_value, $selector) {
 		//		$selector_matches[$index2][1] += $offset_adjust;
 		//	}
 		//}
+		//print('$old_attribute_string, $new_attribute_string, $attribute_offset, $this->context in set_attribute: ');var_dump($old_attribute_string, $new_attribute_string, $attribute_offset, $this->context);
 		O::replace($old_attribute_string, $new_attribute_string, $attribute_offset);
-		//print('set attribute0004<br />');
+		//print('set attribute0004<br />' . PHP_EOL);
 		
-		//print('here376561<br />');
+		//print('here376561<br />' . PHP_EOL);
 		/*if($this->use_context) {
 			foreach($this->context as $context_index => $context_value) {
 				if($context_value[1] !== false) {
@@ -2077,7 +2195,7 @@ function set_attribute($attribute_name, $new_value, $selector) {
 		//print('$this->context in set_attribute: ');var_dump($this->context);
 		$index--;
 	}
-	//print('set attribute0005<br />');
+	//print('set attribute0005<br />' . PHP_EOL);
 	//print('$this->code, $selector_matches at the end of set_attribute: ');var_dump($this->code, $selector_matches);
 	if(sizeof($selector_matches) === 1) { // questionable
 		return $selector_matches[0];
@@ -2095,11 +2213,9 @@ function set_tag_attribute($code, $attribute_name, $attribute_value, $tagname = 
 	if($tagname === false) {
 		O::fatal_error('please provide set_tag_attribute with a tagname.');
 	}
-	//if($offset_depths === false) {
-	//	$offset_depths = $this->offset_depths;
-	//}
 	if($offset_depths === false) {
-		$offset_depths = O::get_offset_depths(substr($code, $offset), $offset + $offset_to_add, O::depth($offset + $offset_to_add));
+		$offset_depths = $this->offset_depths;
+	//	$offset_depths = O::get_offset_depths(substr($code, $offset), $offset + $offset_to_add, O::depth($offset + $offset_to_add));
 	}
 	//print('$code, $attribute_name, $attribute_value, $offset, $tagname in set_tag_attribute: ');var_dump($code, $attribute_name, $attribute_value, $offset, $tagname);
 	if($offset === 0) {
@@ -2274,7 +2390,7 @@ function decrement_attribute($attribute_name, $selector) {
 }
 
 function select($selector, $matching_array = false, $offset_depths = false) {
-	//print('start of select()<br />');
+	//print('start of select()<br />' . PHP_EOL);
 	if($matching_array === false) {
 		$matching_array = array(array($this->code, 0));
 	}
@@ -2284,19 +2400,27 @@ function select($selector, $matching_array = false, $offset_depths = false) {
 		$matching_array = array($matching_array);
 	}
 	if($offset_depths === false) {
-		//$offset_depths = $this->offset_depths;
+	//	$offset_depths = $this->offset_depths;
 		//$offset_depths = array();
 		//foreach($matching_array as $index => $value) {
+		//$index = sizeof($matching_array) - 1;
+		//while($index > -1) { // very important to go in reverse_order?
+		//	$value = $matching_array[$index];
 		//	$offset_depths[] = $this->offset_depths;
+		//	$index--;
 		//}
-		$offset_depths = O::get_offset_depths_of_selector_matches($matching_array);
+		$offset_depths = O::get_offset_depths_of_matches($matching_array);
 	}
 	//print('$selector, $matching_array, $offset_depths in select: ');var_dump($selector, $matching_array, $offset_depths);
 	O::parse_selector_string($selector);
 	//print('$selector, $this->selector_piece_sets: ');var_dump($selector, $this->selector_piece_sets);
 	$selector_matches = array();
 	foreach($matching_array as $index => $value) {
+	//$index = sizeof($matching_array) - 1;
+	//while($index > -1) { // very important to go in reverse_order?
+	//	$value = $matching_array[$index];
 		$selector_matches = array_merge($selector_matches, O::preg_select($value[0], $value[1], $offset_depths[$index]));
+	//	$index--;
 	}
 	/*print('$offset_depths in select before testing format: ');var_dump($offset_depths);
 	if(O::all_entries_are_arrays($offset_depths)) {
@@ -2308,7 +2432,7 @@ function select($selector, $matching_array = false, $offset_depths = false) {
 		}
 		$offset_depths = $new_offset_depths;
 	}*/
-	//print('$selector_matches, $offset_depths in select before get_tag_string: ');var_dump($selector_matches, $offset_depths);
+	//print('$selector_matches, $matching_array, $offset_depths in select before get_tag_string: ');var_dump($selector_matches, $matching_array, $offset_depths);
 	foreach($selector_matches as $index => $value) {
 		//$selector_matches[$index][0] = O::get_tag_string(substr($this->code, $selector_matches[$index][1]), strlen($selector_matches[$index][0]), $selector_matches[$index][1]);
 		//$selector_matches[$index][0] = O::get_tag_string($selector_matches[$index][1], O::get_offset_depths(substr($this->code, $selector_matches[$index][1]))); // hard to say whether it's more efficient to make a new offset_depths array or just use that of the whole code, in this instance
@@ -2320,7 +2444,7 @@ function select($selector, $matching_array = false, $offset_depths = false) {
 }
 
 function preg_expression_from_selector_piece($selector_piece_index) {
-	//print('un here 002<br />');
+	//print('un here 002<br />' . PHP_EOL);
 	//print('$selector_piece_index at start of preg_expression_from_selector_piece: ');var_dump($selector_piece_index);
 	$match_any_tagname = false;
 	$tagname_component = '';
@@ -2414,7 +2538,7 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 	if($offset_depths === false) {
 		$offset_depths = $this->offset_depths;
 	}
-	//print('$code, $offset_to_add, $offset_depths at the start of preg_select: ');var_dump($code, $offset_to_add, $offset_depths);	
+	//print('$code, $offset_to_add, $offset_depths at the start of preg_select: ');var_dump($code, $offset_to_add, $offset_depths);
 	
 	$selector_matches = array();
 	// these 3 saved indices variables were probably a previous attempt that is redundant now though still uncommented-out lol
@@ -2426,7 +2550,7 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 	foreach($this->selector_piece_sets as $this->selector_piece_set_index => $this->selector_pieces) {
 		$code = $initial_code;
 		$offset_to_add = $initial_offset_to_add;
-		//print('fractal_here0000<br />');
+		//print('fractal_here0000<br />' . PHP_EOL);
 		$fractally_get = true;
 		//O::parse_selector_piece($this->selector_pieces[0], 0);
 		//if(strpos($this->selector_pieces[0], '[') !== false) {
@@ -2446,9 +2570,9 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 		//print('$code, $this->tagnames before clipping start: ');var_dump($code, $this->tagnames);
 		$shallowest_start_position = strlen($code);
 		foreach($this->tagnames[0] as $tagname_index => $tagname) {
-			//print('un here 001<br />');
+			//print('un here 001<br />' . PHP_EOL);
 			//print('O::preg_expression_from_selector_piece(0): ');var_dump(O::preg_expression_from_selector_piece(0));
-			//print('un here 003<br />');
+			//print('un here 003<br />' . PHP_EOL);
 			preg_match(O::preg_expression_from_selector_piece(0), $code, $start_position_matches, PREG_OFFSET_CAPTURE);
 			$start_position = $start_position_matches[0][1];
 			if(is_numeric($start_position)) {
@@ -2466,12 +2590,15 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 		// also don't waste time on code that is past the point where the deepest thing we are looking for occurs (clip the end) here we can get fancy; the essence of fractal_get
 		//print('$code, $this->tagvalues before clipping end: ');var_dump($code, $this->tagvalues);
 		$deepest_end_position = 0;
-		//print('clippy001<br />');
+		//print('clippy001<br />' . PHP_EOL);
 		//print('$this->tagnames: ');var_dump($this->tagnames);
 		foreach($this->tagnames[sizeof($this->selector_pieces) - 1] as $tagname_index => $tagname) {
-			//print('clippy002<br />');
+			//print('clippy002<br />' . PHP_EOL);
+			if($tagname === '*') {
+				$tagname = $this->tagname_regex;
+			}
 			if($this->tagvalues[0][0] === false) { // there may be no tagvalues in the selector piece, in which case; match the closing tag alone without a tagvalue
-				//print('clippy003<br />');
+				//print('clippy003<br />' . PHP_EOL);
 				$clip_end_regex = '/<\/' . $tagname . '>/is';
 				O::preg_match_last($clip_end_regex, $code, $end_position_matches, PREG_OFFSET_CAPTURE);
 				$end_position = $end_position_matches[0][1] + strlen($end_position_matches[0][0]);
@@ -2481,9 +2608,9 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 					}
 				}
 			} else {
-				//print('clippy004<br />');
+				//print('clippy004<br />' . PHP_EOL);
 				foreach($this->tagvalues[sizeof($this->selector_pieces) - 1] as $tagvalue_index => $tagvalue) {
-					//print('clippy005<br />');
+					//print('clippy005<br />' . PHP_EOL);
 					$clip_end_regex = '/>' . $tagvalue . '<\/' . $tagname . '>/is';
 					O::preg_match_last($clip_end_regex, $code, $end_position_matches, PREG_OFFSET_CAPTURE);
 					$end_position = $end_position_matches[0][1] + strlen($end_position_matches[0][0]);
@@ -2495,7 +2622,7 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 				}
 			}
 		}
-		//print('clippy006<br />');
+		//print('clippy006<br />' . PHP_EOL);
 		$code = substr($code, 0, $deepest_end_position);
 		//print('$code after clipping end: ');var_dump($code);
 		if($code == false) { // false, null, string of length zero, etc
@@ -2513,7 +2640,7 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 		//$this->fractal_depths = $this->fractal_depth_sets[$this->selector_piece_set_index];
 		// parse selector pieces here instead of in resursive_select both to prevent duplications and have the the results from the last piece to look at for fractal_get
 		// array(/*' ', */'_', '@', '=', '&', '[', ']', '.', '*', '|');
-		//print('fractal_here0001<br />');
+		//print('fractal_here0001<br />' . PHP_EOL);
 		$selector_scope_index = 1; // skip the first index which will (almost) always be indicating offspring of any depth
 		while($selector_scope_index < sizeof($this->selector_scopes)) {
 			if($this->selector_scopes[$selector_scope_index] !== 'direct') {
@@ -2523,9 +2650,9 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 			$selector_scope_index++;
 		}
 		//print('$fractally_get: ');var_dump($fractally_get);
-		//print('fractal_here0002<br />');
+		//print('fractal_here0002<br />' . PHP_EOL);
 		if($fractally_get) {
-			//print('fractal_here0003<br />');
+			//print('fractal_here0003<br />' . PHP_EOL);
 			// fractal_get (a subfunction? fractfuntion? regardless, it's great)
 			// since we're fractal, recursive_select works from the start, and here we'll work from the end
 			//O::warning('working from the end for fractal_get');
@@ -2534,13 +2661,13 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 			$fractal_matches = array(array($code, false, false));
 			//print('$fractal_matches after initialization before fractal getting: ');var_dump($fractal_matches);
 			//$fractal_offset_to_add = $offset_to_add;
-			//print('fractal_here0004<br />');
+			//print('fractal_here0004<br />' . PHP_EOL);
 			while($selector_piece_index > -1) {
 				//$this->debug_counter++;
 				//if($this->debug_counter > 100) {
 				//	O::fatal_error('$this->debug_counter > 100');
 				//}
-				//print('fractal_here0005<br />');
+				//print('fractal_here0005<br />' . PHP_EOL);
 				//print('$selector_piece_index, $fractal_matches at start of while loop in fractal get: ');var_dump($selector_piece_index, $fractal_matches);
 				// go in reverse order trying to match the deepest part: tagvalue, attributes, tagname
 				// HARD-CODING  \/
@@ -2560,8 +2687,9 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 				}
 				//print('$fractal_matches after possibly broadening: ');var_dump($fractal_matches);
 				$new_fractal_matches = array();
-				//print('fractal_here0006<br />');
+				//print('fractal_here0006<br />' . PHP_EOL);
 				foreach($fractal_matches as $fractal_index => $fractal_value) {
+					//print('fractal_here0006.5<br />' . PHP_EOL);
 					//unset($fractal_matches[$fractal_index]);
 					$code = $fractal_value[0];
 					if($fractal_value[1] !== false) {
@@ -2580,11 +2708,12 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 					//} else {
 					//	$child_offset = $fractal_value[3];
 					//}
-					//print('fractal_here0007<br />');
+					//print('fractal_here0007<br />' . PHP_EOL);
 					$tagvalue = $this->tagvalues[$selector_piece_index][$tagname_index];
+					//print('$tagvalue in fractal_get: ');var_dump($tagvalue);
 					if($tagvalue !== false) {
 						// should only look for tagvalue in last selector piece btw
-						//print('fractal_here0008 fractal matching by tagvalue<br />');
+						//print('fractal_here0008 fractal matching by tagvalue<br />' . PHP_EOL);
 						// what about whitespace? hasn't come up yet, and presumably only would in content that we wouldn't really query?
 						if($this->tagnames[$selector_piece_index][$tagname_index] === '*') {
 							$tagname_regex = $this->tagname_regex;
@@ -2592,7 +2721,16 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 							$tagname_regex = $this->tagnames[$selector_piece_index][$tagname_index];
 						}
 						preg_match_all('/<(' . $tagname_regex . ')(\s+[^>]+|[^\w:\->][^>]*?|>{0})>' . O::preg_escape($tagvalue) . '<\/\1>/is', $code, $tagvalue_matches, PREG_OFFSET_CAPTURE);
-						//print('$selector_piece_index, $code, $tagvalue, $tagvalue_matches: ');var_dump($selector_piece_index, $code, $tagvalue, $tagvalue_matches);
+						//print('$selector_piece_index, $code, $tagvalue_matches: ');var_dump($selector_piece_index, $code, $tagvalue_matches);
+						// reassess based on the paradigm of a structured universe; rather than the multidimensional fractal paradigm
+						//foreach($tagvalue_matches[0] as $tagvalue_index => $tagvalue_value) {
+						//	if(!isset($this->offset_depths[$tagvalue_value[1]])) { // implicitly exclude results like within comments or programming instructions
+						//		unset($tagvalue_matches[0][$tagvalue_index]);
+						//		unset($tagvalue_matches[1][$tagvalue_index]);
+						//		unset($tagvalue_matches[2][$tagvalue_index]);
+						//	}
+						//}
+						//print('after considering structure in fractal_get $tagvalue_matches: ');var_dump($tagvalue_matches);exit(0);
 						// function tag_match($code, $offset = 0, $offset_to_add = 0, $selector_piece_index = 0, $offset_depths = false, $minimum_depth = false, $maximum_depth = false) {
 						foreach($tagvalue_matches[0] as $tagvalue_index => $tagvalue_value) {
 							// get_parent($selector, $matching_array = false, $add_to_context = true, $ignore_context = false, $parent_node_only = false, $tagged_result = false) {
@@ -2604,13 +2742,14 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 							}
 						}
 					} else {
+						//print('fractal_here0008.5 fractal matching not by tagvalue<br />' . PHP_EOL);
 						if($selector_piece_index < sizeof($this->selector_pieces) - 1) {
 							$parenting_code = substr($code, 0, strpos($code, '>') + 1);
 						} else {
 							$parenting_code = $code;
 						}
 						if(sizeof($this->required_attribute_sets[$selector_piece_index][$tagname_index]) !== 0) {
-							//print('fractal_here0009 fractal matching by attributes<br />');
+							//print('fractal_here0009 fractal matching by attributes<br />' . PHP_EOL);
 							//print('$selector_piece_index, $this->required_attribute_sets: ');var_dump($selector_piece_index, $this->required_attribute_sets);
 							if($this->tagnames[$selector_piece_index][$tagname_index] === '*') {
 								$tagname_regex = $this->tagname_regex;
@@ -2625,13 +2764,13 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 								foreach($attributes_matches[0] as $attribute_index => $attribute_string) {
 									$expanded_LOM = O::expand($code, $attributes_matches[0][$attribute_index][1], $offset_to_add, $offset_depths);
 									if(O::tag_match($code, $expanded_LOM[0][1] - $offset_to_add, $offset_to_add, $selector_piece_index, $offset_depths, $minimum_depth, $maximum_depth)) {
-										//print('tag match in fractal matching by attributes<br />');
+										//print('tag match in fractal matching by attributes<br />' . PHP_EOL);
 										$new_fractal_matches[] = array($expanded_LOM[0][0], $expanded_LOM[0][1], O::depth($expanded_LOM[0][1], $offset_depths));
 									}
 								}
 							}
 						} else {
-							//print('fractal_here0010 fractal matching by tagname<br />');
+							//print('fractal_here0010 fractal matching by tagname<br />' . PHP_EOL);
 							foreach($this->tagnames[$selector_piece_index] as $tagname_index => $tagname) {
 								if($tagname === '*') {
 									$tagname_regex = $this->tagname_regex;
@@ -2642,7 +2781,8 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 								//print('$tagname_regex, $parenting_code, $tagname_matches in fractal matching by tagname: ');var_dump($tagname_regex, $parenting_code, $tagname_matches);
 								foreach($tagname_matches[0] as $tagname_match_index => $tagname_match_array) {
 									$expanded_LOM = O::expand($code, $tagname_matches[0][$tagname_match_index][1], $offset_to_add, $offset_depths);
-									//print('$expanded_LOM, $minimum_depth, $maximum_depth in fractal matching by tagname: ');var_dump($expanded_LOM, $minimum_depth, $maximum_depth);
+									//print('$offset_to_add, $expanded_LOM, $minimum_depth, $maximum_depth in fractal matching by tagname: ');var_dump($offset_to_add, $expanded_LOM, $minimum_depth, $maximum_depth);
+									//print('$O->context: ');var_dump($O->context);
 									if(O::tag_match($code, $expanded_LOM[0][1] - $offset_to_add, $offset_to_add, $selector_piece_index, $offset_depths, $minimum_depth, $maximum_depth)) {
 										//print('tag_match in fractal matching by tagname');
 										// function depth($offset, $offset_depths = false) {
@@ -2660,29 +2800,42 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 					$fractal_matches[] = array('<b>', 12, 5);
 					$fractal_matches[] = array('<a>', 14, 5);
 					$fractal_matches[] = array('<a>', 12, 6);*/
-					//print('$fractal_matches before array_unique: ');var_dump($fractal_matches);
+					// reassess based on the paradigm of a structured universe; rather than the multidimensional fractal paradigm
+					//print('$offset_depths, $this->offset_depths: ');O::var_dump_full($offset_depths, $this->offset_depths);
+					//print('$new_fractal_matches before structuring: ');var_dump($new_fractal_matches);
+					foreach($new_fractal_matches as $fractal_index => $fractal_value) {
+						//print('$fractal_value[1]: ');var_dump($fractal_value[1]);
+						if(!isset($this->offset_depths[$fractal_value[1]])) { // implicitly exclude results like within comments or programming instructions
+							//print('unset $fractal_index: ');var_dump($fractal_index);
+							unset($new_fractal_matches[$fractal_index]);
+						}
+					}
+					//print('$new_fractal_matches before array_unique: ');var_dump($new_fractal_matches);
 					$new_fractal_matches = O::data_unique($new_fractal_matches);
 					$new_fractal_matches = array_values($new_fractal_matches); // re-index
-					//print('$fractal_matches after array_unique: ');var_dump($fractal_matches);
+					//print('$new_fractal_matches after array_unique: ');var_dump($new_fractal_matches);
 				}
+				//print('fractal_here0010.5<br />' . PHP_EOL);
 				$fractal_matches = $new_fractal_matches;
 				$selector_piece_index--;
 			}
-			//print('fractal_here0011<br />');
+			//print('fractal_here0011<br />' . PHP_EOL);
 			foreach($fractal_matches as $fractal_index => $fractal_value) {
+				//print('fractal_here0011.5<br />' . PHP_EOL);
 				$code = $fractal_value[0];
 				$offset_to_add = $fractal_value[1];
 				// if we were dynamically calculating the offset_depths, they would likely be in the offset_depths
 				$selector_matches = array_merge($selector_matches, O::recursive_select($code, $offset_to_add, 0, $offset_depths, $offset_depths[$offset_to_add] - 1));
 			}
+			//print('$selector_matches from $fractal_matches: ');var_dump($selector_matches, $fractal_matches);
 			//O::good_message('fractally got!');
 		} else {
-			//print('fractal_here0012<br />');
+			//print('fractal_here0012<br />' . PHP_EOL);
 			$selector_matches = array_merge($selector_matches, O::recursive_select($code, $offset_to_add, 0, $offset_depths, $offset_depths[$offset_to_add] - 1));
 			//O::warning('non-fractally got.');
 		}
 	}
-	//print('fractal_here0013<br />');
+	//print('fractal_here0013<br />' . PHP_EOL);
 	//print('$this->saved_tagname_indices, $this->saved_tagvalue_indices, $this->saved_attributes_indices: ');var_dump($this->saved_tagname_indices, $this->saved_tagvalue_indices, $this->saved_attributes_indices);
 	//if($this->saved_tagname_indices !== false) {
 	//	if(sizeof($this->saved_tagname_indices) > 1) {
@@ -2712,8 +2865,9 @@ function preg_select($code = false, $offset_to_add = 0, $offset_depths = false) 
 //}
 
 function tag_match($code, $offset = 0, $offset_to_add = 0, $selector_piece_index = 0, $offset_depths = false, $minimum_depth = false, $maximum_depth = false) {
-	if($offset_depths === false) {
-		$offset_depths = O::get_offset_depths(substr($code, $offset), $offset + $offset_to_add, O::depth($offset + $offset_to_add));
+	if($offset_depths == false) {
+		//$offset_depths = O::get_offset_depths(substr($code, $offset), $offset + $offset_to_add, O::depth($offset + $offset_to_add));
+		$offset_depths = $this->offset_depths;
 	}
 	preg_match(O::preg_expression_from_selector_piece($selector_piece_index), $code, $matches, PREG_OFFSET_CAPTURE, $offset);	
 	$matched_tagname = false;
@@ -2722,7 +2876,7 @@ function tag_match($code, $offset = 0, $offset_to_add = 0, $selector_piece_index
 	$matched_attributes = false;
 	foreach($this->tagnames[$selector_piece_index] as $tagname_index => $tagname) {
 		if($matches[1][0] === $tagname || $tagname === '*') {
-			//print('tag matched tagname<br />');
+			//print('tag matched tagname<br />' . PHP_EOL);
 			$matched_tagname = true;
 			$matched_depth = false;
 			$depth = O::depth($matches[0][1] + $offset_to_add, $offset_depths);
@@ -2731,7 +2885,7 @@ function tag_match($code, $offset = 0, $offset_to_add = 0, $selector_piece_index
 				$matched_depth = true;
 			}
 			if($matched_depth) {
-				//print('tag matched depth<br />');
+				//print('tag matched depth<br />' . PHP_EOL);
 				$matched_tagvalue = false;
 				if($this->tagvalues[$selector_piece_index][$tagname_index] === false) {
 					$matched_tagvalue = true;
@@ -2744,7 +2898,7 @@ function tag_match($code, $offset = 0, $offset_to_add = 0, $selector_piece_index
 					}
 				}
 				if($matched_tagvalue) {
-					//print('tag matched tagvalue<br />');
+					//print('tag matched tagvalue<br />' . PHP_EOL);
 					$matched_attributes = false;
 					if(sizeof($this->required_attribute_sets[$selector_piece_index][$tagname_index]) === 0) {
 						$matched_attributes = true;
@@ -2801,7 +2955,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 	//print('$selector_piece_index, $this->selector_pieces, $this->selector_pieces[$selector_piece_index] at start of recursive_select(): ');var_dump($selector_piece_index, $this->selector_pieces, $this->selector_pieces[$selector_piece_index]);
 	//print('$this->selector_scopes, $this->tagnames[$selector_piece_index], $this->tagname_indices[$selector_piece_index], $this->tagvalues[$selector_piece_index], $this->tagvalue_indices[$selector_piece_index], $this->required_attribute_sets[$selector_piece_index], $this->attributes_indices[$selector_piece_index]: ');var_dump($this->selector_scopes, $this->tagnames[$selector_piece_index], $this->tagname_indices[$selector_piece_index], $this->tagvalues[$selector_piece_index], $this->tagvalue_indices[$selector_piece_index], $this->required_attribute_sets[$selector_piece_index], $this->attributes_indices[$selector_piece_index]);
 	// what happens if multiple of $this->tagname_indices[$selector_piece_index], $this->tagvalue_indices[$selector_piece_index], $this->attributes_indices[$selector_piece_index] are specified in the same selector? this needs more work especially since we're hacking at the end for $this->tagvalue_indices[$selector_piece_index] and $this->attributes_indices[$selector_piece_index]
-	if(sizeof($this->required_attributes) > 1) {
+	if(is_array($this->required_attributes) && sizeof($this->required_attributes) > 1) {
 		O::fatal_error('preg requires more complex code to handle all the possible orders of attributes. is this enough to not use preg for this particular select operation?');
 	}
 	//print('$this->tagname_indices[$selector_piece_index]: ');var_dump($this->tagname_indices[$selector_piece_index]);
@@ -2835,7 +2989,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 		foreach($this->tagnames[$selector_piece_index] as $tagname_index => $tagname) { // don't think we've come across a case where multiple tagnames are accepted...
 			//print('$tagname, $matches[1][$index][0]: ');var_dump($tagname, $matches[1][$index][0]);
 			//if($matches[1][$index][0] === $tagname || $tagname === '*') {
-				//print('matched_tagname<br />');
+				//print('matched_tagname<br />' . PHP_EOL);
 				$matched_tagname = true;
 				//if($this->tagname_indices[$selector_piece_index][$tagname_index] !== false) {
 				//	$this->saved_tagname_indices = $this->tagname_indices[$selector_piece_index];
@@ -2857,27 +3011,27 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 				//print('$tagname, $tagvalue, $matches[0][$index][1], $offset_to_add, $offset_depths, $parent_depth, $matched_scope: ');var_dump($tagname, $tagvalue, $matches[0][$index][1], $offset_to_add, $offset_depths, $parent_depth, $matched_scope);
 				//print('$tagname, $tagvalue, $parent_depth, $matched_scope: ');var_dump($tagname, $tagvalue, $parent_depth, $matched_scope);
 				if($matched_scope) {
-					//print('matched scope<br />');
+					//print('matched scope<br />' . PHP_EOL);
 					$matched_tagname_index = false;
 					//print('$value, $tagname, $selector_piece_index, $this->tagname_indices, $this->tagname_match_counter in matched_scope: ');var_dump($value, $tagname, $selector_piece_index, $this->tagname_indices, $this->tagname_match_counter);
 					if($this->tagname_indices[$selector_piece_index][$tagname_index] === false) {
 						$matched_tagname_index = true;
 					} else {
 						if($this->tagname_match_counter[$selector_piece_index][$tagname_index] == $this->tagname_indices[$selector_piece_index][$tagname_index]) {
-							//print('here290675<br />');
+							//print('here290675<br />' . PHP_EOL);
 							//$this->tagname_match_counter2 = 0;
 							foreach($matches[0] as $index2 => $value2) {
-								//print('here290676<br />');
+								//print('here290676<br />' . PHP_EOL);
 								//$unset_match = true;
 								//if($matches[1][$index2][0] === $tagname) {
-								//	//print('here290677<br />');
+								//	//print('here290677<br />' . PHP_EOL);
 								//	if($index === $index2) {
-								//		//print('here290678<br />');
+								//		//print('here290678<br />' . PHP_EOL);
 								//		$unset_match = false;
 								//	}
 								//	//$this->tagname_match_counter2++;
 								//}
-								//print('here290679<br />');
+								//print('here290679<br />' . PHP_EOL);
 								//if($unset_match) {
 								//	unset($matches[0][$index2]);
 								//	//unset($matches[1][$index2]);
@@ -2896,7 +3050,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 						$this->tagname_match_counter[$selector_piece_index][$tagname_index]++;
 					}
 					if($matched_tagname_index) {
-						//print('matched tagname index<br />');
+						//print('matched tagname index<br />' . PHP_EOL);
 						$matched_tagvalue = false;
 						if($this->tagvalues[$selector_piece_index][$tagname_index] === false) {
 							$matched_tagvalue = true;
@@ -2912,7 +3066,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 							}
 						}
 						if($matched_tagvalue) {
-							//print('matched tagvalue<br />');
+							//print('matched tagvalue<br />' . PHP_EOL);
 						//	if($this->tagvalue_indices[$selector_piece_index][$tagname_index] !== false) {
 						//		$this->saved_tagvalue_indices = $this->tagvalue_indices[$selector_piece_index];
 						//	}
@@ -2923,7 +3077,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 								$matched_tagvalue_index = true;
 							} else {
 								if($this->tagvalue_match_counter[$selector_piece_index][$tagname_index] == $this->tagvalue_indices[$selector_piece_index][$tagname_index]) {
-									//print('matched tagvalue index<br />');
+									//print('matched tagvalue index<br />' . PHP_EOL);
 									//print('$value, $selector_piece_index, $tagname, $tagvalue, $this->tagvalue_indices, $this->tagvalue_match_counter: ');var_dump($value, $selector_piece_index, $tagname, $tagvalue, $this->tagvalue_indices, $this->tagvalue_match_counter);
 									//$this->tagvalue_match_counter2 = 0;
 									foreach($matches[0] as $index => $value) {
@@ -2951,7 +3105,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 								$this->tagvalue_match_counter[$selector_piece_index][$tagname_index]++;
 							}
 							if($matched_tagvalue_index) {
-								//print('matched tagvalue index<br />');
+								//print('matched tagvalue index<br />' . PHP_EOL);
 								$matched_attributes = false;
 								if(sizeof($this->required_attribute_sets[$selector_piece_index][$tagname_index]) === 0) {
 									$matched_attributes = true;
@@ -2985,7 +3139,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 									}
 								}
 								if($matched_attributes) {
-									//print('matched attributes<br />');
+									//print('matched attributes<br />' . PHP_EOL);
 								//	if($this->attributes_indices[$selector_piece_index][$tagname_index] !== false) {
 								//		$this->saved_attributes_indices = $this->attributes_indices[$selector_piece_index];
 								//	}
@@ -2994,7 +3148,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 										$matched_attributes_index = true;
 									} else {
 										if($this->attributes_match_counter[$selector_piece_index][$tagname_index] == $this->attributes_indices[$selector_piece_index][$tagname_index]) {
-											//print('matched attributes indices<br />');
+											//print('matched attributes indices<br />' . PHP_EOL);
 											//$this->attributes_match_counter2 = 0;
 											foreach($matches[0] as $index2 => $value2) {
 												//$unset_match = true;
@@ -3022,7 +3176,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 									}
 									// debug
 									//if($matched_attributes_index) {
-									//	print('matched attributes index<br />');
+									//	print('matched attributes index<br />' . PHP_EOL);
 									//}
 								}
 							}
@@ -3038,7 +3192,7 @@ function recursive_select($code, $offset_to_add = 0, $selector_piece_index = 0, 
 		if($matched_tagname && $matched_tagname_index && $matched_scope && $matched_tagvalue && $matched_tagvalue_index && $matched_attributes && $matched_attributes_index) {
 			
 		} else {
-			//print('unsetting due to unmatched tagname or scope<br />');
+			//print('unsetting due to unmatched tagname or scope<br />' . PHP_EOL);
 			unset($matches[0][$index]);
 			//unset($matches[1][$index]);
 			//unset($matches[2][$index]);
@@ -3308,9 +3462,9 @@ function parse_selector_piece($piece, $selector_piece_index) {
 }
 
 function select_old($selector, $matching_array = false, $offset_depths = false) {
-	//print('start of select()<br />');
+	//print('start of select()<br />' . PHP_EOL);
 	if($matching_array === false) {
-		//print('here374859---0005.6<br />');
+		//print('here374859---0005.6<br />' . PHP_EOL);
 		//$code = array($this->LOM);
 		//$this->code = O::code_from_LOM();
 		//$matching_array = array(array($this->code, 0));
@@ -3330,7 +3484,11 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 	//print('$selector, $this->selector_piece_sets: ');var_dump($selector, $this->selector_piece_sets);
 	$selector_matches = array();
 	foreach($matching_array as $index => $value) {
+	//$index = sizeof($matching_array) - 1;
+	//while($index > -1) { // very important to go in reverse_order?
+	//	$value = $matching_array[$index];
 		$selector_matches = array_merge($selector_matches, O::preg_select($value[0], $value[1], $offset_depths));
+	//	$index--;
 	}
 	//print('$selector_matches in select before get_tag_string: ');var_dump($selector_matches);
 	foreach($selector_matches as $index => $value) {
@@ -3358,19 +3516,19 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 		$selector_piece_set_matches = false;
 		$selected_parent_matches = false;
 		$selected_parent_piece_set_index = false;
-		//print('here374859---0006<br />');
+		//print('here374859---0006<br />' . PHP_EOL);
 		$contextual_matches = $matching_array;
 		$last_piece = 'Z'; // dummy initialization
 		foreach($selector_piece_set as $piece_index => $piece) {
-			//print('here374859---0007<br />');
+			//print('here374859---0007<br />' . PHP_EOL);
 			//print('$piece: ');var_dump($piece);
 			// parse the piece
 			//if($piece_index === 0 || strlen($last_piece) === 0 || strpos($last_piece, '*') !== false) {
 			if($piece_index === 0 || strlen($last_piece) === 0) {
-				//print('here374859---0008<br />');
+				//print('here374859---0008<br />' . PHP_EOL);
 				$look_only_in_direct_children = false;
 			} else {
-				//print('here374859---0008.5<br />');
+				//print('here374859---0008.5<br />' . PHP_EOL);
 				$look_only_in_direct_children = true;
 			}
 			$piece_offset = 0;
@@ -3387,10 +3545,10 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 			$parsing_attribute_value = false;
 			$required_attribute_sets = array();
 			$required_attributes = array();
-			//print('here374859---0009<br />');
+			//print('here374859---0009<br />' . PHP_EOL);
 			// attribute systax doesn't use square brackets [ ] unlike XPath; tagname[5]=tagvalue@attname1=attvalue1@attname2=attvalue2@attname3=attvalue3
 			while($piece_offset < strlen($piece)) {
-				//print('here374859---0010<br />');
+				//print('here374859---0010<br />' . PHP_EOL);
 				if($parsing_attribute_name) {
 					if($piece[$piece_offset] === '@') {
 						$required_attributes[O::query_decode($attribute_name_piece)] = false;
@@ -3420,34 +3578,34 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 					$piece_offset++;
 					continue;
 				} elseif($piece[$piece_offset] === '=') { // then we have the tagname and we find the specified tagvalue
-					//print('here374859---0011<br />');
+					//print('here374859---0011<br />' . PHP_EOL);
 					//if($tagvalues === false) {
 					//	$tagvalues = array();
 					//}
 					$piece_offset++;
 					$tagvalue = '';
 					while($piece_offset < strlen($piece) && $piece[$piece_offset] !== '@' && $piece[$piece_offset] !== '&') {
-						//print('here374859---0011.5<br />');
+						//print('here374859---0011.5<br />' . PHP_EOL);
 						$tagvalue .= $piece[$piece_offset];
 						$piece_offset++;
 					}
 					continue;
 				} elseif($piece[$piece_offset] === '[') { // check whether we are selecting by order or by attribute
-					//print('here374859---0012<br />');
+					//print('here374859---0012<br />' . PHP_EOL);
 					$possible_index_length = strpos($piece, ']') - $piece_offset - 1;
 					$possible_index = substr($piece, $piece_offset + 1, $possible_index_length);
 					if(is_numeric($possible_index)) {
-						//print('here374859---0013<br />');
+						//print('here374859---0013<br />' . PHP_EOL);
 						$matching_index = $possible_index;
 						$piece_offset += $possible_index_length + 2;
 						continue;
 					} else {
-						//print('here374859---0031<br />');
+						//print('here374859---0031<br />' . PHP_EOL);
 						print('$possible_index: ');var_dump($possible_index);
 						O::fatal_error('!is_numeric($possible_index)');
 					}
 				} elseif($piece[$piece_offset] === '@') {
-					//print('here374859---0032<br />');
+					//print('here374859---0032<br />' . PHP_EOL);
 					if($piece_offset === 0) {
 						print('$piece: ');var_dump($piece);
 						O::fatal_error('trying to select an attribute in a system (Logical Object Model (LOM)) where attributes are properties of tags rather than standing on their own.');
@@ -3458,7 +3616,7 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 						continue;
 					}
 				} elseif($piece[$piece_offset] === '&') {
-					//print('here374859---0032.5<br />');
+					//print('here374859---0032.5<br />' . PHP_EOL);
 					if($piece_offset === 0) {
 						print('$piece: ');var_dump($piece);
 						O::fatal_error('query piece starting with &amp; makes no sense.');
@@ -3501,10 +3659,10 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 				$contextual_matches = O::match_by_tagname($tagnames, $contextual_matches, $look_only_in_direct_children, $tagvalues, $matching_indices, $required_attribute_sets);
 			}
 			//print('$contextual_matches after match_by_tagname: ');var_dump($contextual_matches);
-			//print('here374859---0033<br />');
+			//print('here374859---0033<br />' . PHP_EOL);
 			foreach($tagnames as $tagname) {
 				if($tagname[0] === '.') {
-					//print('here374859---0034<br />');
+					//print('here374859---0034<br />' . PHP_EOL);
 					$selected_parent_piece_index = $piece_index;
 					$selected_parent_matches = $contextual_matches;
 					break;
@@ -3521,7 +3679,7 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 		}
 		$matches_at_last_tag = $contextual_matches;
 		$selector_piece_set_matches = $contextual_matches;
-		//print('here374859---0038<br />');
+		//print('here374859---0038<br />' . PHP_EOL);
 		//print('$selected_parent_matches before selected parent processing in select: ');O::var_dump_full($selected_parent_matches);
 		//print('$selector_piece_set_matches before selected parent processing in select: ');var_dump($selector_piece_set_matches);
 		if($selected_parent_matches !== false) {
@@ -3565,72 +3723,72 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 				//	}
 				//}
 			}
-			//print('here374859---0038.5<br />');
+			//print('here374859---0038.5<br />' . PHP_EOL);
 			//print('$selected_parent_matches: ');var_dump($selected_parent_matches);
 			$selected_parent_full_selector_matches = array();
 			foreach($selector_piece_set_matches as $contextual_matches_index => $contextual_matches_value) {
-				//print('here374859---0038.51<br />');
+				//print('here374859---0038.51<br />' . PHP_EOL);
 				foreach($contextual_matches_value as $contextual_matches_first_index => $contextual_matches_first_value) { break; }
 				foreach($selected_parent_matches as $selected_parent_matches_index => $selected_parent_matches_value) {
-					//print('here374859---0038.52<br />');
+					//print('here374859---0038.52<br />' . PHP_EOL);
 					//print('$selected_parent_matches_index: ');var_dump($selected_parent_matches_index);
 					$first_index4 = false;
 					foreach($selected_parent_matches_value as $index4 => $value4) {
 						if($first_index4 === false) {
 							$first_index4 = $index4;
 						}
-						//print('here374859---0038.53<br />');
+						//print('here374859---0038.53<br />' . PHP_EOL);
 						if($contextual_matches_first_index === $index4) {
 							//print('$contextual_matches_first_index, $index4: ');var_dump($contextual_matches_first_index, $index4);
-							//print('here374859---0038.54<br />');
+							//print('here374859---0038.54<br />' . PHP_EOL);
 							$counter = $index4 - 1;
 							$depth_counter = 0;
 							while($counter >= $first_index4) {
-								//print('here374859---0038.55<br />');
+								//print('here374859---0038.55<br />' . PHP_EOL);
 								if($selected_parent_matches_value[$counter][0] == 1) {
 									if($selected_parent_matches_value[$counter][1][2] === 0) {
-										//print('here374859---0038.56<br />');
+										//print('here374859---0038.56<br />' . PHP_EOL);
 										$depth_counter++;
 									}
 									if($selected_parent_matches_value[$counter][1][2] === 1) {
-										//print('here374859---0038.561<br />');
+										//print('here374859---0038.561<br />' . PHP_EOL);
 										$depth_counter--;
 									}
 								}
 								$counter--;
 							}
-							//print('here374859---0038.57<br />');
+							//print('here374859---0038.57<br />' . PHP_EOL);
 							//print('$depth_counter, $depth_requirement, $piece_index, $selected_parent_piece_index: ');var_dump($depth_counter, $depth_requirement, $piece_index, $selected_parent_piece_index);
 							if($depth_requirement !== false && $depth_counter >= $depth_requirement) {
-								//print('here374859---0038.571<br />');
+								//print('here374859---0038.571<br />' . PHP_EOL);
 								$its_already_there = false;
 								foreach($selected_parent_full_selector_matches as $index35 => $value35) {
-									//print('here374859---0038.572<br />');
+									//print('here374859---0038.572<br />' . PHP_EOL);
 									if($value35 === $selected_parent_matches_value) {
-										//print('here374859---0038.573<br />');
+										//print('here374859---0038.573<br />' . PHP_EOL);
 										$its_already_there = true;
 										break;
 									}
 								}
-								//print('here374859---0038.574<br />');
+								//print('here374859---0038.574<br />' . PHP_EOL);
 								if(!$its_already_there) {
-									//print('here374859---0038.575<br />');
+									//print('here374859---0038.575<br />' . PHP_EOL);
 									$selected_parent_full_selector_matches[] = $selected_parent_matches_value;
 								}
 							} elseif($depth_counter === $piece_index - $selected_parent_piece_index) {
-								//print('here374859---0038.58<br />');
+								//print('here374859---0038.58<br />' . PHP_EOL);
 								$its_already_there = false;
 								foreach($selected_parent_full_selector_matches as $index35 => $value35) {
-									//print('here374859---0038.581<br />');
+									//print('here374859---0038.581<br />' . PHP_EOL);
 									if($value35 === $selected_parent_matches_value) {
-										//print('here374859---0038.582<br />');
+										//print('here374859---0038.582<br />' . PHP_EOL);
 										$its_already_there = true;
 										break;
 									}
 								}
-								//print('here374859---0038.583<br />');
+								//print('here374859---0038.583<br />' . PHP_EOL);
 								if(!$its_already_there) {
-									//print('here374859---0038.584<br />');
+									//print('here374859---0038.584<br />' . PHP_EOL);
 									$selected_parent_full_selector_matches[] = $selected_parent_matches_value;
 								}
 							}
@@ -3644,14 +3802,14 @@ function select_old($selector, $matching_array = false, $offset_depths = false) 
 		}
 		//print('$selector_piece_set_matches after selected parent processing in select: ');var_dump($selector_piece_set_matches);
 		if(sizeof($selector_piece_set_matches) > 0) {
-			//print('here374859---0035<br />');
+			//print('here374859---0035<br />' . PHP_EOL);
 			$selector_matches = array_merge($selector_matches, $selector_piece_set_matches);
 			//break;
 		}
 	}
 	//print('$code at the end of select: ');var_dump($code);
 	//print('$selector_matches at end of select: ');var_dump($selector_matches);
-	//print('end of select()<br />');
+	//print('end of select()<br />' . PHP_EOL);
 	return $selector_matches;
 }
 
@@ -3759,6 +3917,9 @@ function match_by_tagname($tagname_array, $matching_array = false, $look_only_in
 	//print('$tagname_array, $matching_array, $look_only_in_direct_children, $tagvalue_array, $matching_indices, $required_attribute_sets in match_by_tagname: ');var_dump($tagname_array, $matching_array, $look_only_in_direct_children, $tagvalue_array, $matching_indices, $required_attribute_sets);
 	$matches = array();
 	foreach($matching_array as $index => $value) {
+	//$index = sizeof($matching_array) - 1;
+	//while($index > -1) { // very important to go in reverse_order?
+	//	$value = $matching_array[$index];
 		if($look_only_in_direct_children) {
 			foreach($tagname_array as $tagname_index => $tagname) {
 				if($tagname[0] === '.') {
@@ -3766,10 +3927,10 @@ function match_by_tagname($tagname_array, $matching_array = false, $look_only_in
 				}
 				//print('$tagname, $tagvalue_array[$tagname_index]: ');var_dump($tagname, $tagvalue_array[$tagname_index]);
 				if($tagname === '*') {
-					//print('get_all_tags_at_this_level<br />');
+					//print('get_all_tags_at_this_level<br />' . PHP_EOL);
 					$tagname_matches = O::get_all_tags_at_this_level($value[0], $value[1], $tagvalue_array[$tagname_index], $matching_indices[$tagname_index], $required_attribute_sets[$tagname_index]);
 				} else {
-					//print('get_all_named_tags_at_this_level<br />');
+					//print('get_all_named_tags_at_this_level<br />' . PHP_EOL);
 					$tagname_matches = O::get_all_named_tags_at_this_level($value[0], $tagname, $value[1], $tagvalue_array[$tagname_index], $matching_indices[$tagname_index], $required_attribute_sets[$tagname_index]);
 				}
 				// since it doesn't make sense to try to look for a child under two separate tags, just return the last tagname match if all tagnames are satisfied
@@ -3786,10 +3947,10 @@ function match_by_tagname($tagname_array, $matching_array = false, $look_only_in
 				}
 				//print('$tagname, $tagvalue_array[$tagname_index]: ');var_dump($tagname, $tagvalue_array[$tagname_index]);
 				if($tagname === '*') {
-					//print('get_all_tags<br />');
+					//print('get_all_tags<br />' . PHP_EOL);
 					$tagname_matches = O::get_all_tags($value[0], $value[1], $tagvalue_array[$tagname_index], $matching_indices[$tagname_index], $required_attribute_sets[$tagname_index]);
 				} else {
-					//print('get_all_named_tags<br />');
+					//print('get_all_named_tags<br />' . PHP_EOL);
 					$tagname_matches = O::get_all_named_tags($value[0], $tagname, $value[1], $tagvalue_array[$tagname_index], $matching_indices[$tagname_index], $required_attribute_sets[$tagname_index]);
 				}
 				// since it doesn't make sense to try to look for a child under two separate tags, just return the last tagname match if all tagnames are satisfied
@@ -3806,6 +3967,7 @@ function match_by_tagname($tagname_array, $matching_array = false, $look_only_in
 		//	$matches = array_intersect($matches, $tagname_matches);
 		//}
 		$matches = array_merge($matches, $tagname_matches);
+	//	$index--;
 	}
 	//print('$this->code, $tagname, $matches: ');var_dump($this->code, $tagname, $matches);exit(0);
 	return $matches;
@@ -3851,7 +4013,10 @@ function LOM_match_by_tagname($tagname, $matching_array, $look_only_in_direct_ch
 	//print('$tagname, $look_only_in_direct_children, $tagvalue, $matching_index, $required_attributes in match_by_tagname: ');var_dump($tagname, $look_only_in_direct_children, $tagvalue, $matching_index, $required_attributes);
 	if(sizeof($matching_array) > 0) {
 		foreach($matching_array as $index2 => $value2) {
-			//print('here374859---0018<br />');
+		//$index2 = sizeof($matching_array) - 1;
+		//while($index2 > -1) { // very important to go in reverse_order?
+		//	$value2 = $matching_array[$index2];
+			//print('here374859---0018<br />' . PHP_EOL);
 			//print('$index2, $value2: ');var_dump($index2, $value2);
 			// debug
 			if($this->debug && !is_array($value2)) {
@@ -3864,7 +4029,7 @@ function LOM_match_by_tagname($tagname, $matching_array, $look_only_in_direct_ch
 			}
 			$potential_matches = array();
 			foreach($value2 as $index => $value) {
-				//print('here374859---0019<br />');
+				//print('here374859---0019<br />' . PHP_EOL);
 				$required_attributes_exist = true;
 				if($value[0] == 1) {
 					$existing_attributes = $value[1][1];
@@ -3899,11 +4064,11 @@ function LOM_match_by_tagname($tagname, $matching_array, $look_only_in_direct_ch
 						$tagname = substr($tagname, 1);
 					}
 					//print('$index, $value[0], $value[1][2], $tagname, $value[1][0], $tagvalue, $value2[$index + 1][0], $tagvalue, $value2[$index + 1][1]: ');var_dump($index, $value[0], $value[1][2], $tagname, $value[1][0], $tagvalue, $value2[$index + 1][0], $tagvalue, $value2[$index + 1][1]);
-					//print('here237541<br />');
+					//print('here237541<br />' . PHP_EOL);
 					if(($look_only_in_direct_children === false || $matching_depth === 1) && $value[0] == 1 && $value[1][2] === 0 && ($tagname === $value[1][0] || $tagname == '*') && ($tagvalue === false || (strlen($tagvalue) > 0 && $value2[$index + 1][0] === 0 && $tagvalue === $value2[$index + 1][1])) && $required_attributes_exist) {
-						//print('here237542<br />');
+						//print('here237542<br />' . PHP_EOL);
 						if($matching_index === false || $matching_index === $matches_counter) {
-							//print('here237543<br />');
+							//print('here237543<br />' . PHP_EOL);
 							// build up the match
 							$match_depth = $matching_depth;
 							$match_at_depth = array();
@@ -3913,26 +4078,26 @@ function LOM_match_by_tagname($tagname, $matching_array, $look_only_in_direct_ch
 								}
 								$match_at_depth[$match_index2] = $matching_entry2;
 								if($matching_entry2[0] == 1 && $matching_entry2[1][2] === 0) {
-									//print('here237544<br />');
+									//print('here237544<br />' . PHP_EOL);
 									$match_depth++;
 								}
 								if($matching_entry2[0] == 1 && $matching_entry2[1][2] === 1) {
-									//print('here237545<br />');
+									//print('here237545<br />' . PHP_EOL);
 									$match_depth--;
 									if($match_depth === $matching_depth) {
-										//print('here237546<br />');
+										//print('here237546<br />' . PHP_EOL);
 										break;
 									}
 								}
 							}
-							//print('here237547<br />');
+							//print('here237547<br />' . PHP_EOL);
 							//print('$match_at_depth: ');var_dump($match_at_depth);
 							$potential_matches[] = $match_at_depth;
 							$tagvalues_satisfied[$tagvalue_index] = true;
 							//print('$potential_matches, $tagvalues_satisfied: ');var_dump($potential_matches, $tagvalues_satisfied);
 							//$first_tagvalue_was_matched = true;
 						}
-						//print('here237548<br />');
+						//print('here237548<br />' . PHP_EOL);
 						$matches_counter++;
 					}
 					//if($tagvalue_index > 0 && $first_tagvalue_was_matched) { // if both tagvalue conditions are not satisfied then don't call it a match
@@ -3943,11 +4108,11 @@ function LOM_match_by_tagname($tagname, $matching_array, $look_only_in_direct_ch
 				//print('$potential_matches: ');var_dump($potential_matches);
 
 				if($value[0] == 1 && $value[1][2] === 0) {
-					//print('here374859---0021<br />');
+					//print('here374859---0021<br />' . PHP_EOL);
 					$matching_depth++;
 				}
 				if($value[0] == 1 && $value[1][2] === 1) {
-					//print('here374859---0022<br />');
+					//print('here374859---0022<br />' . PHP_EOL);
 					$matching_depth--;
 				}
 			}
@@ -3974,6 +4139,7 @@ function LOM_match_by_tagname($tagname, $matching_array, $look_only_in_direct_ch
 					O::fatal_error('code to handle more than one required tagvalue while not only looking in direct children  has not been written');
 				}
 			}*/
+		//	$index2--;
 		}
 	}
 	//print('$matches in match_by_tagname: ');var_dump($matches);
@@ -4125,10 +4291,15 @@ private function internal_replace($code, $old_value, $new_value, $offset = 0) {
 	//	return $code;
 	//}
 	$new_code = substr($code, 0, $offset) . $new_value . substr($code, $offset + strlen($old_value));
+	$this->offsets_need_adjusting = true;
 	if($code === $new_code) {
 		$this->string_operation_made_a_change = false;
+		$this->offsets_need_adjusting = false;
 	} else {
 		$this->string_operation_made_a_change = true;
+		if(strlen($old_value) === strlen($new_value)) {
+			$this->offsets_need_adjusting = false;
+		}
 	}
 	//$this->zero_offsets = array();
 	//print('$code, $old_value, $new_value, substr($code, 0, $offset) . $new_value . substr($code, $offset + strlen($old_value)): ');var_dump($code, $old_value, $new_value, substr($code, 0, $offset) . $new_value . substr($code, $offset + strlen($old_value)));
@@ -4152,11 +4323,13 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 	//print('$selector, $offset, $offset_adjust, substr($this->code, $offset - 10, 20) in is_numeric($selector) in set: ');O::var_dump_full($selector, $offset, $offset_adjust, substr($this->code, $offset - 10, 20));
 	//print('$this->LOM in is_numeric($selector) in set: ');O::var_dump_full($this->LOM);
 	$this->code = O::string_replace($this->code, $old_value, $new_value, $offset);
-	//print('before adjust_offset_depths in set<br />');
+	//print('before adjust_offsets in set<br />' . PHP_EOL);
 	if($this->string_operation_made_a_change) {
 		if($offset_adjust != 0) {
-			//O::adjust_offset_depths($offset, $offset_adjust);
-			O::adjust_offset_depths($offset + 1, $offset_adjust); // + 1 because only subsequent offsets are affected
+			//O::adjust_offsets($offset, $offset_adjust);
+			if($this->offsets_need_adjusting) {
+				$included_array = O::adjust_offsets($offset + 1, $offset_adjust, $included_array); // + 1 because only subsequent offsets are affected
+			}
 			
 			//print('$this->code, $this->string_operation_made_a_change in is_numeric($selector) in set: ');O::var_dump_full($this->code, $this->string_operation_made_a_change);
 			/*$this->LOM[$selector][1] = $new_value;
@@ -4183,7 +4356,7 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 				$this->offset_depths[$new_value_offset] = $new_value_depth;
 			}
 			ksort($this->offset_depths);*/
-			O::replace_offset_depths($old_value, $new_value, $offset, $depth_of_offset);
+			O::replace_offsets_and_depths($old_value, $new_value, $offset, $offset_adjust, $depth_of_offset);
 			
 			/*$replacing_an_attribute = false;
 			if(O::is_in_an_opening_tag($offset)) { // the replace is in an opening tag
@@ -4213,37 +4386,44 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 				}
 			}*/
 			foreach($this->context as $context_index => $context_value) {
+				if($context_value[3] === false) { // false here means use $this->offset_depths
+					continue;
+				}
 				//print('$context_value[1]: ');var_dump($context_value[1]);
 				//print('$offset, $offset_adjust, $this->context[$context_index] before offset adjusting: ');var_dump($offset, $offset_adjust, $this->context[$context_index]);
 				/*if($offset >= $context_value[1] && $offset <= $context_value[1] + strlen($context_value[0])) {
 					//if($context_value[1] === $offset) {
-					//print('here4569710<br />');
+					//print('here4569710<br />' . PHP_EOL);
 					//print('$old_value, $new_value: ');var_dump($old_value, $new_value);
 					$context_value[0] = O::string_replace($context_value[0], $old_value, $new_value, $offset - $context_value[1]);
 				}*/
 				
 				if(is_array($context_value[1])) { // it may be false, meaning the whole code
 					foreach($context_value[1] as $index => $value) {
-						//if($offset >= $value[1] && $offset <= $value[1] + strlen($value[0])) {
-						//	$context_value[1][$index][0] = O::string_replace($context_value[1][$index][0], $old_value, $new_value, $offset - $value[1]);
-						//}
+						if($offset >= $value[1] && $offset <= $value[1] + strlen($value[0])) {
+							$context_value[1][$index][0] = O::string_replace($context_value[1][$index][0], $old_value, $new_value, $offset - $value[1]);
+						}
 						// context does not use string-offset pairs; that is LOM. context uses offset-strlen pairs, in other words: markers
-						if($offset >= $value[0] && $offset <= $value[0] + $value[1]) { // change the strlen in this parent context entry
-							$this->context[$context_index][1][$index][1] += $offset_adjust;
-						}
-						if($offset <= $value[0]) { // change the offset in this parent context entry
-							$this->context[$context_index][1][$index][0] += $offset_adjust;
-						}
+					//	if($offset >= $value[0] && $offset <= $value[0] + $value[1]) { // change the strlen in this parent context entry
+					//		$this->context[$context_index][1][$index][1] += $offset_adjust;
+					//	}
+					//	if($offset <= $value[0]) { // change the offset in this parent context entry
+					//		$this->context[$context_index][1][$index][0] += $offset_adjust;
+					//	}
 					}
 				}
-				foreach($context_value[2] as $index => $value) {
-					if($offset >= $value[0] && $offset <= $value[0] + $value[1]) { // change the strlen in this matches context entry
-						$this->context[$context_index][2][$index][1] += $offset_adjust;
-					}
-					if($offset <= $value[0]) { // change the offset in this matches context entry
-						$this->context[$context_index][2][$index][0] += $offset_adjust;
-					}
-				}
+			//	foreach($context_value[2] as $index => $value) {
+			//		if($offset >= $value[1] && $offset <= $value[1] + strlen($value[0])) {
+			//			$context_value[2][$index][0] = O::string_replace($context_value[2][$index][0], $old_value, $new_value, $offset - $value[1]);
+			//			$this->context[$context_index][2][$index][1] += $offset_adjust;
+			//		}
+			//		if($offset >= $value[0] && $offset <= $value[0] + $value[1]) { // change the strlen in this matches context entry
+			//			$this->context[$context_index][2][$index][1] += $offset_adjust;
+			//		}
+			//		if($offset <= $value[0]) { // change the offset in this matches context entry
+			//			$this->context[$context_index][2][$index][0] += $offset_adjust;
+			//		}
+			//	}
 				/*if($replacing_an_attribute) {
 					print('$context_value[2] before replacing attribute: ');var_dump($context_value[2]);
 					foreach($context_value[2] as $context2_index => $context2_value) {
@@ -4291,7 +4471,7 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 				$parent_node[$selector][1] = $new_value;
 			}
 		}*/
-		//print('here4569702<br />');
+		//print('here4569702<br />' . PHP_EOL);
 		
 		/*foreach($this->variables as $variable_index => $variable_value) {
 			if(is_array($this->variables[$variable_index])) {
@@ -4316,11 +4496,11 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 						if($offset >= $value[1] && $offset <= $value[1] + strlen($value[0])) {
 							$this->variables[$variable_index][$index][0] = O::string_replace($this->variables[$variable_index][$index][0], $old_value, $new_value, $offset - $value[1]);
 						}
-						if($offset_adjust != 0) {
-							if($this->variables[$variable_index][$index][1] >= $offset) {
-								$this->variables[$variable_index][$index][1] += $offset_adjust;
-							}
-						}
+					//	if($offset_adjust != 0) {
+					//		if($this->variables[$variable_index][$index][1] >= $offset) {
+					//			$this->variables[$variable_index][$index][1] += $offset_adjust;
+					//		}
+					//	}
 					}
 			//	} else {
 			//		if($offset >= $this->variables[$variable_index][1] && $offset <= $this->variables[$variable_index][1] + strlen($this->variables[$variable_index][0])) {
@@ -4344,46 +4524,46 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 			print('$included_array: ');var_dump($included_array);
 			O::fatal_error('is_string($included_array) in replace() is not handled');
 		} elseif(is_array($included_array)) {
-			//print('here4569703<br />');
+			//print('here4569703<br />' . PHP_EOL);
 			if(is_array($included_array[0])) {
-				//print('here4569704<br />');
+				//print('here4569704<br />' . PHP_EOL);
 				foreach($included_array as $index => $value) {
-					//print('here4569705<br />');
+					//print('here4569705<br />' . PHP_EOL);
 					if($offset >= $value[1] && $offset <= $value[1] + strlen($value[0])) {
 					//if($value[1] === $offset) {
-						//print('here4569706<br />');
+						//print('here4569706<br />' . PHP_EOL);
 						//print('$included_array[$index][0], $old_value, $new_value, $offset - $value[1] before replace: ');var_dump($included_array[$index][0], $old_value, $new_value, $offset - $value[1]);
 						$included_array[$index][0] = O::string_replace($included_array[$index][0], $old_value, $new_value, $offset - $value[1]);
 						//print('$included_array[$index][0] after replace: ');var_dump($included_array[$index][0]);
 					}
-					if($offset_adjust != 0) {
-						//print('here4569707<br />');
-						if($included_array[$index][1] >= $offset) {
-							//print('here4569708<br />');
-							$included_array[$index][1] += $offset_adjust;
-						}
-					}
+				//	if($offset_adjust != 0) {
+				//		//print('here4569707<br />' . PHP_EOL);
+				//		if($included_array[$index][1] >= $offset) {
+				//			//print('here4569708<br />' . PHP_EOL);
+				//			$included_array[$index][1] += $offset_adjust;
+				//		}
+				//	}
 				}
 			} else {
-				//print('here4569709<br />');
+				//print('here4569709<br />' . PHP_EOL);
 				//foreach($included_array as $index => $value) {
 				//	$included_array[$index] = $new_value;
 				//}
 				if($offset >= $included_array[1] && $offset <= $included_array[1] + strlen($included_array[0])) {
 					//if($included_array[1] === $offset) {
-					//print('here4569710<br />');
+					//print('here4569710<br />' . PHP_EOL);
 					//print('$old_value, $new_value: ');var_dump($old_value, $new_value);
 					$included_array[0] = O::string_replace($included_array[0], $old_value, $new_value, $offset - $included_array[1]);
 				}
-				if($offset_adjust != 0) {
-					if($included_array[1] >= $offset) {
-						//print('here4569711<br />');
-						$included_array[1] += $offset_adjust;
-					}
-				}
+			//	if($offset_adjust != 0) {
+			//		if($included_array[1] >= $offset) {
+			//			//print('here4569711<br />' . PHP_EOL);
+			//			$included_array[1] += $offset_adjust;
+			//		}
+			//	}
 			}
 		} else {
-			//print('here4569712<br />');
+			//print('here4569712<br />' . PHP_EOL);
 			//$included_array = O::string_replace('', $new_value, $offset, $included_array);
 			$included_array = true;
 		}
@@ -4392,14 +4572,47 @@ function replace($old_value, $new_value, $offset = 0, $included_array = false) {
 }
 
 function set($selector, $new_value = false, $parent_node = false, $parent_node_only = false) {
-	if(is_array($new_value) && !is_array($selector)) { // swap them
+	if(is_array($new_value) && is_array($new_value[0]) && !is_array($selector)) { // swap them
 		$temp_selector = $new_value;
 		$selector = $new_value;
 		$new_value = $temp_selector;
 	}
 	// this function assumes the selector only chooses a single entry rather than a range, otherwise array_slice_replace would have to be used. not an unassailable position
 	//print('$selector, $new_value, $parent_node in set: ');var_dump($selector, $new_value, $parent_node);
-	if(is_numeric($parent_node)) {
+	if(is_array($parent_node) && is_array($parent_node[0]) && sizeof($parent_node) > 1) {
+		if(!is_array($new_value)) {
+			print('$selector, $new_value, $parent_node in set: ');var_dump($selector, $new_value, $parent_node);
+			O::fatal_error('$parent_node is multiple but $new_value is not, so how to proceed is unwritten');
+		} elseif(sizeof($new_value) !== sizeof($parent_node)) {
+			print('$selector, $new_value, $parent_node in set: ');var_dump($selector, $new_value, $parent_node);
+			O::fatal_error('$parent_node and $new_value are both multiple but have different sizes, so how to proceed is unwritten');
+		} else {
+			//print('$parent_node before in set with multiple: ');var_dump($parent_node);
+			$old_value = O::get($selector, $parent_node, false, false, true);
+			$counter = sizeof($parent_node) - 1;
+			while($counter > -1) { // very important to go in reverse order since offsets may change?
+				//print('$counter, $parent_node[$counter] single before: ');var_dump($counter, $parent_node[$counter]);
+				$parent_node[$counter] = O::set($selector, $new_value[$counter], $parent_node[$counter], $parent_node_only);
+				//print('$counter, $parent_node[$counter], $new_value[$counter], $old_value[$counter] single after: ');var_dump($counter, $parent_node[$counter], $new_value[$counter], $old_value[$counter]);
+				// must do inline offset adjustment since parent_node is multiple
+				$offset_adjust = strlen($new_value[$counter]) - strlen($old_value[$counter]);
+				//print('$offset_adjust in set with multiple: ');var_dump($offset_adjust);
+				if($offset_adjust != 0) {
+					$counter2 = $counter + 1;
+					while($counter2 < sizeof($parent_node)) {
+						//print('$counter2 in set with multiple: ');var_dump($counter2);
+						$parent_node[$counter2][1] += $offset_adjust;
+						$counter2++;
+						//break; // debug
+					}
+				}
+				//break; // debug
+				$counter--;
+			}
+			//print('$parent_node after in set with multiple: ');var_dump($parent_node);
+			return $parent_node;
+		}
+	} elseif(is_numeric($parent_node)) {
 		print('$selector, $new_value, $parent_node, $parent_node_only in set: ');var_dump($selector, $new_value, $parent_node, $parent_node_only);
 		O::fatal_error('assuming parent_node is an offset in set but this is not coded yet');
 	} elseif(is_string($parent_node) && strpos(O::query_decode($parent_node), '<') !== false) {
@@ -4413,7 +4626,8 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 	//print('$parent_node mid set: ');var_dump($parent_node);
 	$new_value = (string)$new_value;
 	O::check_tag_types($new_value);
-	if($new_value === false || $new_value === NULL || strlen($new_value) === 0) {
+	//if($new_value === false || $new_value === NULL || strlen($new_value) === 0) {
+	if($new_value === false || $new_value === NULL) {
 		$parent_node = O::delete($selector, $parent_node);
 	} elseif(is_numeric($selector)) { // treat it as an offset
 		$selector = (int)$selector;
@@ -4432,27 +4646,27 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 					O::fatal_error('not sure what to do when $full_string starts with a closing tag in set()');
 				}
 			} elseif($this->must_check_for_self_closing && $full_string[strpos($full_string, '>', 1) - 1] === '/') { // self-closing tag
-				//print('self-closing tag at position: ' . $position . '<br />');
+				//print('self-closing tag at position: ' . $position . '<br />' . PHP_EOL);
 				$old_value = $expanded_LOM[0][0];
 				$offset = $expanded_LOM[0][1];
 			} elseif($this->must_check_for_non_parsed_character_data && substr($full_string, 1, 8) === '![CDATA[') { // non-parsed character data
-				//print('non-parsed character data at position: ' . $position . '<br />');
+				//print('non-parsed character data at position: ' . $position . '<br />' . PHP_EOL);
 				$old_value = $expanded_LOM[0][0];
 				$offset = $expanded_LOM[0][1];
 			} elseif($this->must_check_for_comment && substr($full_string, 1, 3) === '!--') { // comment
-				//print('comment at position: ' . $position . '<br />');
+				//print('comment at position: ' . $position . '<br />' . PHP_EOL);
 				$old_value = $expanded_LOM[0][0];
 				$offset = $expanded_LOM[0][1];
 			} elseif($this->must_check_for_programming_instruction && $full_string[1] === '?') { // programming instruction
-				//print('programming instruction at position: ' . $position . '<br />');
+				//print('programming instruction at position: ' . $position . '<br />' . PHP_EOL);
 				$old_value = $expanded_LOM[0][0];
 				$offset = $expanded_LOM[0][1];
 			} elseif($this->must_check_for_ASP && $full_string[1] === '%') { // ASP
-				//print('ASP at position: ' . $position . '<br />');
+				//print('ASP at position: ' . $position . '<br />' . PHP_EOL);
 				$old_value = $expanded_LOM[0][0];
 				$offset = $expanded_LOM[0][1];
 			} else { // opening tag
-			//	//print('opening tag at position: ' . $position . '<br />');
+			//	//print('opening tag at position: ' . $position . '<br />' . PHP_EOL);
 			//	$this->offset_depths[$position] = $depth;
 			//	$depth++;
 				$old_value = $expanded_LOM[1][0];
@@ -4473,8 +4687,8 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 			//print('$this->LOM in is_numeric($selector) in set: ');O::var_dump_full($this->LOM);
 			if(!$parent_node_only) {
 				$this->code = O::replace($this->code, $old_value, $new_value, $offset);
-				//print('before adjust_offset_depths in set<br />');
-				O::adjust_offset_depths($offset, $offset_adjust);
+				//print('before adjust_offsets in set<br />' . PHP_EOL);
+				O::adjust_offsets($offset, $offset_adjust);
 				//print('$this->code, $this->string_operation_made_a_change in is_numeric($selector) in set: ');O::var_dump_full($this->code, $this->string_operation_made_a_change);
 				if($this->string_operation_made_a_change) {
 					//$this->LOM[$selector][1] = $new_value;
@@ -4537,7 +4751,7 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 			//		$parent_node[$selector][1] = $new_value;
 			//	}
 			//}
-			//print('here4569702<br />');
+			//print('here4569702<br />' . PHP_EOL);
 
 			foreach($this->variables as $variable_index => $variable_value) {
 				if(is_array($this->variables[$variable_index])) {
@@ -4564,42 +4778,42 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 			}
 
 			if(is_array($parent_node)) {
-				//print('here4569703<br />');
+				//print('here4569703<br />' . PHP_EOL);
 				if(is_array($parent_node[0])) {
-					//print('here4569704<br />');
+					//print('here4569704<br />' . PHP_EOL);
 					foreach($parent_node as $index => $value) {
-						//print('here4569705<br />');
+						//print('here4569705<br />' . PHP_EOL);
 						if($offset >= $value[1] && $offset <= $value[1] + strlen($value[0])) {
 						//if($value[1] === $offset) {
-							//print('here4569706<br />');
+							//print('here4569706<br />' . PHP_EOL);
 							//print('$parent_node[$index][0], $old_value, $new_value, $offset - $value[1] before replace: ');var_dump($parent_node[$index][0], $old_value, $new_value, $offset - $value[1]);
 							$parent_node[$index][0] = O::replace($parent_node[$index][0], $old_value, $new_value, $offset - $value[1]);
 							//print('$parent_node[$index][0] after replace: ');var_dump($parent_node[$index][0]);
 						}
-						//print('here4569707<br />');
+						//print('here4569707<br />' . PHP_EOL);
 						if($parent_node[$index][1] >= $offset) {
-							//print('here4569708<br />');
+							//print('here4569708<br />' . PHP_EOL);
 							$parent_node[$index][1] += $offset_adjust;
 						}
 					}
 				} else {
-					//print('here4569709<br />');
+					//print('here4569709<br />' . PHP_EOL);
 					//foreach($parent_node as $index => $value) {
 					//	$parent_node[$index] = $new_value;
 					//}
 					if($offset >= $parent_node[1] && $offset <= $parent_node[1] + strlen($parent_node[0])) {
 						//if($parent_node[1] === $offset) {
-						//print('here4569710<br />');
+						//print('here4569710<br />' . PHP_EOL);
 						//print('$old_value, $new_value: ');var_dump($old_value, $new_value);
 						$parent_node[0] = O::replace($parent_node[0], $old_value, $new_value, $offset - $parent_node[1]);
 					}
 					if($parent_node[1] >= $offset) {
-						//print('here4569711<br />');
+						//print('here4569711<br />' . PHP_EOL);
 						$parent_node[1] += $offset_adjust;
 					}
 				}
 			} else {
-				//print('here4569712<br />');
+				//print('here4569712<br />' . PHP_EOL);
 				$parent_node = $new_value;
 			}
 		*/	
@@ -4619,10 +4833,10 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 		while($index > -1) {
 			$parent_node = O::set($selector_matches[$index][1], $new_value, $parent_node, $parent_node_only);
 			/*if($this->LOM[$result][0] === 0) { // then it is text
-				//print('it is text<br />');
+				//print('it is text<br />' . PHP_EOL);
 				$parent_node = O::set($result, $new_value, $parent_node, $parent_node_only);
 			} else {
-				//print('it is not text<br />');
+				//print('it is not text<br />' . PHP_EOL);
 				$parent_node = O::set($result + 1, $new_value, $parent_node, $parent_node_only); // + 1 since get_LOM_indices is returning the opening tags
 			}*/
 			$index--;
@@ -4932,9 +5146,9 @@ function new_($new_value, $selector = false) {
 	O::check_tag_types($new_value);
 	$new_matches = array();
 	if(is_numeric($selector)) { // treat it as an offset
-		//print('is_numeric($selector) in new_<br />');
+		//print('is_numeric($selector) in new_<br />' . PHP_EOL);
 		$selector = (int)$selector;
-		//print('expanding in new_<br />');
+		//print('expanding in new_<br />' . PHP_EOL);
 		$expanded_LOM = O::expand($this->code, $selector, false, false, 'greedy');
 	//	print('$expanded_LOM in new_: ');var_dump($expanded_LOM);
 		//if($expanded_LOM[0][1] === false) { // deadly hack?? seems so! 2019-07-09. um 2022-01-16
@@ -4958,8 +5172,8 @@ function new_($new_value, $selector = false) {
 				$depth_of_offset = O::depth($offset);
 			}
 			print('$offset, $depth_of_offset, $this->code in is_numeric($selector) in new_: ');O::var_dump_full($offset, $depth_of_offset, $this->code);
-			//print('before adjust_offset_depths in new_<br />');
-			O::adjust_offset_depths($offset, $offset_adjust);
+			//print('before adjust_offsets in new_<br />' . PHP_EOL);
+			O::adjust_offsets($offset, $offset_adjust);
 			//$this->offset_depths[] = array($offset, $depth_of_offset + 1);
 			//if() {
 		*/
@@ -5087,7 +5301,7 @@ function new_($new_value, $selector = false) {
 		//	$this->context[] = array($selector, false, $offset, $selector_matches);
 		//}
 	} elseif(is_string($selector)) {
-		//print('is_string($selector) in new_<br />');
+		//print('is_string($selector) in new_<br />' . PHP_EOL);
 		//$selector_matches = O::get($selector);
 		//$selector_matches = O::get_closing_LOM_indices($selector, false, false, false, false);
 		//$selector_matches = O::get_LOM_indices($selector, false, false, false, false); // kind of ugly to always add before? after? the opening tag
@@ -5194,7 +5408,7 @@ function new_($new_value, $selector = false) {
 		}
 		*/
 	} elseif(is_array($selector)) { // recurse??
-		//print('is_array($selector) in new_<br />');
+		//print('is_array($selector) in new_<br />' . PHP_EOL);
 		if(O::all_entries_are_arrays($selector)) {
 			$index = sizeof($selector) - 1; // have to go in reverse order
 			while($index > -1) {
@@ -5224,37 +5438,37 @@ function new_($new_value, $selector = false) {
 		//}
 		//$this->debug_counter++;
 		/*$counter = 0;
-		//print('here37589708-0<br />');
+		//print('here37589708-0<br />' . PHP_EOL);
 		if(sizeof($selector) === 1) {
-			//print('here37589708-1<br />');
+			//print('here37589708-1<br />' . PHP_EOL);
 			$its_an_array_of_LOM_arrays = false;
 			foreach($selector as $index => $value) {
-				//print('here37589708-2<br />');
+				//print('here37589708-2<br />' . PHP_EOL);
 				$counter = 0;
 				$proper_LOM_array_format_counter = 0;
 				foreach($value as $index2 => $value2) {
-					//print('here37589708-3<br />');
+					//print('here37589708-3<br />' . PHP_EOL);
 					if($value2[0] === 0 || $value2[0] === 1) {
-						//print('here37589708-4<br />');
+						//print('here37589708-4<br />' . PHP_EOL);
 						$proper_LOM_array_format_counter++;
 					}
-					//print('here37589708-5<br />');
+					//print('here37589708-5<br />' . PHP_EOL);
 					$counter++;
 					if($counter === 2) {
-						//print('here37589708-6<br />');
+						//print('here37589708-6<br />' . PHP_EOL);
 						break;
 					}
 				}
-				//print('here37589708-7<br />');
+				//print('here37589708-7<br />' . PHP_EOL);
 				if($counter === $proper_LOM_array_format_counter) {
-					//print('here37589708-8<br />');
+					//print('here37589708-8<br />' . PHP_EOL);
 					$its_an_array_of_LOM_arrays = true;
 					break;
 				}
 			}
-			//print('here37589708-9<br />');
+			//print('here37589708-9<br />' . PHP_EOL);
 			if($its_an_array_of_LOM_arrays) {
-				//print('here37589708-10<br />');
+				//print('here37589708-10<br />' . PHP_EOL);
 				$selector = $selector[$index];
 			}
 		}
@@ -5399,12 +5613,31 @@ function random($selector, $parent_node = false, $parent_node_only = false) {
 
 function delete($selector, $parent_node = false, $parent_node_only = false) {
 	//print('$selector, $parent_node, $this->code, $this->LOM, $this->context before delete: ');var_dump($selector, $parent_node, $this->code, $this->LOM, $this->context);
-	if($parent_node === false) {
-
-	} elseif(!is_array($parent_node)) {
-		print('$parent_node: ');var_dump($parent_node);
-		O::fatal_error('!is_array($parent_node) is not coded for yet because how to get what the selector is referring to in a $parent_node that is a mere string without an accompanying offset is unclear');
+// 	if($parent_node === false) {
+//
+// 	} elseif(!is_array($parent_node)) {
+// 		print('$parent_node: ');var_dump($parent_node);
+// 		O::fatal_error('!is_array($parent_node) is not coded for yet because how to get what the selector is referring to in a $parent_node that is a mere string without an accompanying offset is unclear');
+// 	}
+	if(is_array($parent_node) && !O::all_entries_are_arrays($parent_node)) {
+		$parent_node = array($parent_node);
+	} elseif(is_string($parent_node) && strpos(O::query_decode($parent_node), '<') !== false) {
+		$add_to_context = false;
+		$ignore_context = true;
+		$parent_node_only = true;
+		//$this->code = O::code_from_LOM();
+		if(strpos($this->code, $parent_node) !== false) {
+			$parent_node = array(array($parent_node, strpos($this->code, $parent_node)));
+		} else {
+			$parent_node = array(array($parent_node, 0));
+		}
+	} elseif(is_string($parent_node)) {
+		$parent_node = O::get($parent_node, false, $add_to_context, $ignore_context); // not sure if we should force whether to add to context
 	}
+	if(is_array($parent_node) && sizeof($parent_node) === 0) {
+		return array();
+	}
+	//print('$parent_node in delete(): ');var_dump($parent_node);
 	// worth noting that it probably would have been easier to have this function be a sort of alias and return O::set($selector, '', $parent_node = false); although the assumption that set is working on only single values would no longer hold...
 	if(is_numeric($selector)) { // treat it as an offset
 		$selector = (int)$selector;
@@ -5496,8 +5729,8 @@ function delete($selector, $parent_node = false, $parent_node_only = false) {
 						}
 					}
 				}
-				//print('before adjust_offset_depths in delete<br />');
-				O::adjust_offset_depths($offset, $offset_adjust);
+				//print('before adjust_offsets in delete<br />' . PHP_EOL);
+				O::adjust_offsets($offset, $offset_adjust);
 			}
 		}
 		if($parent_node !== false) {
@@ -5567,7 +5800,7 @@ function delete($selector, $parent_node = false, $parent_node_only = false) {
 		}*/
 	} elseif(is_string($selector)) {
 		//$selector_matches = O::get_LOM_indices($selector, false, false, false, false);
-		$selector_matches = O::get_tagged($selector, false, false, false, false);
+		$selector_matches = O::get_tagged($selector, $parent_node, false, false, false);
 		//print('$selector_matches in is_string($selector) in delete(): ');var_dump($selector_matches);
 		//$counter = sizeof($this->offsets_from_get) - 1;
 		$counter = sizeof($selector_matches) - 1;
@@ -5717,13 +5950,13 @@ function delete($selector, $parent_node = false, $parent_node_only = false) {
 				// have to go in reverse order
 				foreach($selector[$counter1] as $counter2 => $value2) {  }
 				while(isset($selector[$counter1][$counter2])) {
-					//print('deleting index2: ' . $counter2 . '<br />');
+					//print('deleting index2: ' . $counter2 . '<br />' . PHP_EOL);
 					$parent_node = O::delete($counter2, $parent_node);
 					//print('nested array $selector[$counter1] after nested delete: ');O::var_dump_full($selector[$counter1]);
 					$counter2--;
 				}
 			} else {
-				//print('deleting index: ' . $counter1 . '<br />');
+				//print('deleting index: ' . $counter1 . '<br />' . PHP_EOL);
 				$parent_node = O::delete($counter1, $parent_node);
 			}
 			$counter1--;
@@ -5814,7 +6047,7 @@ function strip_tag($selector, $parent_node = false, $parent_node_only = false) {
 	//print('O::LOM_to_string($this->LOM) before strip_tag: ');O::var_dump_full(O::LOM_to_string($this->LOM));
 	// worth noting that it probably would have been easier to have this function be a sort of alias and return O::set($selector, '', $parent_node = false); although the assumption that set is working on only single values would no longer hold...
 	if(is_numeric($selector)) { // treat it as an offset
-		//print('is_numeric($selector) in strip_tag<br />');
+		//print('is_numeric($selector) in strip_tag<br />' . PHP_EOL);
 		$selector = (int)$selector;
 		//$new_array = array();
 		//$index_counter = false;
@@ -5934,10 +6167,10 @@ function strip_tag($selector, $parent_node = false, $parent_node_only = false) {
 			$this->context = array_values($this->context);
 		}*/
 	} elseif(is_string($selector) && $selector[0] === '<') { // would like this type of data type handling in more functions
-		//print('is_string($selector) && $selector[0] === '<' in strip_tag<br />');
+		//print('is_string($selector) && $selector[0] === '<' in strip_tag<br />' . PHP_EOL);
 		return substr($selector, strpos($selector, '>') + 1, strlen($selector) - (strpos($selector, '>') + 1) - (strlen($selector) - O::strpos_last($selector, '<')));
 	} elseif(is_string($selector)) {
-		//print('is_string($selector) in strip_tag<br />');
+		//print('is_string($selector) in strip_tag<br />' . PHP_EOL);
 		$selector_matches = O::get_LOM_indices($selector, false, false, false, false);
 		//print('$selector_matches: ');var_dump($selector_matches);
 		$counter = sizeof($selector_matches) - 1;
@@ -6001,7 +6234,7 @@ function strip_tag($selector, $parent_node = false, $parent_node_only = false) {
 			$this->context = array_values($this->context);
 		}*/
 	} elseif(is_array($selector)) {
-		//print('is_array($selector) in strip_tag<br />');
+		//print('is_array($selector) in strip_tag<br />' . PHP_EOL);
 		if(O::all_entries_are_arrays($selector)) {
 			$counter = sizeof($selector) - 1;
 			while($counter > -1) { // go in reverse order
@@ -6239,11 +6472,11 @@ function add($to_add, $selector, $parent_node = false, $parent_node_only = false
 	}
 	//print('$to_add, $selector, $parent_node, $parent_node_only in add after parameter swapping: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 	if(is_numeric($selector)) { // treat it as an offset
-		//print('here8567080<br />');
+		//print('here8567080<br />' . PHP_EOL);
 		$selector = (int)$selector;
 		$parent_node = O::set($selector, O::get($selector, $parent_node) + $to_add, $parent_node, $parent_node_only);
 	} elseif(is_string($selector)) {
-		//print('here8567081<br />');
+		//print('here8567081<br />' . PHP_EOL);
 		//$index_results = O::get_LOM_indices($selector, $parent_node);
 		//$offsets = O::get_offsets($selector, $parent_node);
 		//foreach($offsets as $offset) {
@@ -6252,7 +6485,7 @@ function add($to_add, $selector, $parent_node = false, $parent_node_only = false
 		//print('$selector_matches, $selector_matches_index in add: ');var_dump($selector_matches, $selector_matches_index);
 		//foreach($selector_matches as $selector_match) {
 		while($selector_matches_index > -1) {
-			//print('here8567082<br />');
+			//print('here8567082<br />' . PHP_EOL);
 			//print('$index, O::get($index), $to_add in add: ');var_dump($index, O::get($index), $to_add);
 			//$parent_node = O::set($offset, O::get($offset, $parent_node) + $to_add, $parent_node, $parent_node_only);
 			$parent_node = O::set($selector_matches[$selector_matches_index][1], O::tagless($selector_matches[$selector_matches_index][0]) + $to_add, $parent_node, $parent_node_only);
@@ -6260,9 +6493,10 @@ function add($to_add, $selector, $parent_node = false, $parent_node_only = false
 		}
 		//O::set($selector, O::get($selector, $parent_node) + $to_add, $parent_node);
 	} elseif(is_array($selector)) { // recurse??
+		print('$to_add, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in add function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$to_add, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in add');
 	}
 	//print('$parent_node at the end of add: ');var_dump($parent_node);
@@ -6318,9 +6552,10 @@ function add_zero_ceiling($to_add, $selector, $parent_node = false, $parent_node
 		}
 		//O::set($selector, O::get($selector, $parent_node) + $to_add, $parent_node);
 	} elseif(is_array($selector)) { // recurse??
+		print('$to_add, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in add_zero_ceiling function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$to_add, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in add_zero_ceiling');
 	}
 	return $parent_node;
@@ -6363,9 +6598,10 @@ function subtract($to_subtract, $selector, $parent_node = false, $parent_node_on
 		}
 		//O::set($selector, O::get($selector, $parent_node) - $to_subtract, $parent_node);
 	} elseif(is_array($selector)) { // recurse??
+		print('$to_subtract, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in subtract function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$to_subtract, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in subtract');
 	}
 	return $parent_node;
@@ -6421,9 +6657,10 @@ function subtract_zero_floor($to_subtract, $selector, $parent_node = false, $par
 		}
 		//O::set($selector, O::get($selector, $parent_node) - $to_subtract, $parent_node);
 	} elseif(is_array($selector)) { // recurse??
+		print('$to_subtract, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in subtract_zero_floor function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$to_subtract, $selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in subtract_zero_floor');
 	}
 	return $parent_node;
@@ -6444,9 +6681,10 @@ function increment($selector, $parent_node = false, $parent_node_only = false) {
 		}*/
 		$parent_node = O::add(1, $selector, $parent_node, $parent_node_only);
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in increment function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in increment');
 	}
 	return $parent_node;
@@ -6471,9 +6709,10 @@ function increment_zero_ceiling($selector, $parent_node = false, $parent_node_on
 		}*/
 		$parent_node = O::add_zero_ceiling(1, $selector, $parent_node, $parent_node_only);
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in increment_zero_ceiling function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in increment_zero_ceiling');
 	}
 	return $parent_node;
@@ -6492,9 +6731,10 @@ function decrement($selector, $parent_node = false, $parent_node_only = false) {
 		}*/
 		$parent_node = O::subtract(1, $selector, $parent_node, $parent_node_only);
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in decrement function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in decrement');
 	}
 	return $parent_node;
@@ -6519,9 +6759,10 @@ function decrement_zero_floor($selector, $parent_node = false, $parent_node_only
 		}*/
 		$parent_node = O::subtract_zero_floor(1, $selector, $parent_node, $parent_node_only);
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in decrement_zero_floor function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in decrement_zero_floor');
 	}
 	return $parent_node;
@@ -6554,9 +6795,10 @@ function operation($selector, $operation, $parent_node = false, $parent_node_onl
 			$selector_matches_index--;
 		}
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $operation, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $operation, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in operation function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $operation, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $operation, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in operation');
 	}
 	return $parent_node;
@@ -6598,9 +6840,10 @@ function multiply($selector, $to_multiply = false, $parent_node = false, $parent
 		}
 		//O::set($selector, O::get($selector, $parent_node) - $to_multiply, $parent_node);
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $to_multiply, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $to_multiply, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in multiply function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $to_multiply, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $to_multiply, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in multiply');
 	}
 	return $parent_node;
@@ -6643,9 +6886,10 @@ function divide($selector, $to_divide = false, $parent_node = false, $parent_nod
 		}
 		//O::set($selector, O::get($selector, $parent_node) - $to_divide, $parent_node);
 	} elseif(is_array($selector)) { // recurse??
+		print('$selector, $to_divide, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $to_divide, $parent_node, $parent_node_only);
 		O::fatal_error('array selector not handled in divide function');
 	} else {
-		print('$selector: ');var_dump($selector);
+		print('$selector, $to_divide, $parent_node, $parent_node_only: ');var_dump($to_add, $selector, $to_divide, $parent_node, $parent_node_only);
 		O::fatal_error('Unknown selector type in divide');
 	}
 	return $parent_node;
@@ -7010,12 +7254,12 @@ function set_tag_name($selector, $new_tag_name) {
 			}
 		} else {
 			$did_first = false;
-			//print('here927600<br />');
+			//print('here927600<br />' . PHP_EOL);
 			$counter = 0;
 			foreach($selector as $index => $value) {
-				//print('here927601<br />');
+				//print('here927601<br />' . PHP_EOL);
 				if(!$did_first) {
-					//print('here927602<br />');
+					//print('here927602<br />' . PHP_EOL);
 					$this->LOM[$index][1][0] = $new_tag_name;
 					$selector[$index][1][0] = $new_tag_name;
 					foreach($this->context as $context_index => $context_value) {
@@ -7034,7 +7278,7 @@ function set_tag_name($selector, $new_tag_name) {
 					}
 					$did_first = true;
 				} elseif($counter === sizeof($selector) - 1) {
-					//print('here927603<br />');
+					//print('here927603<br />' . PHP_EOL);
 					$this->LOM[$index][1][0] = $new_tag_name;
 					$selector[$index][1][0] = $new_tag_name;
 					foreach($this->context as $context_index => $context_value) {
@@ -7138,11 +7382,11 @@ function get_tag_name($variable) {
 	return false;
 }
 
-function tag_name($variable) {
+function tag_name($variable) { // alias
 	return O::get_tag_name($variable);
 }
 
-function tagname($variable) {
+function tagname($variable) { // alias
 	return O::get_tag_name($variable);
 }
 
@@ -7224,7 +7468,7 @@ function get_tag_string($offset, $offset_depths = false) {
 	//	$string = $tagName;
 	//	$tagName = $temp_string;
 	//}
-	//O::adjust_offset_depths($offset, $offset_adjust);
+	//O::adjust_offsets($offset, $offset_adjust);
 	$depth_to_match = O::depth($offset, $offset_depths);
 	//print('$offset, $depth_to_match, $offset_depths in get_tag_string: ');O::var_dump_full($offset, $depth_to_match, $offset_depths);
 	$pointer_got_to_offset = false;
@@ -7232,21 +7476,21 @@ function get_tag_string($offset, $offset_depths = false) {
 	reset($offset_depths);
 	//$depth = current($offset_depths);
 	//print('$depth in get_tag_string: ');O::var_dump_full($depth);
-	//print('before iterating over $offset_depths in get_tag_string<br />');
+	//print('before iterating over $offset_depths in get_tag_string<br />' . PHP_EOL);
 	$next_result = true;
 	while($next_result !== false) {
 		//print('key($offset_depths): ');var_dump(key($offset_depths));
 		if($pointer_got_to_offset) {
-			//print('pointer_got_to_offset<br />');
+			//print('pointer_got_to_offset<br />' . PHP_EOL);
 			if(current($offset_depths) === $depth_to_match) {
-				//print('matched depth<br />');
+				//print('matched depth<br />' . PHP_EOL);
 				$offset_of_matched_depth = key($offset_depths);
 				break;
 			}
 		} else {
-			//print('not pointer_got_to_offset<br />');
+			//print('not pointer_got_to_offset<br />' . PHP_EOL);
 			if(key($offset_depths) === $offset) {
-				//print('setting pointer_got_to_offset<br />');
+				//print('setting pointer_got_to_offset<br />' . PHP_EOL);
 				$pointer_got_to_offset = true;
 			}
 		}
@@ -7501,15 +7745,15 @@ function get_all_named_tags_at_this_level($string, $tagname, $offset = 0, $tagva
 function get_tags_in_LOM($LOM, $index = 0) { // beauty of a recursive function
 	$tags = array();
 	$depth = 0;
-	//print('here3645756860<br />');
+	//print('here3645756860<br />' . PHP_EOL);
 	while($index < sizeof($LOM)) {
-		//print('here3645756861<br />');
+		//print('here3645756861<br />' . PHP_EOL);
 		// what about programming instructions and such?
 		if($LOM[$index][0] === 1 && $LOM[$index][1][2] === 0) { // opening tag
-			//print('here3645756862<br />');
+			//print('here3645756862<br />' . PHP_EOL);
 			if($depth === 0) {
 				//$tags = array_merge(O::get_tags_in_LOM($LOM, $index + 1), $tags);
-				//print('here3645756863<br />');
+				//print('here3645756863<br />' . PHP_EOL);
 				//$saved_tagname = $LOM[$index][1][0];
 				$saved_index = $index;
 			}
@@ -7705,12 +7949,12 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 	if($opening_whitespace_matches[0][1] === $offset) {
 		$offset += strlen($opening_whitespace_matches[0][0]);
 	}
-	if($offset_depths === false) {
-		//print('creating $offset_depths in expand()<br />');
+	if($offset_depths == false) {
+		//print('creating $offset_depths in expand()<br />' . PHP_EOL);
 		// offset_depths can be off by 1 (probably -1) when inserting into text rather than at a set offset_depth but this isn't a problem since offset_depths stays inside expand() and the error doesn't propagate
-		//$offset_depths = $this->offset_depths;
+		$offset_depths = $this->offset_depths;
 		//print('$offset, $offset_to_add, O::depth($offset + $offset_to_add) in expand(): ');var_dump($offset, $offset_to_add, O::depth($offset + $offset_to_add));
-		$offset_depths = O::get_offset_depths(substr($code, $offset), $offset + $offset_to_add, O::depth($offset + $offset_to_add));
+	//	$offset_depths = O::get_offset_depths(substr($code, $offset), $offset + $offset_to_add, O::depth($offset + $offset_to_add));
 		//print('created $code, $offset, $offset_to_add, $offset_depths in expand(): ');O::var_dump_full($code, $offset, $offset_to_add, $offset_depths);
 	}
 	//$depth_to_match = O::depth($offset + $offset_to_add + strpos($code, '<', $offset));
@@ -7780,21 +8024,21 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 		//$offset_of_last_depth_match = false;
 		reset($offset_depths);
 		$next_result = true;
-		//print('here280<br />');
+		//print('here280<br />' . PHP_EOL);
 		/*while($next_result !== false) {
-			//print('here281<br />');
+			//print('here281<br />' . PHP_EOL);
 			//print('current($offset_depths): ');var_dump(current($offset_depths));
 			if($pointer_got_to_offset) {
-				//print('pointer_got_to_offset<br />');
+				//print('pointer_got_to_offset<br />' . PHP_EOL);
 				//print('current($offset_depths): ');var_dump(current($offset_depths));
 				if(current($offset_depths) < $depth_to_match) {
-		//			//print('here282.5<br />');
+		//			//print('here282.5<br />' . PHP_EOL);
 		//			//$offset_of_matched_depth = key($this->offset_depths);
 					break;
 				}
-				//print('here283<br />');
+				//print('here283<br />' . PHP_EOL);
 				if(current($offset_depths) === $depth_to_match) {
-					//print('here284<br />');
+					//print('here284<br />' . PHP_EOL);
 					$offset_of_matched_depth = key($offset_depths);
 		//			if($depth_to_match === 0) { // raw tags wihtout a container tag for the whole XML file
 					if($mode === 'lazy') {
@@ -7806,17 +8050,17 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 					//}
 				}
 			} else {
-				//print('here285<br />');
+				//print('here285<br />' . PHP_EOL);
 				//if(key($offset_depths) === $offset_of_opening_angle_bracket + $offset_to_add) {
 				//if(key($offset_depths) === $offset + $opening_whitespace_length) {
 				//if(key($offset_depths) >= $offset) {
 				if(key($offset_depths) >= $offset_to_add + $offset) {
-					//print('here286<br />');
+					//print('here286<br />' . PHP_EOL);
 					$pointer_got_to_offset = true;
 		//			$offset_of_matched_depth = key($offset_depths);
 				}
 			}
-			//print('here287<br />');
+			//print('here287<br />' . PHP_EOL);
 			$next_result = next($offset_depths);
 		}*/
 
@@ -7858,11 +8102,11 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 			}
 		//}
 	}
-	//print('here288<br />');
+	//print('here288<br />' . PHP_EOL);
 	/*if($next_result === false) { // the whole code
 		$offset_of_matched_depth = key($offset_depths);
 	} elseif($offset_of_matched_depth === NULL) { // the whole code
-		//print('here289<br />');
+		//print('here289<br />' . PHP_EOL);
 		//$offset_of_matched_depth = strlen($this->code);
 		$offset_of_matched_depth = $offset_to_add + strlen($code);
 		//$offset_of_matched_depth = strlen($code);
@@ -7890,27 +8134,28 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 	//$full_string = substr($code, $offset, $offset_of_less_than_depth - $offset);
 	if($full_string[0] === '<') {
 		if($full_string[1] === '/') { // closing tag
-			if($this->debug) {
-				print('$full_string: ');var_dump($full_string);
-				O::fatal_error('not sure what to do when $full_string starts with a closing tag in expand()');
-			}
+// 			if($this->debug) {
+// 				print('$full_string: ');var_dump($full_string);
+// 				O::fatal_error('not sure what to do when $full_string starts with a closing tag in expand()');
+// 			}
+			$full_string = '';
 		} elseif($this->must_check_for_self_closing && $full_string[strpos($full_string, '>', 1) - 1] === '/') { // self-closing tag
-			//print('self-closing tag at position: ' . $position . '<br />');
+			//print('self-closing tag at position: ' . $position . '<br />' . PHP_EOL);
 			$full_string = substr($full_string, 0, strpos($full_string, '>', 1) + 1);
 		} elseif($this->must_check_for_non_parsed_character_data && substr($full_string, 1, 8) === '![CDATA[') { // non-parsed character data
-			//print('non-parsed character data at position: ' . $position . '<br />');
+			//print('non-parsed character data at position: ' . $position . '<br />' . PHP_EOL);
 			$full_string = substr($full_string, 0, strpos($full_string, ']]>', 1) + 3);
 		} elseif($this->must_check_for_comment && substr($full_string, 1, 3) === '!--') { // comment
-			//print('comment at position: ' . $position . '<br />');
+			//print('comment at position: ' . $position . '<br />' . PHP_EOL);
 			$full_string = substr($full_string, 0, strpos($full_string, '-->', 1) + 3);
 		} elseif($this->must_check_for_programming_instruction && $full_string[1] === '?') { // programming instruction
-			//print('programming instruction at position: ' . $position . '<br />');
+			//print('programming instruction at position: ' . $position . '<br />' . PHP_EOL);
 			$full_string = substr($full_string, 0, strpos($full_string, '?>', 1) + 2);
 		} elseif($this->must_check_for_ASP && $full_string[1] === '%') { // ASP
-			//print('ASP at position: ' . $position . '<br />');
+			//print('ASP at position: ' . $position . '<br />' . PHP_EOL);
 			$full_string = substr($full_string, 0, strpos($full_string, '%>', 1) + 2);
 		}// else { // opening tag
-		//	//print('opening tag at position: ' . $position . '<br />');
+		//	//print('opening tag at position: ' . $position . '<br />' . PHP_EOL);
 		//	$this->offset_depths[$position] = $depth;
 		//	$depth++;
 		//}
@@ -8098,11 +8343,11 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 	}
 	$offset = $offset_of_code;
 	//print('$code, $start_index, $offset_to_add, $offset_of_code in generate_LOM: ');var_dump($code, $start_index, $offset_to_add, $offset_of_code);
-	//print('5054<br />');exit(0);
+	//print('5054<br />' . PHP_EOL);exit(0);
 	while($offset < strlen($code)) {
-		//print('5055<br />');
+		//print('5055<br />' . PHP_EOL);
 		if($parsing_tag) {
-			//print('5056<br />');
+			//print('5056<br />' . PHP_EOL);
 			if($code[$offset] === '<') {
 				O::fatal_error('LOM alert: invalid syntax; <code>' . htmlentities($code_piece) . '</code> will be treated as text (unexpected &lt;).');
 				$LOM[$index_counter] = array(0, $code_piece, $saved_offset + $offset_to_add);
@@ -8118,20 +8363,20 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 				$code_piece .= $code[$offset];
 			}
 		} else {
-			//print('5057<br />');
+			//print('5057<br />' . PHP_EOL);
 			if($code[$offset] === '<') {
 				$LOM[$index_counter] = array(0, $code_piece, $saved_offset + $offset_to_add);
 				$saved_offset = $offset;
 				$index_counter++;
 				$offset++;
 				if(substr($code, $offset, 8) === '![CDATA[') { // non-parsed character data
-					//print('5058<br />');
+					//print('5058<br />' . PHP_EOL);
 					$offset += 8;
 					$code_piece = '<![CDATA[';
 					while($offset < strlen($code)) {
-						//print('5059<br />');
+						//print('5059<br />' . PHP_EOL);
 						if(substr($code, $offset, 3) === ']]>') {
-							//print('her3287394560845069<br />');
+							//print('her3287394560845069<br />' . PHP_EOL);
 							$LOM[$index_counter] = array(1, array($code_piece . ']]>', false, 4, false), $saved_offset + $offset_to_add);
 							/*$LOM[$index_counter] = array(0, array($code_piece . ']]>', false, 4, false));*/
 							$index_counter++;
@@ -8146,14 +8391,14 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 					//print('###########' . $code . '#################');
 					O::fatal_error('Non-parsed character data was not properly terminated; <code>' . htmlentities($code_piece) . '</code>.');
 				} elseif(substr($code, $offset, 3) === '!--') { // comment
-					//print('5060<br />');
+					//print('5060<br />' . PHP_EOL);
 					//print(substr($code, $offset));
 					$offset += 3;
 					$code_piece = '<!--';
 					while($offset < strlen($code)) {
-						//print('5061<br />');
+						//print('5061<br />' . PHP_EOL);
 						if(substr($code, $offset, 3) === '-->') {
-							//print('her3287394560845070<br />');
+							//print('her3287394560845070<br />' . PHP_EOL);
 							//var_dump(array(1, array($code_piece, '', 5)));
 							$LOM[$index_counter] = array(1, array($code_piece . '-->', false, 5, false), $saved_offset + $offset_to_add);
 							/*$LOM[$index_counter] = array(0, array($code_piece . '-->', false, 5, false));*/
@@ -8168,13 +8413,13 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 					}
 					O::fatal_error('Comment was not properly terminated; <code>' . htmlentities($code_piece) . '</code>.');
 				} elseif($code[$offset] === '?') { // programming instruction
-					//print('5062<br />');
+					//print('5062<br />' . PHP_EOL);
 					$offset++;
 					$code_piece = '<?';
 					while($offset < strlen($code)) {
-						//print('5063<br />');
+						//print('5063<br />' . PHP_EOL);
 						if(substr($code, $offset, 2) === '?>') {
-							//print('her3287394560845071<br />');
+							//print('her3287394560845071<br />' . PHP_EOL);
 							$LOM[$index_counter] = array(1, array($code_piece . '?>', false, 6, false), $saved_offset + $offset_to_add);
 							/*$LOM[$index_counter] = array(0, array($code_piece . '?>', false, 6, false));*/
 							$index_counter++;
@@ -8188,14 +8433,14 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 					}
 					O::fatal_error('Programming instruction was not properly terminated; <code>' . htmlentities($code_piece) . '</code>.');
 				} elseif($code[$offset] === '%') { // ASP
-					//print('5064<br />');//exit(0);
+					//print('5064<br />' . PHP_EOL);//exit(0);
 					print('ASP...' . substr($code, $offset));
 					$offset++;
 					$code_piece = '<%';
 					while($offset < strlen($code)) {
-						//print('5065<br />');
+						//print('5065<br />' . PHP_EOL);
 						if(substr($code, $offset, 2) === '%>') {
-							//print('her3287394560845072<br />');
+							//print('her3287394560845072<br />' . PHP_EOL);
 							//var_dump(array(1, array($code_piece, '', 7)));
 							$LOM[$index_counter] = array(1, array($code_piece . '%>', false, 7, false), $saved_offset + $offset_to_add);
 							/*$LOM[$index_counter] = array(0, array($code_piece . '%>', false, 7, false));*/
@@ -8210,7 +8455,7 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 					}
 					O::fatal_error('ASP code was not properly terminated; <code>' . htmlentities($code_piece) . '</code>.');
 				} else {
-					//print('5066<br />');
+					//print('5066<br />' . PHP_EOL);
 					//var_dump($LOM);
 					$code_piece = '<';
 					$parsing_tag = true;
@@ -8235,7 +8480,7 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 	//var_dump($LOM);exit(0);
 	// this is where we could have a LOM without any changes to the code; although I don't know what purpose that would serve...
 
-	//print('5067<br />');//exit(0);
+	//print('5067<br />' . PHP_EOL);//exit(0);
 	//print($code);
 	//return;
 	//print('$LOM mid generate: ');var_dump($LOM);
@@ -8259,9 +8504,9 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 			$strlen_tag = strlen($tag);
 			$parsed_tag_name = false;
 			while($offset < $strlen_tag) {
-				//print('here4068950697-80<br />');
+				//print('here4068950697-80<br />' . PHP_EOL);
 				if($parsed_tag_name) {
-					//print('here4068950697-81<br />');
+					//print('here4068950697-81<br />' . PHP_EOL);
 					if($tag[$offset] === '>') {
 						break;
 					} elseif(substr($tag, $offset, 2) === '/>') {
@@ -8345,7 +8590,7 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 						continue;
 					}
 				} else {
-					//print('here4068950697-82<br />');
+					//print('here4068950697-82<br />' . PHP_EOL);
 					$parsed_tag_name = true;
 					/*
 					'!doctype' => 'parse_doctype',
@@ -8359,7 +8604,7 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 					// concerning these partial (very limited) parsings of special stuff like programming instructions and scripts from different language than HTML; it shouldn't be a problem as long as they do not
 					// contain reflexive code (for example a PHP string like ...... '[question-mark]>' (I can't actually write it because notepad++'s parser busts into comments to find ends of programming instructions apparently...)
 					if(substr($tag, $offset, 8) === '!doctype' || substr($tag, $offset, 8) === '!DOCTYPE') {
-						//print('here4068950697-83<br />');
+						//print('here4068950697-83<br />' . PHP_EOL);
 						// could handle doctype; for now just keep it
 						$tag_array = array($tag, '', 3);
 						break;
@@ -8387,7 +8632,7 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 					$tag_array[0] = $tag_name;
 					if(O::is_block($tag_name)) {
 						// mark it as block for future reference
-						//print('marked a tag as a block<br />');
+						//print('marked a tag as a block<br />' . PHP_EOL);
 						$tag_array[3] = true;
 					}
 					//$tag_name_offset = $tag_name_matches[0][1];
@@ -8399,12 +8644,12 @@ function generate_LOM($code, $start_index = false, $offset_to_add = 0, $offset_o
 						$offset += $strlen_tag_name;
 						continue;
 					//}
-					//print('here4068950697-84<br />');
+					//print('here4068950697-84<br />' . PHP_EOL);
 				}
 				$offset++;
 			}
 			// I suppose we could sort attributes as desired here
-			//print('here4068950697-85<br />');
+			//print('here4068950697-85<br />' . PHP_EOL);
 			$tag_array[1] = $attributes_array;
 		//	if($tag_array[2] === 0) {
 		//		$tag_types['opening']++;
@@ -8446,6 +8691,10 @@ function set_variable($name, $selector) {
 	// get($selector, $matching_array = false, $add_to_context = true, $ignore_context = false, $parent_node_only = false, $tagged_result = false) {
 	$this->variables[$name] = O::get($selector, false, true, false, false, true);
 	return true;
+}
+
+function living_variable($name, $selector) { // alias
+	return O::set_variable($name, $selector);
 }
 
 function cv($names) { // alias
@@ -8539,7 +8788,7 @@ function validate() {
 		}
 		foreach($context_value[2] as $context2_index => $context2_value) {
 			if($this->code[$context2_value[0]] !== '<') {
-				print('$this->context[$context_index]: ');O::var_dump_full($this->context[$context_index]);
+				print('$context2_value[0], $this->context[$context_index], substr($this->code, $context2_value[0], $context2_value[1]): ');O::var_dump_full($context2_value[0], $this->context[$context_index], substr($this->code, $context2_value[0], $context2_value[1]));
 				O::fatal_error('offset points to non-opening bracket in context');
 			}
 			// could check the whole string too...
@@ -8547,7 +8796,7 @@ function validate() {
 		foreach($context_value[3] as $context3_index => $context3_value) {
 			foreach($context3_value as $offset => $depth) {
 				if($this->offset_depths[$offset] === $depth) {
-					
+
 				} else {
 					print('$this->context[$context_index]: ');O::var_dump_full($this->context[$context_index]);
 					print('$this->offset_depths, $offset, $depth: ');var_dump($this->offset_depths, $offset, $depth);
@@ -8604,7 +8853,7 @@ function save_LOM_to_file($filename = false, $parent_node = false) {
 		$code = O::generate_code_from_LOM($parent_node);
 	}
 	//print('$filename, $code in save_LOM_to_file: ');var_dump($filename, $code);
-	file_put_contents($filename, $code);
+	return file_put_contents($filename, $code);
 }
 
 /*function to_string_offset_pair($array) {
@@ -8784,7 +9033,7 @@ private function one_dimensional_LOM_array_to_code($array) {
 			}
 			$indentation_string = '';
 			if($tag_array[3]) { // is block
-				//print('found a tag marked as a block<br />');
+				//print('found a tag marked as a block<br />' . PHP_EOL);
 				if($tag_type === 1) {
 					$block_depth--;
 				}
@@ -9126,6 +9375,7 @@ function filename_minus_extension($string) {
 }
 
 function file_extension($string) {
+	return pathinfo($string)['extension'];
 	if(strpos($string, '.') === false || O::strpos_last($string, '.') < O::strpos_last($string, DS)) {
 		return false;
 	}
@@ -9138,6 +9388,8 @@ function shortpath($string) {
 
 function strpos_last($haystack, $needle) {
 	//print('$haystack, $needle: ');var_dump($haystack, $needle);
+	//return strrpos($haystack, $needle, -1 * $offset);
+	return strrpos($haystack, $needle);
 	if(strlen($needle) === 0) {
 		return false;
 	}
@@ -9165,7 +9417,7 @@ function getmicrotime() {
 
 function dump_total_time_taken() {
 	$time_spent = O::getmicrotime() - $this->O_initial_time;
-	print('Total time spent querying XML: ' . $time_spent . ' seconds.<br />');
+	print('Total time spent querying XML: ' . $time_spent . ' seconds.<br />' . PHP_EOL);
 }
 
 }

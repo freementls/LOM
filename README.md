@@ -1,5 +1,9 @@
 # LOM
 
+Version 0.4.5
+
+Some small bug fixes and optimizations.
+
 Version 0.4
 
 This is an excellent version. Writing works properly now. It's now fractal and refinements could still be made. Forked from <a href="https://github.com/flaurora-sonora/LOM">LOM</a>.

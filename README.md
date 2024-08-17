@@ -20,7 +20,7 @@ See test.php for usage examples.
 
 To see an example of what's possible with LOM, check out a game made using it:
 
-[http://flaurora-sonora.000webhostapp.com/infini/bbalof.php?scenario=0](https://freement.cloud/infini/bbalof.php?scenario=0)
+https://freement.cloud/infini/bbalof.php?scenario=0
 
 Version 0.1
 

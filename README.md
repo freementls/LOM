@@ -1,5 +1,9 @@
 # LOM
 
+Version 0.5
+
+LOM is now feature complete. It has been made faster by fixing up some bugs. If something goes wrong (which happens a lot less now!) you can use O::debug(); to give you the debug messages. Some bug fixes included imprecisions in internal encoding, a rework of the offset_depths array system to make it consistent throughout, adding a few little useful functions, less hacks to make things work (this is a great change, not assuming what code is coming in and thus being universal). Enjoy, have fun!
+
 Version 0.4.5
 
 Some small bug fixes and optimizations.
@@ -16,7 +20,7 @@ See test.php for usage examples.
 
 To see an example of what's possible with LOM, check out a game made using it:
 
-http://flaurora-sonora.000webhostapp.com/infini/bbalof.php?scenario=0
+[http://flaurora-sonora.000webhostapp.com/infini/bbalof.php?scenario=0](https://freement.cloud/infini/bbalof.php?scenario=0)
 
 Version 0.1
 

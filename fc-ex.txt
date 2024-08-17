@@ -1,0 +1,701 @@
+Comparing files O-20220225-excellent.php and O.PHP
+***** O-20220225-excellent.php
+        }
+        //$this->LOM = O::generate_LOM($this->code); // only generate_LOM as needed; it's possible that only simple preg operat
+***** O.PHP
+        }
+        $this->initial_code = $this->code;
+        //$this->LOM = O::generate_LOM($this->code); // only generate_LOM as needed; it's possible that only simple preg operat
+*****
+
+***** O-20220225-excellent.php
+        //print('$this->offset_depths after set_offset_depths(): ');O::var_dump_full($this->offset_depths);exit(0);
+        //O::debug();
+***** O.PHP
+        //print('$this->offset_depths after set_offset_depths(): ');O::var_dump_full($this->offset_depths);exit(0);
+        O::set_LOM_operators();
+        //O::debug();
+*****
+
+***** O-20220225-excellent.php
+
+function preg_replace_first($search, $replace, $subject) {
+        return preg_replace($search, $replace, $subject, 1);
+}
+***** O.PHP
+
+function preg_search_escape($string) { // alias
+        return O::preg_escape($string);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function preg_replace_last($search, $replace, $subject) {
+        //print("preg_replace_last subject: ");var_dump($subject);
+        // we can't just reverse everything like in str_replace_last since the regular expressions operators have a predefined 
+orientation (left-to-right)
+        preg_match_all($search, $subject, $matches, PREG_OFFSET_CAPTURE);
+        if(sizeof($matches[0]) === 0) {
+                return $subject;
+        }
+        $last_offset = $matches[0][sizeof($matches[0]) - 1][1];
+        $substr = substr($subject, $last_offset);
+        $substr = preg_replace($search, $replace, $substr);
+        //print("preg_replace_last replaced: ");var_dump(substr($subject, 0, $last_offset) . $substr);
+        return substr($subject, 0, $last_offset) . $substr;
+}
+***** O.PHP
+
+function preg_escape($string) {
+        return str_replace('/', '\/', preg_quote($string));
+}
+*****
+
+***** O-20220225-excellent.php
+
+function reverse_quantifier_components($string) {
+        if($expression[0] === '{') {
+                $offset = 0;
+                while($offset < strlen($expression)) {
+                        if($expression[$offset] === '{') {
+                                $start = '';
+                                while($expression[$offset] !== ',') {
+                                        $start .= $expression[$offset];
+                                        $offset++;
+                                }
+                                $new_expression .= '}';
+                                $offset++;
+                                continue;
+                        } elseif($expression[$offset] === ',') {
+                                $end = '';
+                                while($expression[$offset] !== '}') {
+                                        $end .= $expression[$offset];
+                                        $offset++;
+                                }
+                                $new_expression .= strrev($end) . ',' . strrev($start);
+                                $offset++;
+                                continue;
+                        } elseif($expression[$offset] === '}') {
+                                $new_expression .= '{';
+                                $offset++;
+                                continue;
+                        }
+                        $offset++;
+                }
+        } else {
+                $new_expression = strrev($expression);
+        }
+        return $new_expression;
+}
+***** O.PHP
+
+function preg_replace_escape($string) { // alias
+        return O::preg_escape_replacement($string);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function reverse_preg_expression($string) { // alias
+        return O::reverse_preg_pattern($string);
+}
+***** O.PHP
+
+function preg_replacement_escape($string) { // alias
+        return O::preg_escape_replacement($string);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function reverse_preg_query($string) { // alias
+        return O::reverse_preg_pattern($string);
+}
+***** O.PHP
+
+function preg_escape_replacement($string) {
+        $string = str_replace('$', '\$', $string);
+        $string = str_replace('{', '\{', $string);
+        $string = str_replace('}', '\}', $string);
+        return $string;
+}
+*****
+
+***** O-20220225-excellent.php
+
+function reverse_preg($string) { // alias
+        return O::reverse_preg_pattern($string);
+}
+***** O.PHP
+
+function preg_replace_first($search, $replace, $subject) {
+        return preg_replace($search, $replace, $subject, 1);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function reverse_preg_pattern($string) {
+***** O.PHP
+
+function preg_replace_last($search, $replace, $subject) {
+        //print("preg_replace_last subject: ");var_dump($subject);
+        // we can't just reverse everything like in str_replace_last since the regular expressions operators have a predefined 
+orientation (left-to-right)
+        preg_match_all($search, $subject, $matches, PREG_OFFSET_CAPTURE);
+        if(sizeof($matches[0]) === 0) {
+                return $subject;
+        }
+        $last_offset = $matches[0][sizeof($matches[0]) - 1][1];
+        $substr = substr($subject, $last_offset);
+        $substr = preg_replace($search, $replace, $substr);
+        //print("preg_replace_last replaced: ");var_dump(substr($subject, 0, $last_offset) . $substr);
+        return substr($subject, 0, $last_offset) . $substr;
+}
+
+function reverse_quantifier_components($string) {
+        if($expression[0] === '{') {
+                $offset = 0;
+                while($offset < strlen($expression)) {
+                        if($expression[$offset] === '{') {
+                                $start = '';
+                                while($expression[$offset] !== ',') {
+                                        $start .= $expression[$offset];
+                                        $offset++;
+                                }
+                                $new_expression .= '}';
+                                $offset++;
+                                continue;
+                        } elseif($expression[$offset] === ',') {
+                                $end = '';
+                                while($expression[$offset] !== '}') {
+                                        $end .= $expression[$offset];
+                                        $offset++;
+                                }
+                                $new_expression .= strrev($end) . ',' . strrev($start);
+                                $offset++;
+                                continue;
+                        } elseif($expression[$offset] === '}') {
+                                $new_expression .= '{';
+                                $offset++;
+                                continue;
+                        }
+                        $offset++;
+                }
+        } else {
+                $new_expression = strrev($expression);
+        }
+        return $new_expression;
+}
+
+function reverse_preg_expression($string) { // alias
+        return O::reverse_preg_pattern($string);
+}
+
+function reverse_preg_query($string) { // alias
+        return O::reverse_preg_pattern($string);
+}
+
+function reverse_preg($string) { // alias
+        return O::reverse_preg_pattern($string);
+}
+
+function reverse_preg_pattern($string) {
+*****
+
+***** O-20220225-excellent.php
+        $opening_tag_string = preg_replace('/(<' . $this->tagname_regex . ')(\s+[^>]+|[^\w:\->][^>]*?|>{0})>)/is', '$1 ' . $att
+ribute_name . '="' . $attribute_value . '"$2$3', $opening_tag_string);
+        //print('$initial_opening_tag_string, $opening_tag_string in set_tag_attribute: ');var_dump($initial_opening_tag_string
+***** O.PHP
+        $opening_tag_string = preg_replace('/(<' . $this->tagname_regex . ')(\s+[^>]+|[^\w:\->][^>]*?|>{0})>)/is', '$1 ' . $att
+ribute_name . '="' . O::preg_replacement_escape($attribute_value) . '"$2$3', $opening_tag_string);
+        //print('$initial_opening_tag_string, $opening_tag_string in set_tag_attribute: ');var_dump($initial_opening_tag_string
+*****
+
+***** O-20220225-excellent.php
+
+function increment_attribute($attribute_name, $selector) {
+***** O.PHP
+
+function attribute_add($attribute_name, $to_add, $selector) { // alias
+        return O::add_to_attribute($attribute_name, $to_add, $selector);
+}
+
+function attr_add($attribute_name, $to_add, $selector) { // alias
+        return O::add_to_attribute($attribute_name, $to_add, $selector);
+}
+
+function att_add($attribute_name, $to_add, $selector) { // alias
+        return O::add_to_attribute($attribute_name, $to_add, $selector);
+}
+
+function add_to_att($attribute_name, $to_add, $selector) { // alias
+        return O::add_to_attribute($attribute_name, $to_add, $selector);
+}
+
+function add_to_attr($attribute_name, $to_add, $selector) { // alias
+        return O::add_to_attribute($attribute_name, $to_add, $selector);
+}
+
+function add_to_attribute($attribute_name, $to_add, $selector) {
+        if(is_numeric($attribute_name) && !is_numeric($to_add)) { // swap them
+                $temp_to_add = $to_add;
+                $to_add = $attribute_name;
+                $attribute_name = $temp_to_add;
+        }
+        return O::set_attribute($attribute_name, O::get_attribute($attribute_name, $selector) + $to_add, $selector);
+}
+
+function inc_attribute($attribute_name, $selector) { // alias
+        return O::increment_attribute($attribute_name, $selector);
+}
+
+function inc_att($attribute_name, $selector) { // alias
+        return O::increment_attribute($attribute_name, $selector);
+}
+
+function inc_attr($attribute_name, $selector) { // alias
+        return O::increment_attribute($attribute_name, $selector);
+}
+
+function increment_att($attribute_name, $selector) { // alias
+        return O::increment_attribute($attribute_name, $selector);
+}
+
+function increment_attr($attribute_name, $selector) { // alias
+        return O::increment_attribute($attribute_name, $selector);
+}
+
+function increment_attribute($attribute_name, $selector) {
+*****
+
+***** O-20220225-excellent.php
+
+function decrement_attribute($attribute_name, $selector) {
+        return O::set_attribute($attribute_name, O::get_attribute($attribute_name, $selector) - 1, $selector);
+}
+***** O.PHP
+
+function dec_attribute($attribute_name, $selector) { // alias
+        return O::decrement_attribute($attribute_name, $selector);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function select($selector, $matching_array = false, $offset_depths = false) {
+***** O.PHP
+
+function dec_att($attribute_name, $selector) { // alias
+        return O::decrement_attribute($attribute_name, $selector);
+}
+
+function dec_attr($attribute_name, $selector) { // alias
+        return O::decrement_attribute($attribute_name, $selector);
+}
+
+function decrement_att($attribute_name, $selector) { // alias
+        return O::decrement_attribute($attribute_name, $selector);
+}
+
+function decrement_attribute($attribute_name, $selector) {
+        return O::set_attribute($attribute_name, O::get_attribute($attribute_name, $selector) - 1, $selector);
+}
+
+function select($selector, $matching_array = false, $offset_depths = false) {
+*****
+
+***** O-20220225-excellent.php
+                                                }
+                                                preg_match_all('/<(' . $tagname_regex . ')(\s+[^>]+|[^\w:\->][^>]*?|>{0})>' . $
+tagvalue . '<\/\1>/is', $code, $tagvalue_matches, PREG_OFFSET_CAPTURE);
+                                                //print('$selector_piece_index, $code, $tagvalue, $tagvalue_matches: ');var_dum
+***** O.PHP
+                                                }
+                                                preg_match_all('/<(' . $tagname_regex . ')(\s+[^>]+|[^\w:\->][^>]*?|>{0})>' . O
+::preg_escape($tagvalue) . '<\/\1>/is', $code, $tagvalue_matches, PREG_OFFSET_CAPTURE);
+                                                //print('$selector_piece_index, $code, $tagvalue, $tagvalue_matches: ');var_dum
+*****
+
+***** O-20220225-excellent.php
+                                                                preg_match_all('/<' . $tagname_regex . '[^>]{0,}\s+(' . $requir
+ed_attribute_name . ')="(' . $required_attribute_value . ')"/is', $parenting_code, $attributes_matches, PREG_OFFSET_CAPTURE);
+                                                                foreach($attributes_matches[0] as $attribute_index => $attribut
+***** O.PHP
+                                                                preg_match_all('/<' . $tagname_regex . '[^>]{0,}\s+(' . $requir
+ed_attribute_name . ')="(' . O::preg_escape($required_attribute_value) . ')"/is', $parenting_code, $attributes_matches, PREG_OF
+FSET_CAPTURE);
+                                                                foreach($attributes_matches[0] as $attribute_index => $attribut
+*****
+
+***** O-20220225-excellent.php
+
+function save($filename = false, $parent_node = false) { // alias
+        return O::save_LOM_to_file($filename, $parent_node);
+}
+***** O.PHP
+
+function save_if_needed($filename = false, $parent_node = false) { // alias
+        return O::save_if($filename, $parent_node);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function save_LOM($filename = false, $parent_node = false) { // alias
+        return O::save_LOM_to_file($filename, $parent_node);
+}
+***** O.PHP
+
+function save_if_changed($filename = false, $parent_node = false) { // alias
+        return O::save_if($filename, $parent_node);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function save_LOM_to_file($filename = false, $parent_node = false) {
+        if($filename === false) {
+                $filename = $this->file;
+        }
+        if($parent_node === false) {
+                $code = O::generate_code_from_LOM($this->LOM);
+        } else {
+                //$code = O::generate_code_from_LOM(O::get($parent_node));
+                $code = O::generate_code_from_LOM($parent_node);
+        }
+        //print('$filename, $code in save_LOM_to_file: ');var_dump($filename, $code);
+        file_put_contents($filename, $code);
+}
+***** O.PHP
+
+function save_if($filename = false, $parent_node = false) {
+        if($this->code !== $this->initial_code) {
+                return O::save_LOM_to_file($filename, $parent_node);
+        } else {
+                return false;
+        }
+}
+*****
+
+***** O-20220225-excellent.php
+
+/*function to_string_offset_pair($array) {
+        foreach($array as $first_index => $first_value) { break; }
+        return array(O::generate_code_from_LOM_array($array), $array[$first_index][2]);
+}
+*/
+function tagstring($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+}
+***** O.PHP
+
+function save($filename = false, $parent_node = false) { // alias
+        return O::save_LOM_to_file($filename, $parent_node);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function tag_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+}
+***** O.PHP
+
+function save_LOM($filename = false, $parent_node = false) { // alias
+        return O::save_LOM_to_file($filename, $parent_node);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function tostring($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+}
+***** O.PHP
+
+function save_LOM_to_file($filename = false, $parent_node = false) {
+        if($filename === false) {
+                $filename = $this->file;
+        }
+        if($parent_node === false) {
+                $code = O::generate_code_from_LOM($this->LOM);
+        } else {
+                //$code = O::generate_code_from_LOM(O::get($parent_node));
+                $code = O::generate_code_from_LOM($parent_node);
+        }
+        //print('$filename, $code in save_LOM_to_file: ');var_dump($filename, $code);
+        file_put_contents($filename, $code);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+/*function to_string_offset_pair($array) {
+        foreach($array as $first_index => $first_value) { break; }
+        return array(O::generate_code_from_LOM_array($array), $array[$first_index][2]);
+}
+*/
+function tagstring($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function node_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function tag_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function node_to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function tostring($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function LOM_to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function string_from_LOM($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function node_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function LOM_array_to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function node_to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function code_from_LOM($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function LOM_to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function generate_code_from_LOM($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+***** O.PHP
+
+function string_from_LOM($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+*****
+
+***** O-20220225-excellent.php
+
+function get_code() { // alias
+        return O::generate_code_from_LOM_array();
+}
+***** O.PHP
+
+function LOM_array_to_string($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function code() { // alias
+        return O::generate_code_from_LOM_array();
+}
+***** O.PHP
+
+function code_from_LOM($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function get_context() { // alias
+        return O::context();
+}
+***** O.PHP
+
+function generate_code_from_LOM($array) { // alias
+        return O::generate_code_from_LOM_array($array);
+}
+*****
+
+***** O-20220225-excellent.php
+
+function context() {
+        return $this->context;
+}
+***** O.PHP
+
+function get_code() { // alias
+        return O::generate_code_from_LOM_array();
+}
+*****
+
+***** O-20220225-excellent.php
+
+function generate_code_from_LOM_array($array = false) {
+***** O.PHP
+
+function code() { // alias
+        return O::generate_code_from_LOM_array();
+}
+
+function get_context() { // alias
+        return O::context();
+}
+
+function context() {
+        return $this->context;
+}
+
+function generate_code_from_LOM_array($array = false) {
+*****
+
+***** O-20220225-excellent.php
+
+function LOM_operators() {
+        // could set up a fancy array with the operators and what they do and have LOM_operators, query_encode, query_decode dr
+aw from that but for now these functions are just hard-coding what the operators are since that's simple
+        if(!isset($this->operators)) {
+                $this->operators = array(/*' ', */'_', '@', '=', '&', '[', ']', '.', '*', '|');
+        }
+        return $this->operators;
+}
+***** O.PHP
+
+function set_LOM_operators() {
+        //$this->operators = array(/*' ', */'_', '@', '=', '&', '[', ']', '.', '*', '|');
+        $this->operators = array(
+        /*' ',*/
+        '\\' => '<backslash>',
+        '/' => '<forwardslash>',
+        '_' => '<underscore>', 
+        '@' => '<at>', 
+        '=' => '<equals>', 
+        '&' => '<ampersand>', 
+        '[' => '<leftsquarebracket>', 
+        ']' => '<rightsquarebracket>', 
+        '.' => '<dot>', 
+        '*' => '<asterisk>', 
+        '|' => '<bar>'
+        );
+        return true;
+}
+*****
+
+***** O-20220225-excellent.php
+
+function get_LOM_operators($string) { // alias
+        O::LOM_operators();
+}
+***** O.PHP
+
+function LOM_operators() {
+        if(!isset($this->operators)) {
+                O::set_LOM_operators();
+        }
+        return $this->operators;
+}
+*****
+
+***** O-20220225-excellent.php
+
+function get_operators($string) { // alias
+        O::LOM_operators();
+***** O.PHP
+
+function get_LOM_operators($string) { // alias
+        O::LOM_operators();
+*****
+
+***** O-20220225-excellent.php
+
+function query_encode($string) {
+***** O.PHP
+
+function get_operators($string) { // alias
+        O::LOM_operators();
+}
+
+function query_encode($string) {
+*****
+
+***** O-20220225-excellent.php
+        //$string = str_replace(' ', '<space>', $string);
+        $string = str_replace('_', '<underscore>', $string);
+        $string = str_replace('@', '<at>', $string);
+***** O.PHP
+        //$string = str_replace(' ', '<space>', $string);
+        /*$string = str_replace('_', '<underscore>', $string);
+        $string = str_replace('@', '<at>', $string);
+*****
+
+***** O-20220225-excellent.php
+        $string = str_replace('*', '<asterisk>', $string);
+        $string = str_replace('|', '<bar>', $string);
+        return $string;
+***** O.PHP
+        $string = str_replace('*', '<asterisk>', $string);
+        $string = str_replace('|', '<bar>', $string);*/
+        foreach($this->operators as $raw => $coded) {
+                $string = str_replace($raw, $coded, $string);
+        }
+        return $string;
+*****
+
+***** O-20220225-excellent.php
+        //$string = str_replace('<space>', ' ', $string);
+        $string = str_replace('<underscore>', '_', $string);
+        $string = str_replace('<at>', '@', $string);
+***** O.PHP
+        //$string = str_replace('<space>', ' ', $string);
+        /*$string = str_replace('<underscore>', '_', $string);
+        $string = str_replace('<at>', '@', $string);
+*****
+
+***** O-20220225-excellent.php
+        $string = str_replace('<asterisk>', '*', $string);
+        $string = str_replace('<bar>', '|', $string);
+        return $string;
+***** O.PHP
+        $string = str_replace('<asterisk>', '*', $string);
+        $string = str_replace('<bar>', '|', $string);*/
+        foreach($this->operators as $raw => $coded) {
+                $string = str_replace($coded, $raw, $string);
+        }
+        return $string;
+*****
+

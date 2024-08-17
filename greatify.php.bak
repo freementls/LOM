@@ -1,0 +1,14 @@
+<?php
+
+greatify('some house', $greatified_house);
+greatify('some dog', $greatified_dog);
+greatify('something unusual', $greatified_unusual);
+print('$greatified_house: ');var_dump($greatified_house);
+print('$greatified_dog: ');var_dump($greatified_dog);
+print('$greatified_unusual: ');var_dump($greatified_unusual);
+
+function greatify($string, &$return_string) {
+	$return_string = substr($string, 0, 5) . ' great' . substr($string, 5);
+}
+
+?>

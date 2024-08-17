@@ -1,0 +1,12 @@
+<big_container>
+<person>
+<name>sally</name>
+<lastname>kellerman</lastname>
+<hobby>skiing</hobby>
+</person>
+<person age="999">
+<name>tom</name>
+<lastname>blabbo</lastname>
+<hobby>sleeping</hobby>
+</person>
+</big_container>

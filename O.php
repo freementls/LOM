@@ -78,6 +78,7 @@ function __construct($file_to_parse, $use_context = true, $array_blocks = false,
 	$this->initial_code = $this->code;
 	//$this->LOM = O::generate_LOM($this->code); // only generate_LOM as needed; it's possible that only simple preg operations on $this->code are needed
 	//print('$this->code in __construct: ');var_dump($this->code);
+	O::reset_tag_types();
 	O::check_tag_types($this->code);
 	//print('$this->must_check_for_self_closing, $this->must_check_for_doctype, $this->must_check_for_non_parsed_character_data, $this->must_check_for_comment, $this->must_check_for_programming_instruction, $this->must_check_for_ASP: ');var_dump($this->must_check_for_self_closing, $this->must_check_for_doctype, $this->must_check_for_non_parsed_character_data, $this->must_check_for_comment, $this->must_check_for_programming_instruction, $this->must_check_for_ASP);
 	//$this->zero_offsets = array();
@@ -85,6 +86,15 @@ function __construct($file_to_parse, $use_context = true, $array_blocks = false,
 	//print('$this->offset_depths after set_offset_depths(): ');O::var_dump_full($this->offset_depths);
 	O::set_LOM_operators();
 	//O::debug();
+}
+
+function reset_tag_types() {
+	$this->must_check_for_self_closing = false;
+	$this->must_check_for_doctype = false;
+	$this->must_check_for_non_parsed_character_data = false;
+	$this->must_check_for_comment = false;
+	$this->must_check_for_programming_instruction = false;
+	$this->must_check_for_ASP = false;
 }
 
 function check_tag_types($code) {
@@ -5668,6 +5678,8 @@ function set($selector, $new_value = false, $parent_node = false, $parent_node_o
 		print('$selector: ');var_dump($selector);
 		O::fatal_error('Unknown selector type in set');
 	}
+	O::reset_tag_types();
+	O::check_tag_types($this->code);
 	//print('$parent_node at the end of set: ');var_dump($parent_node);
 	//print('$this->context at the end of set: ');O::var_dump_full($this->context);
 	/*if(is_array($parent_node) && sizeof($parent_node) === 1) {
@@ -6512,6 +6524,7 @@ function rand($selector, $parent_node = false, $parent_node_only = false) {
 }
 
 function random($selector, $parent_node = false, $parent_node_only = false) {
+	O::reset_context(); // noteworthy
 	if(is_numeric($selector)) {
 		$selector = (int)$selector;
 		$selector_matches = O::get($selector, $parent_node, $parent_node_only);
@@ -6532,6 +6545,7 @@ function random($selector, $parent_node = false, $parent_node_only = false) {
 		//O::fatal_error('!is_array($selector_matches) in rand()');
 		$selector_matches = array($selector_matches);
 	}
+	//print('$selector_matches before choosing in random(): ');var_dump($selector_matches);
 	return $selector_matches[rand(0, sizeof($selector_matches) - 1)];
 }
 
@@ -6950,6 +6964,8 @@ function delete($selector, $parent_node = false, $parent_node_only = false) {
 		print('$selector: ');var_dump($selector);
 		O::fatal_error('Unknown selector type in delete');
 	}
+	O::reset_tag_types();
+	O::check_tag_types($this->code);
 	//print('O::LOM_to_string($this->LOM) after delete: ');O::var_dump_full(O::LOM_to_string($this->LOM));
 	//print('$this->code, $this->LOM, $this->context after delete: ');O::var_dump_full($this->code, $this->LOM, $this->context);
 	if($parent_node === false) {
@@ -8907,6 +8923,7 @@ function depth($offset, $offset_depths = false) {
 }
 
 function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths = false, $mode = 'lazy') {
+	//print('start of expand()<br />' . PHP_EOL);
 	// expand does more than get_tag_string() and so each may have their place: expand should be more complete but less efficient
 	// mode (lazy or greedy) seems obsolete and may be a vestige or a prior way of thinking that didn't set offset depths for opening angle brackets and text positions
 	// would it be better if this function always received an offset on the opening angle bracket < rather than looking for it? is this a reasonable expectation?
@@ -8923,7 +8940,66 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 	if($opening_whitespace_matches[0][1] === $offset) {
 		$offset += strlen($opening_whitespace_matches[0][0]);
 	}
-	$depth_to_match = O::depth($offset + $offset_to_add);
+	
+	//$expand_debug_counter = 0;
+	//print('$offset, $code: ');var_dump($offset, $code);
+	$parsing_offset = $offset;
+	$parsing_depth = 0;
+	$offset_of_matched_depth = NULL;
+	//print('expand parser001<br />' . PHP_EOL);
+	while($parsing_offset < strlen($code)) {
+		//$expand_debug_counter++;
+		//if($expand_debug_counter > 100) {
+		//	O::fatal_error('$expand_debug_counter > 100');
+		//}
+		//print('expand parser002<br />' . PHP_EOL);
+		//print('$parsing_offset: ');var_dump($parsing_offset);
+		//print('$parsing_offset, $code[$parsing_offset]: ');var_dump($parsing_offset, $code[$parsing_offset]);
+		//print('$parsing_offset, $parsing_depth + $depth_to_add,  substr($code, $parsing_offset, 10): ');var_dump($parsing_offset, $parsing_depth + $depth_to_add, substr($code, $parsing_offset, 10));
+		if($code[$parsing_offset] === '<') {
+			//print('expand parser003<br />' . PHP_EOL);
+			if($this->must_check_for_self_closing && $code[strpos($code, '>', $parsing_offset + 1) - 1] === '/') { // self-closing
+				//print('expand parser004<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, '>', $parsing_offset + 1) - $parsing_offset + 1;
+			} elseif($this->must_check_for_doctype && substr($code, $parsing_offset, 9) === '<!DOCTYPE') { // doctype
+				//print('expand parser005<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, '>', $parsing_offset + 9) - $parsing_offset + 1;
+			} elseif($this->must_check_for_non_parsed_character_data && substr($code, $parsing_offset, 9) === '<![CDATA[') { // non-parsed character data
+				//print('expand parser006<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, ']]>', $parsing_offset + 9) - $parsing_offset + 3;
+			} elseif($this->must_check_for_comment && substr($code, $parsing_offset, 4) === '<!--') { // comment
+				//print('expand parser007<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, '-->', $parsing_offset + 3) - $parsing_offset + 3;
+			} elseif($this->must_check_for_programming_instruction && substr($code, $parsing_offset, 2) === '<?') { // programming instruction
+				//print('expand parser008<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, '?>', $parsing_offset + 2) - $parsing_offset + 2;
+			} elseif($this->must_check_for_ASP && substr($code, $parsing_offset, 2) === '<%') { // ASP
+				//print('expand parser009<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, '%>', $parsing_offset + 2) - $parsing_offset + 2;
+			} elseif($code[$parsing_offset + 1] === '/') { // closing tag
+				//print('expand parser010<br />' . PHP_EOL);
+				//$parsing_offset_depths[$parsing_offset + $parsing_offset_to_add]--;
+				$parsing_offset += strpos($code, '>', $parsing_offset + 2) - $parsing_offset + 1;
+				$parsing_depth--;
+				if($parsing_depth === 0) {
+					//print('expand parser011<br />' . PHP_EOL);
+					$offset_of_matched_depth = $parsing_offset;
+					break;
+				}
+			} else { // opening tag
+				//print('expand parser012<br />' . PHP_EOL);
+				$parsing_offset += strpos($code, '>', $parsing_offset + 1) - $parsing_offset + 1;
+				$parsing_depth++;
+			}
+			//print('expand parser013<br />' . PHP_EOL);
+			continue;
+		}
+		//print('expand parser014<br />' . PHP_EOL);
+		$parsing_offset++;
+	}
+	//print('expand parser015<br />' . PHP_EOL);
+	
+	/* $depth_to_match = O::depth($offset + $offset_to_add);
 	//print('$code, $offset, $offset_to_add, $depth_to_match, $offset_depths at start of expand: ');O::var_dump_full($code, $offset, $offset_to_add, $depth_to_match, $offset_depths);
 	// if($offset_depths == false) {
 	// 	//print('creating $offset_depths in expand()<br />' . PHP_EOL);
@@ -8940,28 +9016,28 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 	// }
 	//$depth_to_match = O::depth($offset + $offset_to_add + strpos($code, '<', $offset));
 	//$offset_of_opening_angle_bracket = strpos($code, '<', $offset);
-	/*if($code[$offset + $opening_whitespace_length] === '<') { // opening angle bracket
-		// aaaaa<bb><cc><dd>ee</dd></cc></bb>
-		//          ^
-		if($code[$offset + $opening_whitespace_length + 1] === '/') { // closing tag
-			$depth_to_match = false;
-			//$parent_depth?? not so good to not have it, but I'm not sure we can always deduce it...
-			//$matching_text = true;
-		} else {
-			$depth_to_match = O::depth($offset_to_add + $offset + $opening_whitespace_length, $offset_depths);
-			//$parent_depth = $depth_to_match - 1;
-			$parent_depth = $depth_to_match - 1;
-			//$matching_text = false;
-		}
-	} else {
-		// aaaaa<bb><cc><dd>ee</dd></cc></bb>
-		//                  ^
-		$depth_to_match = O::depth($offset_to_add + strpos($code, '<', $offset), $offset_depths);
-		//$parent_depth = $depth_to_match;
-		$parent_depth = $depth_to_match - 1;
-		//$matching_text = true;
-	}
-	O::get_offset_depths($code);*/
+	//if($code[$offset + $opening_whitespace_length] === '<') { // opening angle bracket
+	//	// aaaaa<bb><cc><dd>ee</dd></cc></bb>
+	//	//          ^
+	//	if($code[$offset + $opening_whitespace_length + 1] === '/') { // closing tag
+	//		$depth_to_match = false;
+	//		//$parent_depth?? not so good to not have it, but I'm not sure we can always deduce it...
+	//		//$matching_text = true;
+	//	} else {
+	//		$depth_to_match = O::depth($offset_to_add + $offset + $opening_whitespace_length, $offset_depths);
+	//		//$parent_depth = $depth_to_match - 1;
+	//		$parent_depth = $depth_to_match - 1;
+	//		//$matching_text = false;
+	//	}
+	//} else {
+	//	// aaaaa<bb><cc><dd>ee</dd></cc></bb>
+	//	//                  ^
+	//	$depth_to_match = O::depth($offset_to_add + strpos($code, '<', $offset), $offset_depths);
+	//	//$parent_depth = $depth_to_match;
+	//	$parent_depth = $depth_to_match - 1;
+	//	//$matching_text = true;
+	//}
+	//O::get_offset_depths($code);
 	//print('$offset_depths before finding $depth_to_match in expand(): ');var_dump($offset_depths);
 	//$look_for_offset_of_less_than_depth = true;
 	// if(isset($offset_depths[$offset + $offset_to_add])) {
@@ -9005,60 +9081,60 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 		reset($offset_depths);
 		$next_result = true;
 		//print('here280<br />' . PHP_EOL);
-		/*while($next_result !== false) {
-			//print('here281<br />' . PHP_EOL);
-			//print('current($offset_depths): ');var_dump(current($offset_depths));
-			if($pointer_got_to_offset) {
-				//print('pointer_got_to_offset<br />' . PHP_EOL);
-				//print('current($offset_depths): ');var_dump(current($offset_depths));
-				if(current($offset_depths) < $depth_to_match) {
-		//			//print('here282.5<br />' . PHP_EOL);
-		//			//$offset_of_matched_depth = key($this->offset_depths);
-					break;
-				}
-				//print('here283<br />' . PHP_EOL);
-				if(current($offset_depths) === $depth_to_match) {
-					//print('here284<br />' . PHP_EOL);
-					$offset_of_matched_depth = key($offset_depths);
-		//			if($depth_to_match === 0) { // raw tags wihtout a container tag for the whole XML file
-					if($mode === 'lazy') {
-						break;
-					}
-		//			}
-					//if($offset_of_opening_angle_bracket === $offset) {
-					//	break;
-					//}
-				}
-			} else {
-				//print('here285<br />' . PHP_EOL);
-				//if(key($offset_depths) === $offset_of_opening_angle_bracket + $offset_to_add) {
-				//if(key($offset_depths) === $offset + $opening_whitespace_length) {
-				//if(key($offset_depths) >= $offset) {
-				if(key($offset_depths) >= $offset_to_add + $offset) {
-					//print('here286<br />' . PHP_EOL);
-					$pointer_got_to_offset = true;
-		//			$offset_of_matched_depth = key($offset_depths);
-				}
-			}
-			//print('here287<br />' . PHP_EOL);
-			$next_result = next($offset_depths);
-		}*/
+	//	while($next_result !== false) {
+	//		//print('here281<br />' . PHP_EOL);
+	//		//print('current($offset_depths): ');var_dump(current($offset_depths));
+	//		if($pointer_got_to_offset) {
+	//			//print('pointer_got_to_offset<br />' . PHP_EOL);
+	//			//print('current($offset_depths): ');var_dump(current($offset_depths));
+	//			if(current($offset_depths) < $depth_to_match) {
+	//	//			//print('here282.5<br />' . PHP_EOL);
+	//	//			//$offset_of_matched_depth = key($this->offset_depths);
+	//				break;
+	//			}
+	//			//print('here283<br />' . PHP_EOL);
+	//			if(current($offset_depths) === $depth_to_match) {
+	//				//print('here284<br />' . PHP_EOL);
+	//				$offset_of_matched_depth = key($offset_depths);
+	//	//			if($depth_to_match === 0) { // raw tags wihtout a container tag for the whole XML file
+	//				if($mode === 'lazy') {
+	//					break;
+	//				}
+	//	//			}
+	//				//if($offset_of_opening_angle_bracket === $offset) {
+	//				//	break;
+	//				//}
+	//			}
+	//		} else {
+	//			//print('here285<br />' . PHP_EOL);
+	//			//if(key($offset_depths) === $offset_of_opening_angle_bracket + $offset_to_add) {
+	//			//if(key($offset_depths) === $offset + $opening_whitespace_length) {
+	//			//if(key($offset_depths) >= $offset) {
+	//			if(key($offset_depths) >= $offset_to_add + $offset) {
+	//				//print('here286<br />' . PHP_EOL);
+	//				$pointer_got_to_offset = true;
+	//	//			$offset_of_matched_depth = key($offset_depths);
+	//			}
+	//		}
+	//		//print('here287<br />' . PHP_EOL);
+	//		$next_result = next($offset_depths);
+	//	}
 
-		/*if($mode === 'lazy') {
-			while($next_result !== false) {
-				if($pointer_got_to_offset) {
-					if(current($offset_depths) === $depth_to_match) {
-						$offset_of_matched_depth = key($offset_depths);
-						break;
-					}
-				} else {
-					if(key($offset_depths) >= $offset + $offset_to_add) {
-						$pointer_got_to_offset = true;
-					}
-				}
-				$next_result = next($offset_depths);
-			}
-		} else { // greedy by default??*/
+	//	if($mode === 'lazy') {
+	//		while($next_result !== false) {
+	//			if($pointer_got_to_offset) {
+	//				if(current($offset_depths) === $depth_to_match) {
+	//					$offset_of_matched_depth = key($offset_depths);
+	//					break;
+	//				}
+	//			} else {
+	//				if(key($offset_depths) >= $offset + $offset_to_add) {
+	//					$pointer_got_to_offset = true;
+	//				}
+	//			}
+	//			$next_result = next($offset_depths);
+	//		}
+	//	} else { // greedy by default??
 			// while($next_result !== false) {
 			// 	if($pointer_got_to_offset) {
 			// 		if($look_for_offset_of_less_than_depth) {
@@ -9128,23 +9204,24 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 	//print('$code[121]: ');var_dump($code[121]);
 	//print('$code[122]: ');var_dump($code[122]);
 	//print('here288<br />' . PHP_EOL);
-	/*if($next_result === false) { // the whole code
-		$offset_of_matched_depth = key($offset_depths);
-	} elseif($offset_of_matched_depth === NULL) { // the whole code
-		//print('here289<br />' . PHP_EOL);
-		//$offset_of_matched_depth = strlen($this->code);
-		$offset_of_matched_depth = $offset_to_add + strlen($code);
-		//$offset_of_matched_depth = strlen($code);
-	}*/
+	//if($next_result === false) { // the whole code
+	//	$offset_of_matched_depth = key($offset_depths);
+	//} elseif($offset_of_matched_depth === NULL) { // the whole code
+	//	//print('here289<br />' . PHP_EOL);
+	//	//$offset_of_matched_depth = strlen($this->code);
+	//	$offset_of_matched_depth = $offset_to_add + strlen($code);
+	//	//$offset_of_matched_depth = strlen($code);
+	//}
 	//if($look_for_offset_of_less_than_depth) {
 	//	if($offset_of_less_than_depth === NULL) { // assume we are in a tag?
 	//		$offset_of_less_than_depth = $offset;
 	//	}
-	//} else {
+	//} else { */
 		if($offset_of_matched_depth === NULL) { // assume we are in a tag?
 			//print('forcing $offset_of_matched_depth since it is null<br />' . PHP_EOL);
 			//$offset_of_matched_depth = $offset;
-			$offset_of_matched_depth = strlen($code) - 1;
+			//$offset_of_matched_depth = strlen($code) - 1;
+			$offset_of_matched_depth = strlen($code); // since we wrote the parser
 		}
 	//}
 	//print('$depth_to_match, $offset_of_less_than_depth in expand(): ');var_dump($depth_to_match, $offset_of_less_than_depth);
@@ -9158,7 +9235,8 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 	//print('$offset, $depth_to_match, $offset_of_matched_depth before creating $full_string in expand(): ');var_dump($offset, $depth_to_match, $offset_of_matched_depth);
 	//$full_string = substr($code, $offset + $opening_whitespace_length, $offset_of_matched_depth - $offset - $opening_whitespace_length);
 	//$full_string = substr($code, $offset, $offset_of_matched_depth - $offset - $offset_to_add);
-	$full_string = substr($code, $offset, $offset_of_matched_depth - $offset + 1);
+	//$full_string = substr($code, $offset, $offset_of_matched_depth - $offset + 1);
+	$full_string = substr($code, $offset, $offset_of_matched_depth - $offset); // since we wrote the parser
 	//print('initial $full_string: ');var_dump($full_string);
 	//$full_string = substr($code, $offset, $offset_of_less_than_depth - $offset);
 	/*if($full_string[0] === '<') {
@@ -9256,9 +9334,9 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 			}
 		}
 		$contents_start_position = $opening_tag_matches[0][1] + strlen($opening_tag_matches[0][0]);
-		if(substr_count($full_string, '</') * 2 < substr_count($full_string, '<')) { // for (probably rare) cases when expand() is fed strings that are missing closing tags to properly close in which case we wouldn't want to assume one needs to be removed
-			$contents_end_position = strlen($full_string);
-		} else {
+	//	if(substr_count($full_string, '</') * 2 < substr_count($full_string, '<')) { // for (probably rare) cases when expand() is fed strings that are missing closing tags to properly close in which case we wouldn't want to assume one needs to be removed
+	//		$contents_end_position = strlen($full_string);
+	//	} else {
 			$rev_full_string = strrev($full_string);
 			$rev_closing_position = strpos($rev_full_string, '/<');
 			if($rev_closing_position === false) {
@@ -9266,7 +9344,7 @@ function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths =
 			} else {
 				$contents_end_position = strlen($full_string) - $rev_closing_position - 2;
 			}
-		}
+	//	}
 		$contained_string = substr($full_string, $contents_start_position, $contents_end_position - $contents_start_position);
 		$contained_string_offset = $contents_start_position + $offset + $offset_to_add;
 		//print('$contents_start_position, $contents_end_position, $contained_string, $contained_string_offset: ');var_dump($contents_start_position, $contents_end_position, $contained_string, $contained_string_offset);

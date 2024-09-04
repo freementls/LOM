@@ -1,5 +1,15 @@
 # LOM
 
+See test.php for usage examples.
+
+To see an example of what's possible with LOM, check out a game made using it:
+
+https://freement.cloud/infini/bbalof.php?scenario=0
+
+Version 0.6
+
+Great optimizations. About 10 times faster in practical cases!
+
 Version 0.5
 
 LOM is now feature complete. It has been made faster by fixing up some bugs. If something goes wrong (which happens a lot less now!) you can use O::debug(); to give you the debug messages. Some bug fixes included imprecisions in internal encoding, a rework of the offset_depths array system to make it consistent throughout, adding a few little useful functions, less hacks to make things work (this is a great change, not assuming what code is coming in and thus being universal). Enjoy, have fun!
@@ -15,12 +25,6 @@ This is an excellent version. Writing works properly now. It's now fractal and r
 Version 0.2
 
 If you are manipulating XML with PHP then this is the code you want. LOM used to use array-based internal data structure but now uses string-based internal data structure. With this type of optimization it's about 10 times faster. Another improvement is that the external data structure (that which is accesible as the results of queries) is now the more familiar (to users of PHP regular expressions) string-offset pairs.
-
-See test.php for usage examples.
-
-To see an example of what's possible with LOM, check out a game made using it:
-
-https://freement.cloud/infini/bbalof.php?scenario=0
 
 Version 0.1
 

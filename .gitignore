@@ -1,0 +1,4 @@
+perf_fixture.xml
+*.o
+native/lib/
+native/bin/

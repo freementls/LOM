@@ -1,0 +1,175 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "LOM Data API",
+    "description": "OData-style LOM service for Power Apps. Prefer List* actions with $filter/$top/$skip so filtering runs on the server — this avoids the Power Apps 500/2000 non-delegable row limit.",
+    "version": "1.0.0"
+  },
+  "host": "127.0.0.1:8080",
+  "basePath": "/",
+  "schemes": ["http", "https"],
+  "securityDefinitions": {
+    "api_key": {
+      "type": "apiKey",
+      "name": "X-Api-Key",
+      "in": "header"
+    }
+  },
+  "security": [{ "api_key": [] }],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "Health",
+        "summary": "Health check",
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/api/ListPeople": {
+      "get": {
+        "operationId": "ListPeople",
+        "summary": "List People with server-side filter and paging (avoids 500/2000 limit)",
+        "x-ms-pageable": { "nextLinkName": "nextLink", "itemName": "value" },
+        "parameters": [
+          {
+            "name": "$filter",
+            "in": "query",
+            "type": "string",
+            "required": false,
+            "description": "OData filter, e.g. lastname eq 'mott' or age gt 16 or startswith(name,'s')"
+          },
+          {
+            "name": "$top",
+            "in": "query",
+            "type": "integer",
+            "default": 50,
+            "description": "Page size (max 5000). Keep galleries at 50–200."
+          },
+          {
+            "name": "$skip",
+            "in": "query",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "$count",
+            "in": "query",
+            "type": "boolean",
+            "default": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of rows",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Person" }
+                },
+                "@odata.count": { "type": "integer" },
+                "@odata.nextLink": { "type": "string" },
+                "nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/odata/People": {
+      "get": {
+        "operationId": "GetPeople",
+        "summary": "OData entity set People",
+        "x-ms-pageable": { "nextLinkName": "@odata.nextLink", "itemName": "value" },
+        "parameters": [
+          { "name": "$filter", "in": "query", "type": "string" },
+          { "name": "$top", "in": "query", "type": "integer", "default": 50 },
+          { "name": "$skip", "in": "query", "type": "integer", "default": 0 },
+          { "name": "$count", "in": "query", "type": "boolean" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "array", "items": { "$ref": "#/definitions/Person" } },
+                "@odata.nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "CreatePerson",
+        "summary": "Create Person",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/PersonWrite" }
+          }
+        ],
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/odata/People({id})": {
+      "get": {
+        "operationId": "GetPerson",
+        "summary": "Get one Person by lom_id",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Person" } }
+        }
+      },
+      "patch": {
+        "operationId": "UpdatePerson",
+        "summary": "Patch Person fields",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/PersonWrite" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "DeletePerson",
+        "summary": "Delete Person",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    }
+  },
+  "definitions": {
+    "Person": {
+      "type": "object",
+      "properties": {
+        "lom_id": { "type": "string" },
+        "age": { "type": "string" },
+        "eye_color": { "type": "string" },
+        "name": { "type": "string" },
+        "lastname": { "type": "string" },
+        "hobby": { "type": "string" }
+      }
+    },
+    "PersonWrite": {
+      "type": "object",
+      "properties": {
+        "age": { "type": "string" },
+        "eye_color": { "type": "string" },
+        "name": { "type": "string" },
+        "lastname": { "type": "string" },
+        "hobby": { "type": "string" }
+      }
+    }
+  }
+}

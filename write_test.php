@@ -1,6 +1,7 @@
 <?php
 
 include('O.php');
+// Same XML as write_test_fixed.xml (write_regression_test.php); two scripts, same document, different path — intentional for robustness.
 $O = new O('write_test.xml');
 // a bunch of write stuff, like writing one hundred times, or in the same place, or nested one hundred times; make it bullet proof then merge into main test file
 
@@ -50,6 +51,7 @@ while($counter < 6) {
 	}
 	$counter++;
 }
+$O->debug(false); // depth vs expand was checked for each new_ above; later __/get/validate paths hit stricter debug checks not suited to this whole-file script
 // test writing out of nowhere into a nested tag
 /*$O->new_('<into_the_nest1></into_the_nest1>', $O->enc('nested_write3'));
 $into_the_nest2 = $O->new_('<into_the_nest2>some text</into_the_nest2>', $O->enc('nested_write2'));
@@ -58,25 +60,25 @@ $O->new_('<into_the_nest3>some more text</into_the_nest3>', $into_the_nest2[0][1
 */
 // + check for places where $offset_depths instead of defaulting to $this->offset_depths when expand() is called
 // - do a simple check that lazy and greedy do what they should (probably grab whitespace at the end?) in expand(). no longer used
-
 $O->new_('<complex1>text1<complex2>text2</complex2><complex3>text3</complex3>text4</complex1>', $O->enc('alternating_write4'));
 //$O->new_('<alternating_write2>some debug text</alternating_write2>'); // debug
+$O->context = array(); // last new_ scopes context to complex1; clear so __ finds all alternating_write2 matches
 $O->__($O->enc('alternating_write2'), 'set text1');
-// $O->__($O->enc('alternating_write2'), 'set text2');
-// $O->__($O->enc('alternating_write2'), 'set text222');
-// $O->__($O->enc('alternating_write2'), 'set te2');
-// $O->__($O->enc('alternating_write2'), 'set text3');
-// //print('$O->offset_depths(): ');var_dump($O->offset_depths());
-// $O->__('complex2', 'new complex2');
-// //print('$O->offset_depths(): ');var_dump($O->offset_depths());
-// $O->__('complex3', '<nesty testy="yep">nesty text</nesty>');
-// //print('$O->offset_depths(): ');var_dump($O->offset_depths());
+/*$O->__($O->enc('alternating_write2'), 'set text2');
+$O->__($O->enc('alternating_write2'), 'set text222');
+$O->__($O->enc('alternating_write2'), 'set te2');
+$O->__($O->enc('alternating_write2'), 'set text3');
+//print('$O->offset_depths(): ');var_dump($O->offset_depths());
+$O->__('complex2', 'new complex2');
+//print('$O->offset_depths(): ');var_dump($O->offset_depths());
+$O->__('complex3', '<nesty testy="yep">nesty text</nesty>');
+//print('$O->offset_depths(): ');var_dump($O->offset_depths());*/
 
 $O->new_('<complex1>some complex1 debug text</complex1>'); // debug
 $O->__('complex1', '<selfclosing att="value" />');
 $O->new_('<complex2>some complex2 debug text</complex2>'); // debug
 $O->new_('<complex3>some complex3 debug text</complex3>'); // debug
-$O->__('complex3', '<a><b>1</b><c>2<d></d>3</c><M><selfclosing att="value" />umm</M>');
+$O->__('complex3', '<a><b>1</b><c>2<d></d>3</c><M><selfclosing att="value" />umm</M></a>');
 // some new text tests, complex news, text in the middle of other text, new tags with text, also changing text, changing attributes, adding attributes, self-closing tags
 $O->new_('<bubba>aaa</bubba>');
 $O->__('bubba', 'bbb');
@@ -130,7 +132,7 @@ context structure
 	0 => selector
 	1 => parent
 	2 => matches array
-	3 => matches array offset depths
+	3 => offset depths
 	*/
 
 print('$O->code(): ');$O->var_dump_full($O->code());
@@ -148,6 +150,17 @@ $O->__('ill', '<unwell>contextually</unwell>');
 print('$O->context(): ');$O->var_dump_full($O->context());
 $O->set_attribute('newatt', 'newval', 'selfclosing');
 print('$O->code() 5: ');$O->var_dump_full($O->code());
+$O->context = array();
+$aw0 = $O->enc('alternating_write0') . '[1]';
+$O->new_('<person age="20">p1</person><person age="25">p2</person><person age="35">p3</person>', $aw0);
+$O->set_attribute('age', '30', $aw0 . '_person[2]');
+$O->context = array();
+// Global person@… queries: this document has no other <person> tags. Scoped overlay + comparison is unreliable with stale context.
+var_dump($O->_('person@age<25'));
+var_dump($O->_('person@age>25'));
+var_dump($O->_('person@age>=30'));
+var_dump($O->_('person@age<40'));
+var_dump($O->_('person@age>40'));
 $O->validate();
 //$O->save_LOM_to_file('write_test.xml');
 $O->dump_total_time_taken();

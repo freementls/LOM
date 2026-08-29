@@ -6,20 +6,15 @@ Living Object Model — hierarchical XML document engine (PHP `O.php`) with a na
 
 ## Live demo
 
-Open **[demo/](demo/)** — edit the XML (same contents as `test.xml`), edit the LOM selector, and watch matches update. Writes (`set` / `new_` / `delete`) apply only when you press the button.
+**[https://freement.cloud/LOM/demo/](https://freement.cloud/LOM/demo/)** — edit the XML (same contents as `test.xml`), edit the LOM selector, and watch matches update. Writes (`set` / `new_` / `delete`) apply only when you press the button.
 
-```bash
-php -S localhost:8765
-# open http://localhost:8765/demo/
-```
-
-If this repo is already served over Apache, open [`/LOM/demo/`](demo/) (or your local path to [`demo/index.php`](demo/index.php)).
+Source for that page: [`demo/`](demo/). Locally: `php -S localhost:8765` then http://localhost:8765/demo/.
 
 ## Quick paths
 
 | Path | What |
 |------|------|
-| [`demo/`](demo/) | [Live query playground](demo/) (XML + selector → matches) |
+| [Live demo](https://freement.cloud/LOM/demo/) | Query playground on freement.cloud (XML + selector → matches) |
 | `O.php` | Original PHP API (unchanged for existing programs) |
 | `native/` | C library (`liblom`), CLI (`lomc`), OData daemon (`lomd`) |
 | `powerapps/` | Entity config, OpenAPI custom connector, setup guide |

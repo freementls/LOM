@@ -228,6 +228,10 @@ class O {
 		if(strpos($selector, '__') !== false) {
 			return false;
 		}
+		// Indexed selectors are always 0-based in PHP; keep them off the native path.
+		if(strpos($selector, '[') !== false) {
+			return false;
+		}
 		return true;
 	}
 
@@ -458,6 +462,11 @@ class O {
 
 	function selector_overlay_postfilter_applies($normalized_selector) {
 		if(!is_string($normalized_selector) || $normalized_selector === '' || strpos($normalized_selector, '[') !== false) {
+			return false;
+		}
+		// tag=value@attr=... is fully applied in recursive_select; a naive
+		// postfilter would treat the first "=" only and wipe valid matches.
+		if(preg_match('/(?:' . $this->comparison_operators_regex . ')[^@\[]*@/', $normalized_selector)) {
 			return false;
 		}
 		O::parse_selector_string($normalized_selector);
@@ -2912,7 +2921,7 @@ class O {
 		$chain = array();
 		$has_index_or_wildcard = false;
 		foreach($pieces as $piece_index => $piece) {
-			if($piece === '' || strpos($piece, '&') !== false || strpos($piece, '@') !== false || strpos($piece, '=') !== false) {
+			if($piece === '') {
 				$fast_indexed_chain_cache[$normalized_selector] = false;
 				return false;
 			}
@@ -2933,19 +2942,33 @@ class O {
 			if($tagname === '*') {
 				$has_index_or_wildcard = true;
 			}
-			if(isset($this->tagvalues[$piece_index]) && $this->tagvalues[$piece_index] !== false && $this->tagvalues[$piece_index][0] !== false) {
-				$fast_indexed_chain_cache[$normalized_selector] = false;
-				return false;
-			}
-			if(isset($this->required_attribute_sets[$piece_index]) && sizeof($this->required_attribute_sets[$piece_index]) > 0 && sizeof($this->required_attribute_sets[$piece_index][0]) > 0) {
-				$fast_indexed_chain_cache[$normalized_selector] = false;
-				return false;
-			}
-			$index = (isset($this->tagname_indices[$piece_index]) && isset($this->tagname_indices[$piece_index][0])) ? $this->tagname_indices[$piece_index][0] : false;
-			if($index !== false && $index !== null) {
+			$tagvalue = (isset($this->tagvalues[$piece_index]) && $this->tagvalues[$piece_index][0] !== false) ? $this->tagvalues[$piece_index][0] : false;
+			$tagvalue_op = (isset($this->tagvalue_comparison_operators[$piece_index]) && isset($this->tagvalue_comparison_operators[$piece_index][0])) ? $this->tagvalue_comparison_operators[$piece_index][0] : false;
+			$required_attributes = (isset($this->required_attribute_sets[$piece_index]) && isset($this->required_attribute_sets[$piece_index][0]) && is_array($this->required_attribute_sets[$piece_index][0])) ? $this->required_attribute_sets[$piece_index][0] : array();
+			$attribute_ops = (isset($this->attribute_sets_comparison_operators[$piece_index]) && isset($this->attribute_sets_comparison_operators[$piece_index][0]) && is_array($this->attribute_sets_comparison_operators[$piece_index][0])) ? $this->attribute_sets_comparison_operators[$piece_index][0] : array();
+			$tagname_index = (isset($this->tagname_indices[$piece_index]) && isset($this->tagname_indices[$piece_index][0])) ? $this->tagname_indices[$piece_index][0] : false;
+			$tagvalue_index = (isset($this->tagvalue_indices[$piece_index]) && isset($this->tagvalue_indices[$piece_index][0])) ? $this->tagvalue_indices[$piece_index][0] : false;
+			$attributes_index = (isset($this->attributes_indices[$piece_index]) && isset($this->attributes_indices[$piece_index][0])) ? $this->attributes_indices[$piece_index][0] : false;
+			if($tagname_index !== false && $tagname_index !== null) {
 				$has_index_or_wildcard = true;
 			}
-			$chain[] = array('tagname' => $tagname, 'index' => $index);
+			if($tagvalue_index !== false && $tagvalue_index !== null) {
+				$has_index_or_wildcard = true;
+			}
+			if($attributes_index !== false && $attributes_index !== null) {
+				$has_index_or_wildcard = true;
+			}
+			$chain[] = array(
+				'tagname' => $tagname,
+				'index' => $tagname_index,
+				'tagname_index' => $tagname_index,
+				'tagvalue' => $tagvalue,
+				'tagvalue_op' => $tagvalue_op,
+				'tagvalue_index' => $tagvalue_index,
+				'required_attributes' => $required_attributes,
+				'attribute_ops' => $attribute_ops,
+				'attributes_index' => $attributes_index,
+			);
 		}
 		if(!$has_index_or_wildcard) {
 			$fast_indexed_chain_cache[$normalized_selector] = false;
@@ -2965,32 +2988,21 @@ class O {
 		$root_key = 'root';
 		foreach($chain as $chain_index => $piece) {
 			$next_offsets = array();
-			if($chain_index === 0) {
-				if($piece['index'] !== false && $piece['index'] !== null) {
-					$pick = (int)$piece['index'] - 1;
-					foreach($this->parent_children_index as $parent_key => $children) {
-						if(sizeof($children) === 0) {
-							continue;
-						}
-						$piece_matches = array();
-						if($piece['tagname'] === '*') {
-							$piece_matches = $children;
-						} else {
-							foreach($children as $child_offset) {
-								if(isset($this->opening_tag_names[$child_offset]) && $this->opening_tag_names[$child_offset] === $piece['tagname']) {
-									$piece_matches[] = $child_offset;
-								}
-							}
-						}
-						if(isset($piece_matches[$pick])) {
-							$next_offsets[] = $piece_matches[$pick];
-						}
-					}
+			if($chain_index === 0 && ($piece['tagname_index'] === false || $piece['tagname_index'] === null)) {
+				if($piece['tagname'] === '*') {
+					$candidates = $this->opening_tag_offsets;
 				} else {
-					if($piece['tagname'] === '*') {
-						$next_offsets = $this->opening_tag_offsets;
-					} else {
-						$next_offsets = O::get_tag_index_offsets($piece['tagname']);
+					$candidates = O::get_tag_index_offsets($piece['tagname']);
+				}
+				$next_offsets = O::fast_apply_index_piece($candidates, $piece);
+			} elseif($chain_index === 0) {
+				foreach($this->parent_children_index as $parent_key => $children) {
+					if(sizeof($children) === 0) {
+						continue;
+					}
+					$picked = O::fast_apply_index_piece($children, $piece);
+					foreach($picked as $po) {
+						$next_offsets[] = $po;
 					}
 				}
 			} else {
@@ -3000,28 +3012,9 @@ class O {
 					if(sizeof($children) === 0) {
 						continue;
 					}
-					$piece_matches = array();
-					if($piece['tagname'] === '*') {
-						$piece_matches = $children;
-					} else {
-						foreach($children as $child_offset) {
-							if(isset($this->opening_tag_names[$child_offset]) && $this->opening_tag_names[$child_offset] === $piece['tagname']) {
-								$piece_matches[] = $child_offset;
-							}
-						}
-					}
-					if(sizeof($piece_matches) === 0) {
-						continue;
-					}
-					if($piece['index'] !== false && $piece['index'] !== null) {
-						$pick = (int)$piece['index'] - 1;
-						if(isset($piece_matches[$pick])) {
-							$next_offsets[] = $piece_matches[$pick];
-						}
-					} else {
-						foreach($piece_matches as $pm) {
-							$next_offsets[] = $pm;
-						}
+					$picked = O::fast_apply_index_piece($children, $piece);
+					foreach($picked as $po) {
+						$next_offsets[] = $po;
 					}
 				}
 			}
@@ -3042,6 +3035,61 @@ class O {
 		// Intentionally skip context insertion here: this path is for
 		// indexed/wildcard direct chains and can otherwise flood context
 		// entries in mixed workloads, tripping debug guardrails in test.php.
+		if($tagged_result) {
+			return $selector_matches;
+		}
+		return O::export($selector_matches);
+	}
+
+	function fast_get_or_union_direct_chains($normalized_selector, $add_to_context = true, $ignore_context = false, $parent_node_only = false, $tagged_result = false) {
+		if(!is_string($normalized_selector) || strpos($normalized_selector, '|') === false || strpos($normalized_selector, '.') !== false) {
+			return false;
+		}
+		$branches = array();
+		$cur = '';
+		$len = strlen($normalized_selector);
+		for($i = 0; $i < $len; $i++) {
+			if($normalized_selector[$i] === '|' && ($i + 1 >= $len || $normalized_selector[$i + 1] !== '=')) {
+				$branches[] = $cur;
+				$cur = '';
+				continue;
+			}
+			$cur .= $normalized_selector[$i];
+		}
+		$branches[] = $cur;
+		if(sizeof($branches) < 2) {
+			return false;
+		}
+		$seen = array();
+		$merged_offsets = array();
+		foreach($branches as $branch) {
+			if($branch === '') {
+				return false;
+			}
+			$part = O::fast_get_indexed_or_wildcard_direct_chain($branch, false, true, $parent_node_only, true);
+			if($part === false) {
+				$part = O::fast_get_simple_direct_tag_chain($branch, false, true, $parent_node_only, true);
+			}
+			if($part === false || !is_array($part)) {
+				return false;
+			}
+			foreach($part as $m) {
+				if(!is_array($m) || !isset($m[1]) || isset($seen[$m[1]])) {
+					continue;
+				}
+				$seen[$m[1]] = 1;
+				$merged_offsets[] = $m[1];
+			}
+		}
+		sort($merged_offsets, SORT_NUMERIC);
+		$this->offsets_from_get = $merged_offsets;
+		if(sizeof($merged_offsets) === 0) {
+			return array();
+		}
+		$selector_matches = array();
+		foreach($merged_offsets as $offset) {
+			$selector_matches[] = O::build_node_result_from_offset($offset, true, $parent_node_only);
+		}
 		if($tagged_result) {
 			return $selector_matches;
 		}
@@ -3082,12 +3130,7 @@ class O {
 				return array();
 			}
 			if($piece['index'] !== false && $piece['index'] !== null) {
-				$pick = (int)$piece['index'] - 1;
-				if(!isset($candidate_offsets[$pick])) {
-					$this->offsets_from_get = array();
-					return array();
-				}
-				$matching_offsets = array($candidate_offsets[$pick]);
+				$matching_offsets = O::pick_offsets_by_index_spec($candidate_offsets, $piece['index']);
 			} else {
 				$matching_offsets = $candidate_offsets;
 			}
@@ -3158,11 +3201,15 @@ class O {
 					}
 					$piece_offsets = $piece_offsets_deduped;
 				}
-				if(!isset($piece_offsets[$piece['index'] - 1])) {
+				$picked = O::pick_offsets_by_index_spec($piece_offsets, $piece['index']);
+				if(sizeof($picked) === 0) {
 					$this->offsets_from_get = array();
 					return array();
 				}
-				$required_piece_offset = $piece_offsets[$piece['index'] - 1];
+				$required_set = array();
+				foreach($picked as $po) {
+					$required_set[(string)$po] = true;
+				}
 				$filtered_offsets = array();
 				foreach($matching_offsets as $matched_leaf_offset) {
 					$current_offset = $matched_leaf_offset;
@@ -3176,7 +3223,7 @@ class O {
 						}
 						$current_piece_offset = $current_offset;
 					}
-					if($current_piece_offset === $required_piece_offset) {
+					if($current_piece_offset !== false && isset($required_set[(string)$current_piece_offset])) {
 						$filtered_offsets[] = $matched_leaf_offset;
 					}
 				}
@@ -3574,7 +3621,7 @@ class O {
 			//print('$selector, $selector_matches in is_numeric($selector_matches): ');var_dump($selector, $selector_matches);
 		} elseif(is_string($selector)) { // do XPath-type processing
 			//print('is_string($selector) in get<br />' . PHP_EOL);
-			if($selector[0] === '@' && strpos($selector, '_') === false && !$this->_lom_selector_has_overlay($selector)) {
+			if($selector[0] === '@' && strpos($selector, '_') === false && strpos($selector, '[') === false && strpos($selector, '=') === false && !$this->_lom_selector_has_overlay($selector)) {
 				$attribute_name = substr($selector, 1);
 				return O::get_attribute_value($attribute_name, $matching_array);
 			}
@@ -3955,6 +4002,14 @@ class O {
 									$this->profile_add_time('get_fastpaths_total', O::getmicrotime() - $get_t_fastpaths_total);
 								}
 								return $fast_indexed_selector_matches;
+							}
+
+							$fast_or_selector_matches = O::fast_get_or_union_direct_chains($normalized_selector, $add_to_context, $ignore_context, $parent_node_only, $tagged_result);
+							if($fast_or_selector_matches !== false) {
+								if($get_t_fastpaths_total !== false) {
+									$this->profile_add_time('get_fastpaths_total', O::getmicrotime() - $get_t_fastpaths_total);
+								}
+								return $fast_or_selector_matches;
 							}
 
 							$fast_selector_matches = O::fast_get_simple_direct_tag_chain($normalized_selector, $add_to_context, $ignore_context, $parent_node_only, $tagged_result);
@@ -5859,7 +5914,7 @@ if(is_numeric($indices)) {
 		}
 		//print('$selector_matches at the end of select: ');var_dump($selector_matches);
 		$this->selector_pieces_preparsed = false;
-		return $selector_matches;
+		return O::apply_qualified_result_indexes($selector_matches);
 		} finally {
 			$this->profile_function_stop('select', $profile_token);
 		}
@@ -6620,14 +6675,10 @@ if(is_numeric($indices)) {
 			print('$this->tagnames[$selector_piece_index], $this->selector_piece_sets, $this->selector_scopes, $selector_piece_index, $this->selector_scopes[$selector_piece_index]: ');var_dump($this->tagnames[$selector_piece_index], $this->selector_piece_sets, $this->selector_scopes, $selector_piece_index, $this->selector_scopes[$selector_piece_index]);
 			O::fatal_error('how to match multiple tags together when not only looking in direct scope is not coded. did you mean to use the "or" operator "|" instead of the "and" operator "&"?');
 		}
-		// this seems like a hack... but it works
-		if($selector_piece_index === 0) { // only reset the things when not recursing?
-			//	$this->selected_parent_matches = false;
-			foreach($this->tagnames[$selector_piece_index] as $tagname_index => $tagname) {
-				$this->tagname_match_counter[$selector_piece_index][$tagname_index] = 0;
-				$this->tagvalue_match_counter[$selector_piece_index][$tagname_index] = 0;
-				$this->attributes_match_counter[$selector_piece_index][$tagname_index] = 0;
-			}
+		foreach($this->tagnames[$selector_piece_index] as $tagname_index => $tagname) {
+			$this->tagname_match_counter[$selector_piece_index][$tagname_index] = 0;
+			$this->tagvalue_match_counter[$selector_piece_index][$tagname_index] = 0;
+			$this->attributes_match_counter[$selector_piece_index][$tagname_index] = 0;
 		}
 		// selector piece to preg_expression
 		$preg_expression = O::preg_expression_from_selector_piece($selector_piece_index);
@@ -6689,7 +6740,11 @@ if(is_numeric($indices)) {
 						//print('tagname index not specified<br />' . PHP_EOL);
 						$matched_tagname_index = true;
 					} else {
-						if($this->tagname_match_counter[$selector_piece_index][$tagname_index] == $this->tagname_indices[$selector_piece_index][$tagname_index]) {
+						$idx_spec = $this->tagname_indices[$selector_piece_index][$tagname_index];
+						$idx_hit = O::consume_index_spec($idx_spec, $this->tagname_match_counter[$selector_piece_index][$tagname_index]);
+						if($idx_hit === true) {
+							$matched_tagname_index = true;
+						} elseif($idx_hit === 'exclusive') {
 							// a specified index is the most specific a selector can be and thus negates anything selection by the selector piece after the index. multiindexes are similarly impossibly ambiguous for a computer though fun to contemplate for humans
 							//print('found tagname with required index<br />' . PHP_EOL);
 							$matches = array(array($value));
@@ -6725,7 +6780,6 @@ if(is_numeric($indices)) {
 							// $matched_tagname_index = true;
 							// $break_due_to_matched_index = true;
 						}
-						$this->tagname_match_counter[$selector_piece_index][$tagname_index]++;
 					}
 					if($matched_tagname_index) {
 						//print('matched tagname index<br />' . PHP_EOL);
@@ -6764,9 +6818,13 @@ if(is_numeric($indices)) {
 							if($this->tagvalue_indices[$selector_piece_index][$tagname_index] === false) {
 								//print('no tagvalue index specified<br />' . PHP_EOL);
 								$matched_tagvalue_index = true;
+							} elseif(O::qualified_index_spec_at($selector_piece_index, $tagname_index) !== false) {
+								$matched_tagvalue_index = true;
 							} else {
-								//print('$this->tagvalue_match_counter[$selector_piece_index][$tagname_index], $this->tagvalue_indices[$selector_piece_index][$tagname_index]: ');var_dump($this->tagvalue_match_counter[$selector_piece_index][$tagname_index], $this->tagvalue_indices[$selector_piece_index][$tagname_index]);
-								if($this->tagvalue_match_counter[$selector_piece_index][$tagname_index] == $this->tagvalue_indices[$selector_piece_index][$tagname_index]) {
+								$tv_idx_hit = O::consume_index_spec($this->tagvalue_indices[$selector_piece_index][$tagname_index], $this->tagvalue_match_counter[$selector_piece_index][$tagname_index]);
+								if($tv_idx_hit === true) {
+									$matched_tagvalue_index = true;
+								} elseif($tv_idx_hit === 'exclusive') {
 									// a specified index is the most specific a selector can be and thus negates anything selection by the selector piece after the index. multiindexes are similarly impossibly ambiguous for a computer though fun to contemplate for humans
 									//print('found tagvalue with required index<br />' . PHP_EOL);
 									$matches = array(array($value));
@@ -6797,7 +6855,6 @@ if(is_numeric($indices)) {
 									// $matched_tagvalue_index = true;
 									// $break_due_to_matched_index = true;
 								}
-								$this->tagvalue_match_counter[$selector_piece_index][$tagname_index]++;
 							}
 							if($matched_tagvalue_index) {
 								//print('matched tagvalue index<br />' . PHP_EOL);
@@ -6808,8 +6865,17 @@ if(is_numeric($indices)) {
 								} else {
 									$attributes_string = $matches[2][$index][0];
 									preg_match_all('/\s+(' . $this->attributename_regex . ')="([^"]+)"/', $attributes_string, $existing_attributes);
+									$required_attribute_position = 0;
 									foreach($this->required_attribute_sets[$selector_piece_index][$tagname_index] as $required_attribute_name => $required_attribute_value) {
 										$matched_required_attribute = false;
+										$attribute_comparison_operator = '=';
+										if(
+											isset($this->attribute_sets_comparison_operators[$selector_piece_index][$tagname_index][$required_attribute_position])
+											&& is_string($this->attribute_sets_comparison_operators[$selector_piece_index][$tagname_index][$required_attribute_position])
+											&& $this->attribute_sets_comparison_operators[$selector_piece_index][$tagname_index][$required_attribute_position] !== ''
+										) {
+											$attribute_comparison_operator = $this->attribute_sets_comparison_operators[$selector_piece_index][$tagname_index][$required_attribute_position];
+										}
 										if($required_attribute_value === false) {
 											foreach($existing_attributes[1] as $existing_attribute_name) {
 												if($existing_attribute_name === $required_attribute_name) {
@@ -6819,9 +6885,16 @@ if(is_numeric($indices)) {
 											}
 										} else {
 											foreach($existing_attributes[1] as $existing_attribute_index => $existing_attribute_name) {
+												if($existing_attribute_name !== $required_attribute_name) {
+													continue;
+												}
 												$existing_attribute_value = $existing_attributes[2][$existing_attribute_index];
-												//print('$existing_attribute_name, $required_attribute_name, $existing_attribute_value, $required_attribute_value: ');var_dump($existing_attribute_name, $required_attribute_name, $existing_attribute_value, $required_attribute_value);
-												if($existing_attribute_name === $required_attribute_name && $existing_attribute_value === $required_attribute_value) {
+												if($attribute_comparison_operator === '=') {
+													if($existing_attribute_value == $required_attribute_value) {
+														$matched_required_attribute = true;
+														break;
+													}
+												} elseif(O::compare($existing_attribute_value, $attribute_comparison_operator, $required_attribute_value)) {
 													$matched_required_attribute = true;
 													break;
 												}
@@ -6832,6 +6905,7 @@ if(is_numeric($indices)) {
 											break;
 										}
 										$matched_attributes = true;
+										$required_attribute_position++;
 									}
 								}
 								if($matched_attributes) {
@@ -6843,40 +6917,19 @@ if(is_numeric($indices)) {
 									if($this->attributes_indices[$selector_piece_index][$tagname_index] === false) {
 										//print('no attributes indices specified<br />' . PHP_EOL);
 										$matched_attributes_index = true;
+									} elseif(O::qualified_index_spec_at($selector_piece_index, $tagname_index) !== false) {
+										$matched_attributes_index = true;
 									} else {
-										//print('$this->attributes_match_counter[$selector_piece_index][$tagname_index], $this->attributes_indices[$selector_piece_index][$tagname_index]: ');var_dump($this->attributes_match_counter[$selector_piece_index][$tagname_index], $this->attributes_indices[$selector_piece_index][$tagname_index]);
-										if($this->attributes_match_counter[$selector_piece_index][$tagname_index] == $this->attributes_indices[$selector_piece_index][$tagname_index]) {
+										$at_idx_hit = O::consume_index_spec($this->attributes_indices[$selector_piece_index][$tagname_index], $this->attributes_match_counter[$selector_piece_index][$tagname_index]);
+										if($at_idx_hit === true) {
+											$matched_attributes_index = true;
+										} elseif($at_idx_hit === 'exclusive') {
 											// a specified index is the most specific a selector can be and thus negates anything selection by the selector piece after the index. multiindexes are similarly impossibly ambiguous for a computer though fun to contemplate for humans
 											//print('found attributes with required index<br />' . PHP_EOL);
 											$matches = array(array($value));
 											$this->reached_selector_index = true;
 											break 2;
-											// //print('matched attributes indices<br />' . PHP_EOL);
-											// print('culling others than attributes index<br />' . PHP_EOL);
-											// //$this->attributes_match_counter2 = 0;
-											// foreach($matches[0] as $index2 => $value2) {
-											// 	//$unset_match = true;
-											// 	//if($matches[1][$index2][0] === $tagname) {
-											// 	//	if($index === $index2) {
-											// 	//		$unset_match = false;
-											// 	//	}
-											// 	//	//$this->attributes_match_counter2++;
-											// 	//}
-											// 	//if($unset_match) {
-											// 	//	unset($matches[0][$index2]);
-											// 	//	//unset($matches[1][$index2]);
-											// 	//	//unset($matches[2][$index2]);
-											// 	//}
-											// 	if($index !== $index2) {
-											// 		unset($matches[0][$index2]);
-											// 	}
-											// }
-											// //continue 2;
-											// //break 2;
-											// $matched_attributes_index = true;
-											// $break_due_to_matched_index = true;
 										}
-										$this->attributes_match_counter[$selector_piece_index][$tagname_index]++;
 									}
 									// debug
 									//if($matched_attributes_index) {
@@ -7089,6 +7142,357 @@ if(is_numeric($indices)) {
 		return false;
 	}
 
+	function parse_index_spec($raw) {
+		if(!is_string($raw) || $raw === '') {
+			return false;
+		}
+		if(ctype_digit($raw)) {
+			return (int)$raw;
+		}
+		$map = array();
+		$parts = explode(',', $raw);
+		$added = 0;
+		foreach($parts as $part) {
+			$part = trim($part);
+			if($part === '') {
+				continue;
+			}
+			$dash = strpos($part, '-');
+			$left = ($dash !== false) ? trim(substr($part, 0, $dash)) : '';
+			$right = ($dash !== false) ? trim(substr($part, $dash + 1)) : '';
+			if($dash !== false && $left !== '' && $right !== '' && ctype_digit($left) && ctype_digit($right)) {
+				$lo = (int)$left;
+				$hi = (int)$right;
+				if($lo > $hi) {
+					$tmp = $lo;
+					$lo = $hi;
+					$hi = $tmp;
+				}
+				if($lo < 0) {
+					$lo = 0;
+				}
+				if($hi - $lo > 512) {
+					$hi = $lo + 512;
+				}
+				for($n = $lo; $n <= $hi; $n++) {
+					$map[$n] = 1;
+					$added++;
+				}
+			} else {
+				if(!ctype_digit(str_replace(array(' ', "\t"), '', $part))) {
+					continue;
+				}
+				$n = (int)$part;
+				if($n >= 0) {
+					$map[$n] = 1;
+					$added++;
+				}
+			}
+			if($added > 512) {
+				break;
+			}
+		}
+		if($added === 0) {
+			return false;
+		}
+		if($added === 1) {
+			reset($map);
+			return (int)key($map);
+		}
+		return $map;
+	}
+
+	function pick_offsets_by_index_spec($piece_matches, $spec) {
+		if($spec === false || $spec === null) {
+			return $piece_matches;
+		}
+		$out = array();
+		if(is_int($spec)) {
+			if($spec >= 0 && isset($piece_matches[$spec])) {
+				$out[] = $piece_matches[$spec];
+			}
+			return $out;
+		}
+		if(!is_array($spec)) {
+			return $out;
+		}
+		$keys = array_keys($spec);
+		sort($keys, SORT_NUMERIC);
+		foreach($keys as $n) {
+			$pick = (int)$n;
+			if($pick >= 0 && isset($piece_matches[$pick])) {
+				$out[] = $piece_matches[$pick];
+			}
+		}
+		return $out;
+	}
+
+	function qualified_index_spec_at($selector_piece_index, $tagname_index) {
+		// Indices on valued matches (tagvalue and/or attribute value) apply to the
+		// collected result set, not per-parent sibling positions.
+		$tv = (isset($this->tagvalues[$selector_piece_index][$tagname_index])) ? $this->tagvalues[$selector_piece_index][$tagname_index] : false;
+		$tv_idx = (isset($this->tagvalue_indices[$selector_piece_index][$tagname_index])) ? $this->tagvalue_indices[$selector_piece_index][$tagname_index] : false;
+		if($tv !== false && $tv !== '' && $tv_idx !== false && $tv_idx !== null) {
+			return $tv_idx;
+		}
+		$at_idx = (isset($this->attributes_indices[$selector_piece_index][$tagname_index])) ? $this->attributes_indices[$selector_piece_index][$tagname_index] : false;
+		if($at_idx === false || $at_idx === null) {
+			return false;
+		}
+		$req = (isset($this->required_attribute_sets[$selector_piece_index][$tagname_index]) && is_array($this->required_attribute_sets[$selector_piece_index][$tagname_index])) ? $this->required_attribute_sets[$selector_piece_index][$tagname_index] : array();
+		foreach($req as $attribute_value) {
+			if($attribute_value !== false && $attribute_value !== null && $attribute_value !== '') {
+				return $at_idx;
+			}
+		}
+		return false;
+	}
+
+	function apply_qualified_result_indexes($matches) {
+		if(!is_array($matches) || sizeof($matches) === 0) {
+			return $matches;
+		}
+		$piece_count = 0;
+		if(isset($this->selector_pieces) && is_array($this->selector_pieces)) {
+			$piece_count = sizeof($this->selector_pieces);
+		} elseif(isset($this->tagnames) && is_array($this->tagnames)) {
+			$piece_count = sizeof($this->tagnames);
+		}
+		$spec = false;
+		for($spi = $piece_count - 1; $spi >= 0; $spi--) {
+			if(!isset($this->tagnames[$spi]) || !is_array($this->tagnames[$spi])) {
+				continue;
+			}
+			$alts = sizeof($this->tagnames[$spi]);
+			for($i = 0; $i < $alts; $i++) {
+				$found = O::qualified_index_spec_at($spi, $i);
+				if($found !== false) {
+					$spec = $found;
+					break 2;
+				}
+			}
+		}
+		if($spec === false) {
+			return $matches;
+		}
+		return O::pick_offsets_by_index_spec($matches, $spec);
+	}
+
+	function consume_index_spec($spec, &$counter) {
+		if($spec === false || $spec === null) {
+			return true;
+		}
+		if(is_array($spec)) {
+			$hit = isset($spec[$counter]);
+			$counter++;
+			return $hit;
+		}
+		if(!is_int($spec)) {
+			return false;
+		}
+		$hit = ($counter === $spec);
+		$counter++;
+		return $hit;
+	}
+
+	function inner_text_from_offset($offset) {
+		O::ensure_parent_indexes();
+		if(!isset($this->opening_tag_names[$offset])) {
+			return '';
+		}
+		if(!isset($this->tag_end_offsets[$offset]) || !isset($this->node_end_offsets[$offset])) {
+			$expanded = O::expand(false, $offset);
+			return (isset($expanded[1][0])) ? (string)$expanded[1][0] : '';
+		}
+		if(O::tag_is_self_closing_at($this->code, $offset, $this->tag_end_offsets[$offset])) {
+			return '';
+		}
+		$tagname = $this->opening_tag_names[$offset];
+		$inner_start = $this->tag_end_offsets[$offset] + 1;
+		$closing = '</' . $tagname . '>';
+		$close_start = $this->node_end_offsets[$offset] - strlen($closing) + 1;
+		if($close_start < $inner_start) {
+			return '';
+		}
+		return substr($this->code, $inner_start, $close_start - $inner_start);
+	}
+
+	function attribute_value_at_offset($offset, $attribute_name) {
+		$attribute_name = (string)$attribute_name;
+		O::ensure_attribute_index($attribute_name);
+		if(!isset($this->attribute_index[$attribute_name][$offset])) {
+			return null;
+		}
+		if(isset($this->attribute_value_index[$attribute_name]) && is_array($this->attribute_value_index[$attribute_name])) {
+			foreach($this->attribute_value_index[$attribute_name] as $val => $offs) {
+				if(isset($offs[$offset])) {
+					return (string)$val;
+				}
+			}
+		}
+		return '';
+	}
+
+	function offset_matches_required_attributes($offset, $required_attributes, $attribute_ops) {
+		if(!is_array($required_attributes) || sizeof($required_attributes) === 0) {
+			return true;
+		}
+		$op_index = 0;
+		foreach($required_attributes as $attribute_name => $attribute_value) {
+			$op = false;
+			if(is_array($attribute_ops)) {
+				if(isset($attribute_ops[$op_index]) && $attribute_ops[$op_index] !== false && $attribute_ops[$op_index] !== '') {
+					$op = $attribute_ops[$op_index];
+				} elseif(isset($attribute_ops[$attribute_name]) && $attribute_ops[$attribute_name] !== false && $attribute_ops[$attribute_name] !== '') {
+					$op = $attribute_ops[$attribute_name];
+				}
+			}
+			$actual = O::attribute_value_at_offset($offset, $attribute_name);
+			if($attribute_value === false) {
+				if($actual === null) {
+					return false;
+				}
+			} else {
+				if($actual === null) {
+					return false;
+				}
+				if($op === false || $op === '') {
+					$op = '=';
+				}
+				if($op === '=') {
+					if($actual != $attribute_value) {
+						return false;
+					}
+				} elseif(!O::compare($actual, $op, $attribute_value)) {
+					return false;
+				}
+			}
+			$op_index++;
+		}
+		return true;
+	}
+
+	function fast_apply_index_piece($candidates, $piece) {
+		$tagname = isset($piece['tagname']) ? $piece['tagname'] : '*';
+		$piece_matches = array();
+		foreach($candidates as $child_offset) {
+			if($tagname !== '*') {
+				if(!isset($this->opening_tag_names[$child_offset]) || $this->opening_tag_names[$child_offset] !== $tagname) {
+					continue;
+				}
+			}
+			$piece_matches[] = $child_offset;
+		}
+		$tagname_index = isset($piece['tagname_index']) ? $piece['tagname_index'] : (isset($piece['index']) ? $piece['index'] : false);
+		if($tagname_index !== false && $tagname_index !== null) {
+			$piece_matches = O::pick_offsets_by_index_spec($piece_matches, $tagname_index);
+		}
+		$tagvalue = isset($piece['tagvalue']) ? $piece['tagvalue'] : false;
+		if($tagvalue !== false && $tagvalue !== null && $tagvalue !== '') {
+			$op = (isset($piece['tagvalue_op']) && $piece['tagvalue_op'] !== false && $piece['tagvalue_op'] !== '') ? $piece['tagvalue_op'] : '=';
+			if($tagname === '*' && $op === '=') {
+				$op = '%=';
+			}
+			$filtered = array();
+			foreach($piece_matches as $off) {
+				$tv = O::inner_text_from_offset($off);
+				if($op === '=') {
+					if($tv == $tagvalue) {
+						$filtered[] = $off;
+					}
+				} elseif(O::compare($tv, $op, $tagvalue)) {
+					$filtered[] = $off;
+				}
+			}
+			$piece_matches = $filtered;
+		}
+		$tagvalue_index = isset($piece['tagvalue_index']) ? $piece['tagvalue_index'] : false;
+		if($tagvalue_index !== false && $tagvalue_index !== null) {
+			$piece_matches = O::pick_offsets_by_index_spec($piece_matches, $tagvalue_index);
+		}
+		$required_attributes = (isset($piece['required_attributes']) && is_array($piece['required_attributes'])) ? $piece['required_attributes'] : array();
+		if(sizeof($required_attributes) > 0) {
+			$ops = (isset($piece['attribute_ops']) && is_array($piece['attribute_ops'])) ? $piece['attribute_ops'] : array();
+			$filtered = array();
+			foreach($piece_matches as $off) {
+				if(O::offset_matches_required_attributes($off, $required_attributes, $ops)) {
+					$filtered[] = $off;
+				}
+			}
+			$piece_matches = $filtered;
+		}
+		$attributes_index = isset($piece['attributes_index']) ? $piece['attributes_index'] : false;
+		if($attributes_index !== false && $attributes_index !== null) {
+			$piece_matches = O::pick_offsets_by_index_spec($piece_matches, $attributes_index);
+		}
+		return $piece_matches;
+	}
+
+	function collapse_same_tag_index_and($selector_piece_index) {
+		if(!isset($this->tagnames[$selector_piece_index])) {
+			return;
+		}
+		$names = $this->tagnames[$selector_piece_index];
+		$n = sizeof($names);
+		if($n < 2) {
+			return;
+		}
+		$first = $names[0];
+		$acc = null;
+		for($i = 0; $i < $n; $i++) {
+			if($names[$i] !== $first) {
+				return;
+			}
+			if(isset($this->tagvalues[$selector_piece_index][$i]) && $this->tagvalues[$selector_piece_index][$i] !== false) {
+				return;
+			}
+			if(isset($this->required_attribute_sets[$selector_piece_index][$i]) && sizeof($this->required_attribute_sets[$selector_piece_index][$i]) > 0) {
+				return;
+			}
+			$idx = isset($this->tagname_indices[$selector_piece_index][$i]) ? $this->tagname_indices[$selector_piece_index][$i] : false;
+			if($idx === false || $idx === null) {
+				return;
+			}
+			if(is_int($idx)) {
+				$map = array($idx => 1);
+			} elseif(is_array($idx)) {
+				$map = $idx;
+			} else {
+				return;
+			}
+			if($acc === null) {
+				$acc = $map;
+			} else {
+				$next = array();
+				foreach($acc as $k => $_v) {
+					if(isset($map[$k])) {
+						$next[$k] = 1;
+					}
+				}
+				$acc = $next;
+			}
+		}
+		if($acc === null || sizeof($acc) === 0) {
+			$spec = array();
+		} elseif(sizeof($acc) === 1) {
+			reset($acc);
+			$spec = (int)key($acc);
+		} else {
+			$spec = $acc;
+		}
+		$this->tagnames[$selector_piece_index] = array($first);
+		$this->tagvalues[$selector_piece_index] = array(false);
+		$this->tagvalue_comparison_operators[$selector_piece_index] = array(false);
+		$this->tagname_indices[$selector_piece_index] = array($spec);
+		$this->tagvalue_indices[$selector_piece_index] = array(false);
+		$this->attributes_indices[$selector_piece_index] = array(false);
+		$this->required_attribute_sets[$selector_piece_index] = array(array());
+		$this->attribute_sets_comparison_operators[$selector_piece_index] = array(array());
+		$this->tagname_match_counter[$selector_piece_index] = array(0);
+		$this->tagvalue_match_counter[$selector_piece_index] = array(0);
+		$this->attributes_match_counter[$selector_piece_index] = array(0);
+	}
+
 	function parse_selector_piece($piece, $selector_piece_index) {
 		//print('$piece, $selector_piece_index at start of parse_selector_piece: ');var_dump($piece, $selector_piece_index);
 		static $piece_parse_cache = array();
@@ -7165,9 +7569,9 @@ if(is_numeric($indices)) {
 					$piece_offset += strlen($attribute_set_comparison_operator);
 					continue;
 				} elseif($piece_offset < strlen($piece) && $piece[$piece_offset] === '[') {
-					$possible_index_length = strpos($piece, ']') - $piece_offset - 1;
+					$possible_index_length = strpos($piece, ']', $piece_offset) - $piece_offset - 1;
 					$possible_index = substr($piece, $piece_offset + 1, $possible_index_length);
-					$attributes_index = (int)$possible_index;
+					$attributes_index = O::parse_index_spec($possible_index);
 					$piece_offset += $possible_index_length + 2;
 					continue;
 				}
@@ -7184,9 +7588,9 @@ if(is_numeric($indices)) {
 					$piece_offset++;
 					continue;
 				} elseif($piece[$piece_offset] === '[') {
-					$possible_index_length = strpos($piece, ']') - $piece_offset - 1;
+					$possible_index_length = strpos($piece, ']', $piece_offset) - $piece_offset - 1;
 					$possible_index = substr($piece, $piece_offset + 1, $possible_index_length);
-					$attributes_index = (int)$possible_index;
+					$attributes_index = O::parse_index_spec($possible_index);
 					$piece_offset += $possible_index_length + 2;
 					continue;
 				}
@@ -7204,28 +7608,26 @@ if(is_numeric($indices)) {
 					$piece_offset++;
 				}
 				if($piece_offset < strlen($piece) && $piece[$piece_offset] === '[') {
-					$possible_index_length = strpos($piece, ']') - $piece_offset - 1;
+					$possible_index_length = strpos($piece, ']', $piece_offset) - $piece_offset - 1;
 					$possible_index = substr($piece, $piece_offset + 1, $possible_index_length);
-					$tagvalue_index = (int)$possible_index;
+					$tagvalue_index = O::parse_index_spec($possible_index);
 					$piece_offset += $possible_index_length + 2;
 					continue;
 				}
 				continue;
 			} elseif($piece[$piece_offset] === '[') {
-				$possible_index_length = strpos($piece, ']') - $piece_offset - 1;
+				$possible_index_length = strpos($piece, ']', $piece_offset) - $piece_offset - 1;
 				$possible_index = substr($piece, $piece_offset + 1, $possible_index_length);
-				$tagname_index = (int)$possible_index;
+				$tagname_index = O::parse_index_spec($possible_index);
 				$piece_offset += $possible_index_length + 2;
 				continue;
 			} elseif($piece[$piece_offset] === '@') {
-				if($piece_offset === 0) {
-					print('$piece: ');var_dump($piece);
-					O::fatal_error('trying to select an attribute in a system (Logical Object Model (LOM)) where attributes are properties of tags rather than standing on their own.');
-				} else {
-					$parsing_attribute_name = true;
-					$piece_offset++;
-					continue;
+				if($tagname === '') {
+					$tagname = '*';
 				}
+				$parsing_attribute_name = true;
+				$piece_offset++;
+				continue;
 			} elseif($piece[$piece_offset] === '&') {
 				if($piece_offset === 0) {
 					print('$piece: ');var_dump($piece);
@@ -7272,7 +7674,10 @@ if(is_numeric($indices)) {
 			$tagname .= $piece[$piece_offset];
 			$piece_offset++;
 		}
-		if(strlen($tagname) > 0) {
+		if(strlen($tagname) > 0 || $tagname_index !== false) {
+			if($tagname === '') {
+				$tagname = '*';
+			}
 			if($tagname[0] === '.') {
 				$tagname = substr($tagname, 1);
 				$this->selected_parent_piece_index = $selector_piece_index;
@@ -7300,6 +7705,7 @@ if(is_numeric($indices)) {
 			$this->tagvalue_match_counter[$selector_piece_index][] = 0;
 			$this->attributes_match_counter[$selector_piece_index][] = 0;
 		}
+		O::collapse_same_tag_index_and($selector_piece_index);
 		//print('$this->tagnames, $this->tagvalues at end of parse_selector_piece: ');var_dump($this->tagnames, $this->tagvalues);
 		// Cache the parsed selector-piece metadata. Mutable counters are reinitialized
 		// from cache on subsequent hits.
@@ -7449,7 +7855,7 @@ if(is_numeric($indices)) {
 						continue;
 					} elseif($piece[$piece_offset] === '[') { // check whether we are selecting by order or by attribute
 						//print('here374859---0012<br />' . PHP_EOL);
-						$possible_index_length = strpos($piece, ']') - $piece_offset - 1;
+						$possible_index_length = strpos($piece, ']', $piece_offset) - $piece_offset - 1;
 						$possible_index = substr($piece, $piece_offset + 1, $possible_index_length);
 						if(is_numeric($possible_index)) {
 							//print('here374859---0013<br />' . PHP_EOL);

@@ -1,11 +1,25 @@
 # LOM
 
-Living Object Model — hierarchical XML document engine (PHP `O.php`) with a native C core and a Power Apps / Power BI HTTP service.
+<img src="icons/lom-logo.svg" width="72" height="72" alt="LOM logo: a rainbow living field with a lock-on reticle"/>
+
+Living Object Model — hierarchical XML document engine (PHP `O.php`) with a native C core and a Power Apps / Power BI HTTP service. The mark is the brief: **find the precise in the mutable**.
+
+## Live demo
+
+Edit the XML (same contents as `test.xml`), edit the LOM selector, and watch matches update.
+
+```bash
+php -S localhost:8765
+# open http://localhost:8765/demo/
+```
+
+If this repo is already served over Apache, open [`demo/`](demo/).
 
 ## Quick paths
 
 | Path | What |
 |------|------|
+| [`demo/`](demo/) | Live query playground (XML + selector → matches) |
 | `O.php` | Original PHP API (unchanged for existing programs) |
 | `native/` | C library (`liblom`), CLI (`lomc`), OData daemon (`lomd`) |
 | `powerapps/` | Entity config, OpenAPI custom connector, setup guide |

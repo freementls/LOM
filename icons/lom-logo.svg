@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="LOM query finds structure">
+  <defs>
+    <linearGradient id="lom-live" x1="4" y1="20" x2="40" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ff5d6c"/>
+      <stop offset="20%" stop-color="#ffa14a"/>
+      <stop offset="40%" stop-color="#ffe25c"/>
+      <stop offset="62%" stop-color="#6cf09e"/>
+      <stop offset="80%" stop-color="#5ec8ff"/>
+      <stop offset="100%" stop-color="#c47bff"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0a0e18"/>
+  <rect x="4" y="20" width="36" height="36" rx="5" fill="url(#lom-live)"/>
+  <rect x="12" y="28" width="20" height="20" rx="4" fill="#0a0e18" opacity="0.22"/>
+  <rect x="12" y="28" width="20" height="20" rx="4" fill="none" stroke="#fffef6" stroke-width="2.5"/>
+  <rect x="20" y="36" width="12" height="12" rx="2.5" fill="#fff7d6"/>
+  <path d="M56 12 L40 28" fill="none" stroke="#0a0e18" stroke-width="4" stroke-linecap="square"/>
+  <path d="M56 12 L40 28" fill="none" stroke="#fffef6" stroke-width="2.2" stroke-linecap="square"/>
+</svg>

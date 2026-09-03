@@ -4,6 +4,10 @@
 
 Living Object Model — hierarchical XML document engine (PHP `O.php`) with a native C core and a Power Apps / Power BI HTTP service. The mark is the brief: **find the precise in the mutable**.
 
+**License:** [Apache License 2.0](LICENSE).
+
+Selectors use `_` / `__` for child / descendant. Comparison values may be PCRE literals: `hobby%=/s.*/i` (see `regex_selector_test.php`). Multi-language connectors: [`connectors/`](connectors/).
+
 ## Live demo
 
 **[https://freement.cloud/LOM/demo/](https://freement.cloud/LOM/demo/)** — edit the XML (same contents as `test.xml`), edit the LOM selector, and watch matches update. Writes (`set` / `new_` / `delete`) apply only when you press the button.
@@ -18,6 +22,8 @@ Source for that page: [`demo/`](demo/). Locally: `php -S localhost:8765` then ht
 | `O.php` | Original PHP API (unchanged for existing programs) |
 | `native/` | C library (`liblom`), CLI (`lomc`), OData daemon (`lomd`) |
 | `powerapps/` | Entity config, OpenAPI custom connector, setup guide |
+| `connectors/` | C#, Python, TypeScript, Java, Go clients (ABI + OData) |
+| `LICENSE` | Apache-2.0 |
 
 ## Power Apps
 

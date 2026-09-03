@@ -7,11 +7,15 @@ LDLIBS = -lm
 LIB = lib/liblom.so
 LOMC = bin/lomc
 LOMD = bin/lomd
-OBJS = src/lom_scan.o src/lom_doc.o
+OBJS = src/lom_scan.o src/lom_doc.o src/lom_fmem.o src/lom_fcache.o
 
-.PHONY: all clean test-scan php-ext
+.PHONY: all clean test-scan php-ext test-fmem
 
 all: $(LIB) $(LOMC) $(LOMD)
+
+test-fmem: $(LIB)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o bin/test_fmem_fcache src/test_fmem_fcache.c -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom $(LDLIBS)
+	./bin/test_fmem_fcache
 
 php-ext: $(LIB)
 	cd php_ext && phpize
@@ -33,8 +37,12 @@ $(LOMC): src/lomc.o $(LIB) | lib
 $(LOMD): src/lomd.o $(LIB) | lib
 	$(CC) -o $@ src/lomd.o -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom -lpthread $(LDLIBS)
 
-src/%.o: src/%.c include/lom.h
+src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+src/lom_scan.o src/lom_doc.o: include/lom.h
+src/lom_fmem.o: include/lom_fmem.h
+src/lom_fcache.o: include/lom_fcache.h
 
 clean:
 	rm -f src/*.o $(LIB) $(LOMC) $(LOMD)

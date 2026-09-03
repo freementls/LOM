@@ -108,7 +108,14 @@ If further tuning is needed:
 - `replace_patch_parent_indexes` branch-local churn
 - `new_()` internals with strict median gate and immediate revert on mixed regression
 
-## Native C accelerator + Power Apps service (2026-07)
+## Regex selectors + large fixtures (2026-09)
+
+- PHP: `/pattern/flags` after any comparison operator; `/` is no longer a child-path alias.
+- `php regex_selector_test.php` — operator × attribute coverage.
+- `php gen_perf_fixture.php [size] [out]` and `./bench_large.sh 100MB` — opt-in large profiles (`LOM_ALLOW_HUGE=1` for ≥10GB).
+- `php bench_vs_tools.php` — personal LOM vs DOM/XPath/XMLReader bake-off (not the paper main table).
+- Native: `lom_fmem` / `lom_fcache` + tag-aligned `lom_piece_boundaries` (`make -C native test-fmem`).
+
 
 - `liblom` + `lomc`: full in-process get/set/new_
 - `lomd`: persistent OData/API daemon for Power Apps / Power BI

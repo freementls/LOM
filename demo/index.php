@@ -1,6 +1,6 @@
 <?php
 $default_xml = file_get_contents(dirname(__DIR__) . DIRECTORY_SEPARATOR . 'test.xml');
-$default_query = '.person_name=sally';
+$default_query = 'hobby%=/s.*/i';
 ?>
 <!DOCTYPE html>
 <html lang="en">

@@ -10,7 +10,7 @@
 make -C native
 ```
 
-Native child selectors use **`/`** (`region/zone/entity`) so `_` is allowed in tag names (`big_container`).
+Native child selectors use **`_`** (`region_zone_entity`) for direct children and **`__`** for descendants. Tag names containing `_` must be encoded. `/` is reserved for regex values in the PHP API.
 
 ## Power Apps
 

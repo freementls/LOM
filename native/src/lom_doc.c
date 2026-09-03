@@ -350,17 +350,23 @@ static bool parse_piece(const char *s, size_t n, sel_piece *p) {
 }
 
 static bool parse_selector(const char *sel, sel_chain *out) {
+	/* Child axis is '_' / '__' (same as PHP). '/' is reserved for regex literals in PHP; native ignores regex. */
 	memset(out, 0, sizeof(*out));
 	if(!sel || !*sel) return false;
 	const char *p = sel;
 	while(*p) {
+		while(*p == '_') p++; /* skip leading underscores (direct-scope marker) */
+		if(!*p) break;
 		const char *start = p;
-		while(*p && *p != '/') p++;
+		while(*p && *p != '_') p++;
 		size_t n = (size_t)(p - start);
+		if(n == 0) continue;
 		if(out->count >= 32) return false;
 		if(!parse_piece(start, n, &out->pieces[out->count])) return false;
 		out->count++;
-		if(*p == '/') p++;
+		/* '__' = descendant (same piece chain for native subset); '_' = child — both advance */
+		if(*p == '_' && *(p + 1) == '_') p += 2;
+		else if(*p == '_') p++;
 	}
 	return out->count > 0;
 }

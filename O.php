@@ -1,6 +1,10 @@
 <?php
-
-// LOM: Living Object Model (started as Logical Object Model)
+/**
+ * LOM: Living Object Model (started as Logical Object Model)
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright contributors to LOM
+ */
 
 // ...... combining tidyer_DOM, DOM, OM, XPath, preg ......
 
@@ -124,6 +128,11 @@ class O {
 	public $tagvalue_comparison_operators = array();
 	public $attribute_sets_comparison_operators = array();
 	public $native_doc = null; /* optional lom_accel document resource */
+	public $selector_regex_table = array(); /* id => array(pattern, flags, compiled) */
+	public $selector_regex_compile_cache = array(); /* "pattern\0flags" => compiled */
+	public $fmem_intern = array(); /* content-hash => string; L1 slice intern */
+	public $fcache_regex_matches = array(); /* key => match arrays */
+	public $fcache_compiled_patterns = array(); /* alias of compile cache for ROI stats */
 
 	function __construct($file_to_parse, $use_context = true, $array_blocks = false, $array_inline = false) {
 		$this->O_initial_time = O::getmicrotime();
@@ -418,7 +427,232 @@ class O {
 		return preg_match('/(?:' . $this->comparison_operators_regex . ')/', $selector) === 1;
 	}
 
+	function lom_regex_token_id($value) {
+		if(!is_string($value)) {
+			return false;
+		}
+		if(preg_match('/^#lomregex#(\d+)#$/', $value, $m)) {
+			return (int)$m[1];
+		}
+		return false;
+	}
+
+	function lom_regex_allowed_flags($flags) {
+		if($flags === '') {
+			return true;
+		}
+		return (bool)preg_match('/^[imsux]+$/', $flags);
+	}
+
+	function compile_lom_regex($pattern, $flags) {
+		$cache_key = $pattern . "\0" . $flags;
+		if(isset($this->selector_regex_compile_cache[$cache_key])) {
+			return $this->selector_regex_compile_cache[$cache_key];
+		}
+		if(!O::lom_regex_allowed_flags($flags)) {
+			O::fatal_error('unsupported regex flags (allowed: i m s u x): ' . $flags);
+		}
+		$delim = '/';
+		$compiled = $delim . $pattern . $delim . $flags;
+		// Validate compile: empty subject; catch invalid patterns.
+		$prev = error_reporting(0);
+		$ok = @preg_match($compiled, '');
+		error_reporting($prev);
+		if($ok === false && preg_last_error() !== PREG_NO_ERROR) {
+			O::fatal_error('invalid regex pattern: ' . $pattern);
+		}
+		$this->selector_regex_compile_cache[$cache_key] = $compiled;
+		return $compiled;
+	}
+
+	function extract_selector_regexes($selector) {
+		if(!is_string($selector) || $selector === '' || strpos($selector, '/') === false) {
+			return $selector;
+		}
+		if(!isset($this->comparison_operators) || !is_array($this->comparison_operators) || sizeof($this->comparison_operators) === 0) {
+			O::set_LOM_operators();
+		}
+		$ops = array_keys($this->comparison_operators); // longest-first already
+		$out = '';
+		$len = strlen($selector);
+		$i = 0;
+		while($i < $len) {
+			$matched_op = false;
+			foreach($ops as $op) {
+				$op_len = strlen($op);
+				if(substr($selector, $i, $op_len) === $op) {
+					$after = $i + $op_len;
+					if($after < $len && $selector[$after] === '/') {
+						// Parse /pattern/flags
+						$p = $after + 1;
+						$pattern = '';
+						while($p < $len) {
+							if($selector[$p] === '\\' && $p + 1 < $len) {
+								$pattern .= $selector[$p] . $selector[$p + 1];
+								$p += 2;
+								continue;
+							}
+							if($selector[$p] === '/') {
+								break;
+							}
+							$pattern .= $selector[$p];
+							$p++;
+						}
+						if($p >= $len || $selector[$p] !== '/') {
+							O::fatal_error('unclosed regex literal after ' . $op);
+						}
+						$p++; // closing /
+						$flags = '';
+						while($p < $len && ctype_alpha($selector[$p])) {
+							$flags .= $selector[$p];
+							$p++;
+						}
+						if(!O::lom_regex_allowed_flags($flags)) {
+							O::fatal_error('unsupported regex flags (allowed: i m s u x): ' . $flags);
+						}
+						$id = sizeof($this->selector_regex_table);
+						$compiled = O::compile_lom_regex($pattern, $flags);
+						$this->selector_regex_table[$id] = array(
+							'pattern' => $pattern,
+							'flags' => $flags,
+							'compiled' => $compiled,
+						);
+						$out .= $op . '#lomregex#' . $id . '#';
+						$i = $p;
+						$matched_op = true;
+						break;
+					}
+					// Operator without regex value — emit op and continue
+					$out .= $op;
+					$i = $after;
+					$matched_op = true;
+					break;
+				}
+			}
+			if($matched_op) {
+				continue;
+			}
+			$out .= $selector[$i];
+			$i++;
+		}
+		return $out;
+	}
+
+	function regex_match_array($text, $compiled, $need_all = true) {
+		$key = $compiled . "\0" . ($need_all ? '1' : '0') . "\0" . $text;
+		if(isset($this->fcache_regex_matches[$key])) {
+			return $this->fcache_regex_matches[$key];
+		}
+		$matches = array();
+		if($need_all) {
+			$ok = @preg_match_all($compiled, $text, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
+		} else {
+			$ok = @preg_match($compiled, $text, $m, PREG_OFFSET_CAPTURE);
+			if($ok) {
+				$matches = array($m);
+			}
+		}
+		if($ok === false) {
+			$err = preg_last_error();
+			if($err !== PREG_NO_ERROR) {
+				O::fatal_error('regex match failed (preg_last_error=' . $err . ')');
+			}
+			$matches = array();
+		}
+		// Cap cache size to avoid unbounded growth on large documents.
+		if(sizeof($this->fcache_regex_matches) > 256) {
+			$this->fcache_regex_matches = array();
+		}
+		$this->fcache_regex_matches[$key] = $matches;
+		return $matches;
+	}
+
+	function fmem_intern_string($string) {
+		if(!is_string($string) || strlen($string) < 32) {
+			return $string;
+		}
+		if(in_array('xxh3', hash_algos(), true)) {
+			$hash = hash('xxh3', $string, false);
+		} else {
+			$hash = hash('sha1', $string, false);
+		}
+		if(isset($this->fmem_intern[$hash]) && $this->fmem_intern[$hash] === $string) {
+			return $this->fmem_intern[$hash];
+		}
+		if(sizeof($this->fmem_intern) > 4096) {
+			$this->fmem_intern = array();
+		}
+		$this->fmem_intern[$hash] = $string;
+		return $this->fmem_intern[$hash];
+	}
+
+	function compare_regex_matches($text, $op, $regex_id) {
+		if(!isset($this->selector_regex_table[$regex_id])) {
+			return false;
+		}
+		$entry = $this->selector_regex_table[$regex_id];
+		$compiled = $entry['compiled'];
+		$text = (string)$text;
+		$text_len = strlen($text);
+		$need_all = !in_array($op, array('%=', '!='), true);
+		$matches = O::regex_match_array($text, $compiled, $need_all);
+		if($op === '!=') {
+			return sizeof($matches) === 0;
+		}
+		if($op === '%=') {
+			return sizeof($matches) > 0;
+		}
+		if(sizeof($matches) === 0) {
+			return false;
+		}
+		foreach($matches as $m) {
+			$full = $m[0][0];
+			$off = $m[0][1];
+			$mlen = strlen($full);
+			switch($op) {
+				case '=':
+					if($off === 0 && $mlen === $text_len) {
+						return true;
+					}
+					break;
+				case '^=':
+					if($off === 0) {
+						return true;
+					}
+					break;
+				case '$=':
+					if($off + $mlen === $text_len) {
+						return true;
+					}
+					break;
+				case '~=':
+					$before_ok = ($off === 0) || ctype_space($text[$off - 1]);
+					$after_ok = ($off + $mlen === $text_len) || ctype_space($text[$off + $mlen]);
+					if($before_ok && $after_ok) {
+						return true;
+					}
+					break;
+				case '>':
+				case '<':
+				case '>=':
+				case '<=':
+					// Regex RHS encodes allowed numeric forms (e.g. *@age>=/1[6-9]|[2-9]\d+/).
+					// Keep the node when a numeric portion matches the pattern.
+					$num_str = (isset($m[1]) && is_array($m[1])) ? $m[1][0] : $full;
+					if(is_numeric($num_str)) {
+						return true;
+					}
+					break;
+			}
+		}
+		return false;
+	}
+
 	function compare($left, $op, $right) {
+		$regex_id = O::lom_regex_token_id($right);
+		if($regex_id !== false) {
+			return O::compare_regex_matches($left, $op, $regex_id);
+		}
 		if(in_array($op, array('>','<','>=','<='), true) && is_numeric($left) && is_numeric($right)) {
 			$left += 0;
 			$right += 0;
@@ -4810,9 +5044,12 @@ class O {
 			$selector = '*' . $selector;
 		}
 		$selector = str_replace('_@', '_*@', $selector);
+		// Extract /pattern/flags before rewriting path backslashes so \w etc. stay intact.
+		if(strpos($selector, '/') !== false) {
+			$this->selector_regex_table = array();
+			$selector = O::extract_selector_regexes($selector);
+		}
 		$selector = str_replace('\\', '_', $selector);
-		$selector = str_replace('/', '_', $selector);
-		//print('$selector in normalize_selector(): ');var_dump($selector);
 		return $selector;
 	}
 
@@ -6005,6 +6242,11 @@ if(is_numeric($indices)) {
 		}
 		foreach($tagvalue_list as $tagvalue_index => $tagvalue) {
 			if($tagvalue !== false) {
+				if(O::lom_regex_token_id($tagvalue) !== false) {
+					$tagvalue_exists = true;
+					$match_any_tagvalue = true; // real check via compare() on regex match arrays
+					continue;
+				}
 				//$tagvalue_component .= $tagvalue . '|';
 				$tagvalue_component .= O::preg_escape($tagvalue) . '|';
 				$tagvalue_exists = true;
@@ -6155,6 +6397,23 @@ if(is_numeric($indices)) {
 						if(isset($this->tagnames[$spi][$tvi]) && $this->tagnames[$spi][$tvi] === '*') {
 							$fractally_get = false;
 							break 2;
+						}
+						if(isset($this->tagvalues[$spi][$tvi]) && O::lom_regex_token_id($this->tagvalues[$spi][$tvi]) !== false) {
+							$fractally_get = false;
+							break 2;
+						}
+					}
+					if(isset($this->required_attribute_sets[$spi]) && is_array($this->required_attribute_sets[$spi])) {
+						foreach($this->required_attribute_sets[$spi] as $attr_set) {
+							if(!is_array($attr_set)) {
+								continue;
+							}
+							foreach($attr_set as $an => $av) {
+								if($av !== false && O::lom_regex_token_id($av) !== false) {
+									$fractally_get = false;
+									break 3;
+								}
+							}
 						}
 					}
 				}
@@ -6801,7 +7060,7 @@ if(is_numeric($indices)) {
 							if($this->tagnames[$selector_piece_index][$tagname_index] === '*' && $tv_op === '=') {
 								$tv_op = '%=';
 							}
-							if($tv_op === '=') {
+							if($tv_op === '=' && O::lom_regex_token_id($this->tagvalues[$selector_piece_index][$tagname_index]) === false) {
 								$matched_tagvalue = ($this->tagvalues[$selector_piece_index][$tagname_index] == $tagvalue);
 							} else {
 								$matched_tagvalue = O::compare($tagvalue, $tv_op, $this->tagvalues[$selector_piece_index][$tagname_index]);
@@ -6889,7 +7148,7 @@ if(is_numeric($indices)) {
 													continue;
 												}
 												$existing_attribute_value = $existing_attributes[2][$existing_attribute_index];
-												if($attribute_comparison_operator === '=') {
+												if($attribute_comparison_operator === '=' && O::lom_regex_token_id($required_attribute_value) === false) {
 													if($existing_attribute_value == $required_attribute_value) {
 														$matched_required_attribute = true;
 														break;
@@ -7396,7 +7655,7 @@ if(is_numeric($indices)) {
 			$filtered = array();
 			foreach($piece_matches as $off) {
 				$tv = O::inner_text_from_offset($off);
-				if($op === '=') {
+				if($op === '=' && O::lom_regex_token_id($tagvalue) === false) {
 					if($tv == $tagvalue) {
 						$filtered[] = $off;
 					}
@@ -12380,10 +12639,10 @@ if(is_numeric($indices)) {
 		$this->ensure_parent_indexes();
 		if(isset($this->node_end_offsets[$offset])) {
 			$end = $this->node_end_offsets[$offset];
-			return substr($this->code, $offset, $end - $offset + 1);
+			return O::fmem_intern_string(substr($this->code, $offset, $end - $offset + 1));
 		}
 		$expanded_LOM = O::expand($this->code, $offset, 0);
-		return $expanded_LOM[0][0];
+		return O::fmem_intern_string($expanded_LOM[0][0]);
 	}
 
 	function get_all_named_tags($string, $tagName, $offset = 0, $tagvalue = false, $matching_index = false, $required_attributes = array()) {

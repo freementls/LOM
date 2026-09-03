@@ -46,11 +46,11 @@ int main(int argc, char **argv) {
 		int parent;
 	} cases[] = {
 		{"top-level repeated tag", "region", 0},
-		{"descendant chain", "region/zone/entity/stats", 0},
+		{"descendant chain", "region_zone_entity_stats", 0},
 		{"attribute existence", "entity@kind", 0},
-		{"attribute value subtag combo", "entity/meta/name=Entity_42", 0},
-		{"indexed tagname selector", "region[10]/zone[5]/entity[7]/stats", 0},
-		{"parent reads", "region/zone/entity/stats", 1},
+		{"attribute value subtag combo", "entity_meta_name=Entity_42", 0},
+		{"indexed tagname selector", "region[10]_zone[5]_entity[7]_stats", 0},
+		{"parent reads", "region_zone_entity_stats", 1},
 	};
 
 	for(size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
@@ -80,9 +80,9 @@ int main(int argc, char **argv) {
 		lom_match_list_free(&m);
 	}
 
-	const char *chain_note = "region[1]/zone[3]/entity[4]/meta/note";
-	const char *chain_meta = "region[1]/zone[3]/entity[4]/meta";
-	const char *chain_bonus = "region[1]/zone[3]/entity[4]/meta/bonus/value";
+	const char *chain_note = "region[1]_zone[3]_entity[4]_meta_note";
+	const char *chain_meta = "region[1]_zone[3]_entity[4]_meta";
+	const char *chain_bonus = "region[1]_zone[3]_entity[4]_meta_bonus_value";
 
 	lom_match_list m;
 	lom_match_list_init(&m);

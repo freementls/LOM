@@ -79,9 +79,16 @@ $default_query = 'hobby%=/s.*/i';
 					<button type="button" class="mode is-on" data-mode="tagged">Nodes</button>
 					<button type="button" class="mode" data-mode="values">Values</button>
 				</div>
-				<p class="tiny-hint">Query updates as you type. <code>Write</code> applies <code>set</code> / <code>new_</code> / <code>delete</code> to the XML.</p>
+				<p class="tiny-hint">Query updates as you type. Regex values use <code>/pattern/flags</code> after any comparison op (<code>%=</code>, <code>^=</code>, …). <code>Write</code> applies <code>set</code> / <code>new_</code> / <code>delete</code>.</p>
 				<div class="chip-row">
-					<button type="button" class="chip is-on" data-query=".person_name=sally">.person_name=sally</button>
+					<button type="button" class="chip is-on" data-query="hobby%=/s.*/i">hobby%=/s.*/i</button>
+					<button type="button" class="chip" data-query="hobby=/^ski/i">hobby=/^ski/i</button>
+					<button type="button" class="chip" data-query="hobby$=/ing$/">hobby$=/ing$/</button>
+					<button type="button" class="chip" data-query="hobby~=/ski|swim/">hobby~=/ski|swim/</button>
+					<button type="button" class="chip" data-query="hobby!=/sleep/i">hobby!=/sleep/i</button>
+					<button type="button" class="chip" data-query="*@age&gt;=/1[6-9]|[2-9]\d+/">*@age&gt;=/1[6-9]|…/</button>
+					<button type="button" class="chip" data-query="person@name=/^sal/i">person@name=/^sal/i</button>
+					<button type="button" class="chip" data-query=".person_name=sally">.person_name=sally</button>
 					<button type="button" class="chip" data-query="hobby">hobby</button>
 					<button type="button" class="chip" data-write-action="set" data-query=".person_lastname=mott" data-write="hobby=breathing">set mott hobby</button>
 					<button type="button" class="chip" data-write-action="new_" data-query="big#underscore#container" data-write="&lt;person age=&quot;33&quot;&gt;&lt;name&gt;santa&lt;/name&gt;&lt;lastname&gt;klaus&lt;/lastname&gt;&lt;hobby&gt;presents&lt;/hobby&gt;&lt;/person&gt;">new_ santa</button>

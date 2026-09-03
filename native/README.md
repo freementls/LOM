@@ -14,17 +14,18 @@ Native child selectors use **`_`** (`region_zone_entity`) for direct children an
 
 ## Accelerators (fmem / fcache / pieces)
 
-`lom_doc_create_file` prefers **mmap**. Tag-row index build can use **parallel workers**. Env toggles (default on):
+`lom_doc_create_file` prefers **mmap**. Aux indexes use **CSR children** + exact-sized `uint32` tag/attr rows (large RAM win). Env toggles:
 
-| Variable | Effect |
-|---|---|
-| `LOM_FMEM=0` | Disable string intern table |
-| `LOM_FCACHE=0` | Disable selector result memo |
-| `LOM_PIECES=0` | Disable tag-aligned piece split |
-| `LOM_PARALLEL=0` | Disable pthread tag-row workers |
+| Variable | Default | Effect |
+|---|---|---|
+| `LOM_FMEM=0` | on | Disable string table (views into `string_blob`, no duplicate copies) |
+| `LOM_FCACHE=0` | on | Disable selector result memo |
+| `LOM_PIECES=0` | on | Disable tag-aligned piece split |
+| `LOM_PARALLEL=1` | **off** | Optional pthread tag-row workers (uses more RAM) |
 
 Ablations: `../bench_ablation.sh [fixture]`.
 
+PHP large files: lazy packed depths (`lom_packed_depths.php`), slim tag index; set `LOM_PHP_HEAVY_INDEX=1` only if you need full PHP parent maps.
 ## Power Apps
 
 See [`powerapps/README.md`](../powerapps/README.md). Short version:

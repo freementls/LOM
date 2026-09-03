@@ -6,6 +6,8 @@
  * Copyright contributors to LOM
  */
 
+require_once __DIR__ . '/lom_packed_depths.php';
+
 // ...... combining tidyer_DOM, DOM, OM, XPath, preg ......
 
 // see test.php for usage examples
@@ -139,6 +141,10 @@ class O {
 	public $fcache_misses = 0;
 	public $fcache_enabled = true;
 	public $fcache_compiled_patterns = array(); /* alias of compile cache for ROI stats */
+	public $offset_depths_pending = false; /* lazy depth map for large documents */
+	public $tag_index_slim_ready = false;
+	public $slim_open_offsets = array();
+	public $slim_node_ends = array();
 
 	function __construct($file_to_parse, $use_context = true, $array_blocks = false, $array_inline = false) {
 		$this->O_initial_time = O::getmicrotime();
@@ -203,13 +209,30 @@ class O {
 		//print('$this->code in __construct: ');var_dump($this->code);
 		O::reset_tag_types();
 		O::check_tag_types($this->code);
-		O::set_offset_depths();
-		//print('$this->must_check_for_self_closing, $this->must_check_for_doctype, $this->must_check_for_non_parsed_character_data, $this->must_check_for_comment, $this->must_check_for_programming_instruction, $this->must_check_for_ASP: ');var_dump($this->must_check_for_self_closing, $this->must_check_for_doctype, $this->must_check_for_non_parsed_character_data, $this->must_check_for_comment, $this->must_check_for_programming_instruction, $this->must_check_for_ASP);
-		//$this->zero_offsets = array();
-		//print('$this->offset_depths after set_offset_depths(): ');O::var_dump_full($this->offset_depths);
+		/* Large documents: defer the full offset_depths PHP array (huge per-key overhead)
+		 * until a query path needs it. Force with LOM_EAGER_DEPTHS=1. */
+		$code_bytes = strlen($this->code);
+		$eager = getenv('LOM_EAGER_DEPTHS');
+		$eager_on = ($eager !== false && $eager !== '' && $eager !== '0' && strcasecmp((string)$eager, 'false') !== 0 && strcasecmp((string)$eager, 'off') !== 0);
+		if(!$eager_on && $code_bytes >= 8 * 1024 * 1024) {
+			$this->offset_depths = array();
+			$this->offset_depths_pending = true;
+			$this->fmem_enabled = false; /* avoid second copies of large slices by default */
+		} else {
+			$this->offset_depths_pending = false;
+			O::set_offset_depths();
+		}
 		O::set_LOM_operators();
 		O::native_doc_boot();
 		//O::debug();
+	}
+
+	function ensure_offset_depths() {
+		if(!$this->offset_depths_pending) {
+			return true;
+		}
+		$this->offset_depths_pending = false;
+		return O::set_offset_depths();
 	}
 
 	function native_doc_boot() {
@@ -1117,8 +1140,21 @@ class O {
 	}
 
 	function set_offset_depths() {
-		//print('$this->code: ');var_dump($this->code);
-		$this->offset_depths = O::get_offset_depths(false, 0, 0, true);
+		$this->offset_depths_pending = false;
+		$code_bytes = strlen($this->code);
+		if($code_bytes >= 8 * 1024 * 1024) {
+			$this->offset_depths = LomPackedOffsetDepths::build_from_code(
+				$this->code,
+				$this->must_check_for_self_closing,
+				$this->must_check_for_doctype,
+				$this->must_check_for_non_parsed_character_data,
+				$this->must_check_for_comment,
+				$this->must_check_for_programming_instruction,
+				$this->must_check_for_ASP
+			);
+		} else {
+			$this->offset_depths = O::get_offset_depths(false, 0, 0, true);
+		}
 		return true;
 		/*$depth = 0;
 			*	//$this->offset_depths = array();
@@ -1218,8 +1254,75 @@ class O {
 		return O::get_offset_depths($code, $offset_to_add, $depth_to_add);
 	}
 
+	function build_offset_depths_linear($code, $offset_to_add = 0, $depth_to_add = 0) {
+		$offset_depths = array();
+		$depth = 0;
+		$len = strlen($code);
+		if($len === 0) {
+			return $offset_depths;
+		}
+		$offset = 0;
+		if($code[0] !== '<') {
+			$offset_depths[$offset_to_add] = $depth + $depth_to_add;
+		}
+		while(($offset = strpos($code, '<', $offset)) !== false) {
+			$offset_depths[$offset + $offset_to_add] = $depth + $depth_to_add;
+			$next = $offset + 1;
+			if($next >= $len) {
+				break;
+			}
+			$c1 = $code[$next];
+			if($c1 === '/') {
+				$depth--;
+				$gt = strpos($code, '>', $next);
+				$offset = ($gt === false) ? $len : $gt + 1;
+				continue;
+			}
+			if($this->must_check_for_comment && $c1 === '!' && substr($code, $next, 3) === '!--') {
+				$end = strpos($code, '-->', $next);
+				$offset = ($end === false) ? $len : $end + 3;
+				continue;
+			}
+			if($this->must_check_for_non_parsed_character_data && $c1 === '!' && substr($code, $next, 8) === '![CDATA[') {
+				$end = strpos($code, ']]>', $next);
+				$offset = ($end === false) ? $len : $end + 3;
+				continue;
+			}
+			if($this->must_check_for_doctype && $c1 === '!' && strncasecmp(substr($code, $offset, 9), '<!DOCTYPE', 9) === 0) {
+				$gt = strpos($code, '>', $next);
+				$offset = ($gt === false) ? $len : $gt + 1;
+				continue;
+			}
+			if($this->must_check_for_programming_instruction && $c1 === '?') {
+				$end = strpos($code, '?>', $next);
+				$offset = ($end === false) ? $len : $end + 2;
+				continue;
+			}
+			if($this->must_check_for_ASP && $c1 === '%') {
+				$end = strpos($code, '%>', $next);
+				$offset = ($end === false) ? $len : $end + 2;
+				continue;
+			}
+			$gt = strpos($code, '>', $next);
+			if($gt === false) {
+				break;
+			}
+			$self = ($gt > $next && $code[$gt - 1] === '/');
+			if(!$self) {
+				$depth++;
+			}
+			$offset = $gt + 1;
+		}
+		return $offset_depths;
+	}
+
 	function get_offset_depths($code = false, $offset_to_add = 0, $depth_to_add = 0, $for_writing = false) {
-		//print('$code, $offset_to_add, $depth_to_add at very start of get_offset_depths: ');var_dump($code, $offset_to_add, $depth_to_add);
+		if(!$for_writing && $this->offset_depths_pending && ($code === false || $code === $this->code)) {
+			O::ensure_offset_depths();
+			if($code === false) {
+				return $this->offset_depths;
+			}
+		}
 		if($code === false) {
 			$code = $this->code;
 		}
@@ -1234,8 +1337,6 @@ class O {
 		if(strlen($code) === 0) {
 			return array();
 		}
-		// Cache parsed offset/depth maps for non-document snippets (write fragments).
-		// This avoids repeatedly running expand() on the same small strings.
 		static $snippet_depth_cache = array();
 		static $snippet_depth_cache_order = array();
 		$can_use_snippet_cache = (
@@ -1248,7 +1349,7 @@ class O {
 			if(isset($snippet_depth_cache[$cache_key])) {
 				$base = $snippet_depth_cache[$cache_key];
 			} else {
-				$base = O::expand($code, 0, 0, true)[3];
+				$base = O::build_offset_depths_linear($code, 0, 0);
 				$snippet_depth_cache[$cache_key] = $base;
 				$snippet_depth_cache_order[] = $cache_key;
 				if(sizeof($snippet_depth_cache_order) > 128) {
@@ -1265,155 +1366,14 @@ class O {
 			}
 			return $shifted;
 		}
-		//if(!$for_writing && $code === $this->code) {
-		//	return $this->offset_depths;
-		//}
-		$expanded_LOM = O::expand($code, 0, $offset_to_add, true);
-		return $expanded_LOM[3];
-		//print('$code, $offset_to_add, $depth_to_add at start of get_offset_depths: ');var_dump($code, $offset_to_add, $depth_to_add);
-		//print('substr($code, 9900, 600): ');var_dump(substr($code, 9900, 600)); // debug
-		$depth = 0;
-		$offset_depths = array();
-		//$position = -1;
-		$offset = 0;
-		// $in_tag = false;
-		// $in_opening_tag = false;
-		// $in_closing_tag = false;
-		// $in_self_closing_tag = false;
-		// $in_doctype = false;
-		// $in_cdata = false;
-		// $in_comment = false;
-		// $in_programming_instruction = false;
-		// $in_ASP = false;
-		if($code[$offset] === '<') { // do nothing and let the parser set the offset_depth
-
-		} else {
-			$offset_depths[$offset + $offset_to_add] = $depth + $depth_to_add;
-		}
-		while($offset < strlen($code)) {
-			//print('$offset, $code[$offset]: ');var_dump($offset, $code[$offset]);
-			//print('$offset, $depth + $depth_to_add,  substr($code, $offset, 10): ');var_dump($offset, $depth + $depth_to_add, substr($code, $offset, 10));
-			if($code[$offset] === '<') {
-				$offset_depths[$offset + $offset_to_add] = $depth + $depth_to_add;
-				if($this->must_check_for_self_closing && $code[strpos($code, '>', $offset + 1) - 1] === '/') { // self-closing
-					$offset += strpos($code, '>', $offset + 1) - $offset + 1;
-				} elseif($this->must_check_for_doctype && substr($code, $offset, 9) === '<!DOCTYPE') { // doctype
-					$offset += strpos($code, '>', $offset + 9) - $offset + 1;
-				} elseif($this->must_check_for_non_parsed_character_data && substr($code, $offset, 9) === '<![CDATA[') { // non-parsed character data
-					$offset += strpos($code, ']]>', $offset + 9) - $offset + 3;
-				} elseif($this->must_check_for_comment && substr($code, $offset, 4) === '<!--') { // comment
-					$offset += strpos($code, '-->', $offset + 3) - $offset + 3;
-				} elseif($this->must_check_for_programming_instruction && substr($code, $offset, 2) === '<?') { // programming instruction
-					$offset += strpos($code, '?>', $offset + 2) - $offset + 2;
-				} elseif($this->must_check_for_ASP && substr($code, $offset, 2) === '<%') { // ASP
-					$offset += strpos($code, '%>', $offset + 2) - $offset + 2;
-				} elseif($code[$offset + 1] === '/') { // closing tag
-					//$offset_depths[$offset + $offset_to_add]--;
-					$offset += strpos($code, '>', $offset + 2) - $offset + 1;
-					$depth--;
-				} else { // opening tag
-					$offset += strpos($code, '>', $offset + 1) - $offset + 1;
-					$depth++;
-				}
-				if(isset($code[$offset]) && $code[$offset] === '<') { // do nothing and let the parser set the offset_depth
-
-				} else { // text
-					$offset_depths[$offset + $offset_to_add] = $depth + $depth_to_add;
-				}
-				continue;
-			}
-			$offset++;
-		}
-		//$offset_depths[$offset + $offset_to_add] = $depth + $depth_to_add; // ensure there is a closing text for expand()
-		/*
-			*	//while(($position = strpos($code, '<', $position + 1)) !== false) {
-			*	//while(($position = strpos($code, '<', $position)) !== false) {
-			*	while(true) {
-			*		//print('$position, $offset_to_add, $depth, $depth_to_add in get_offset_depths loop: ');var_dump($position, $offset_to_add, $depth, $depth_to_add);
-			*		$offset_depths[$position + $offset_to_add] = $depth + $depth_to_add;
-			*		if($code[$position + 1] === '/') { // closing tag
-			*			print('od closing tag<br />' . PHP_EOL);
-			*			$depth--;
-	} elseif($this->must_check_for_self_closing && $code[strpos($code, '>', $position + 1) - 1] === '/') { // self-closing tag
-		//} elseif($this->must_check_for_self_closing && ($closing_angle_bracket_position = strpos($code, '>', $position + 1)) && $code[$closing_angle_bracket_position - 1] === '/') { // self-closing tag
-		print('od self closing<br />' . PHP_EOL);
-	} elseif($this->must_check_for_doctype && (substr($code, $position + 1, 8) === '!DOCTYPE' || substr($code, $position + 1, 8) === '!doctype')) { // doctype
-		print('od doctype<br />' . PHP_EOL);
-		$position = strpos($code, '>', $position + 1) + 1;
-		//continue;
-	} elseif($this->must_check_for_non_parsed_character_data && substr($code, $position + 1, 8) === '![CDATA[') { // non-parsed character data
-		print('od cdata<br />' . PHP_EOL);
-		$position = strpos($code, ']]>', $position + 1) + 3;
-		//continue;
-	} elseif($this->must_check_for_comment && substr($code, $position + 1, 3) === '!--') { // comment
-		print('od comment<br />' . PHP_EOL);
-		$position = strpos($code, '-->', $position + 1) + 3;
-		//continue;
-	} elseif($this->must_check_for_programming_instruction && $code[$position + 1] === '?') { // programming instruction
-		print('od programming instruction<br />' . PHP_EOL);
-		$position = strpos($code, '?>', $position + 1) + 2;
-		//continue;
-	} elseif($this->must_check_for_ASP && $code[$position + 1] === '%') { // ASP
-		print('od ASP<br />' . PHP_EOL);
-		$position = strpos($code, '%>', $position + 1) + 2;
-		//continue;
-	} else { // opening tag
-		print('od opening tag<br />' . PHP_EOL);
-		$depth++;
-		// also mark the depth of text (if there is any)
-		//$closing_angle_bracket_position = strpos($code, '>', $position + 1);
-		//if($code[$closing_angle_bracket_position + 1] === '<') {
-		//	if($code[$closing_angle_bracket_position + 2] === '/') { // still add the zero-length text string
-		//		$offset_depths[$closing_angle_bracket_position + $offset_to_add + 1] = $depth + $depth_to_add;
-		//	}// else { // it'll be caught by code above
-		//	//
-		//	//}
-		//} else { // it's a text string
-		//	$offset_depths[$closing_angle_bracket_position + $offset_to_add + 1] = $depth + $depth_to_add;
-		//}
-	}
-	// also mark the depth of text (in case there is any). if there's an opening angle bracket right after the closing angle bracket it'll be marked twice but nbd
-	// nvm
-	$closing_angle_bracket_position = strpos($code, '>', $position + 1);
-	$position = $closing_angle_bracket_position + 1;
-	if($code[$position] === '<') {
-
-	} else { // add the text
-		$offset_depths[$closing_angle_bracket_position + $offset_to_add] = $depth + $depth_to_add;
-	}
-	//print('$code, strpos($code, \'<\', $position + 1) in get_offset_depths loop: ');var_dump($code, strpos($code, '<', $position + 1));
-	$debug_offset = $position + $offset_to_add;
-	$debug_depth = $depth + $depth_to_add;
-	$debug_code = substr($code, $position + $offset_to_add, 600);
-	$last_piece = substr($code, $last_position, $position - $last_position);
-	$last_position = $position;
-	print('$debug_offset, $debug_depth, $last_piece in get_offset_depths: ' . $debug_offset . ', ' . $debug_depth . ', ' . $last_piece . PHP_EOL);
-	$position = strpos($code, '<', $position);
-	if($position === false) {
-		break;
-	}
-	}
-	*/
-		//$debug2363_depth = $offset_depths[2363];
-		//$debug2363_code = substr($code, 2363, 6);
-		//print('depth, code piece at 2363 get_offset_depths: ' . $debug2363_depth . ', ' . $debug2363_code . PHP_EOL);
-		// $debug2391_depth = $offset_depths[2391];
-		// $debug2391_code = substr($code, 2391, 6);
-		// print('depth, code piece at 2391 get_offset_depths: ' . $debug2391_depth . ', ' . $debug2363_code . PHP_EOL);
-		//print('$offset_depths at end of get_offset_depths: ');var_dump($offset_depths);
-		if($this->debug) {
-			reset($offset_depths);
-			$current_result = current($offset_depths);
-			$next_result = next($offset_depths);
-			if($current_result !== false && $next_result !== false && $current_result > $next_result) {
-				print('$current_result, $next_result: ');var_dump($current_result, $next_result);
-				O::fatal_error('depth should not go down at the start of offset_depths');
-			}
-		}
-		return $offset_depths;
+		/* Full-document and large spans: linear scan — expand() materializes huge arrays. */
+		return O::build_offset_depths_linear($code, $offset_to_add, $depth_to_add);
 	}
 
 	function replace_offsets_and_depths($old_value, $new_value, $offset, $offset_adjust, $depth_of_offset = 0) {
+		if($this->offset_depths instanceof LomPackedOffsetDepths) {
+			$this->offset_depths = $this->offset_depths->thaw();
+		}
 		//function replace_offsets_and_depths($offset, $offset_adjust) {
 		// could check if old_value === new_value but it's a waste since there's a condition on the only place this function is called with $this->string_operation_made_a_change
 		// $this->variables do not keep their own separate offset_depths, nor does included_array
@@ -2061,12 +2021,117 @@ class O {
 		if($this->parent_indexes_ready) {
 			return true;
 		}
+		/* Building PHP hash maps for every open on 100MB+ docs can take multi-GB.
+		 * Skip unless LOM_PHP_HEAVY_INDEX=1; callers fall back (prefer liblom for large files). */
+		$heavy = getenv('LOM_PHP_HEAVY_INDEX');
+		$heavy_on = ($heavy !== false && $heavy !== '' && $heavy !== '0');
+		if(!$heavy_on && strlen($this->code) >= 8 * 1024 * 1024) {
+			return false;
+		}
 		O::build_parent_indexes();
 		return true;
 	}
 
+	/** Tag-name → offsets (+ packed open/end). $want_tag limits tag_index RAM. */
+	function ensure_tag_index_slim($want_tag = false) {
+		if($this->parent_indexes_ready) {
+			return true;
+		}
+		if(!empty($this->tag_index_slim_ready) && ($want_tag === false || isset($this->tag_index[$want_tag]))) {
+			return true;
+		}
+		$this->tag_index = array();
+		$code = $this->code;
+		$len = strlen($code);
+		$offset = 0;
+		$stack = array();
+		$cap = (int)max(1024, intdiv($len, 24));
+		$opens = new SplFixedArray($cap);
+		$ends = new SplFixedArray($cap);
+		$n = 0;
+		while($offset < $len) {
+			$lt = strpos($code, '<', $offset);
+			if($lt === false) {
+				break;
+			}
+			$next = $lt + 1;
+			if($next >= $len) {
+				break;
+			}
+			$c1 = $code[$next];
+			if($c1 === '!' || $c1 === '?' || $c1 === '%') {
+				$gt = strpos($code, '>', $next);
+				$offset = ($gt === false) ? $len : $gt + 1;
+				continue;
+			}
+			$gt = O::find_tag_close_offset($code, $lt);
+			if($gt === false) {
+				break;
+			}
+			if($c1 === '/') {
+				if(sizeof($stack) > 0) {
+					$idx = array_pop($stack);
+					$ends[$idx] = $gt;
+				}
+				$offset = $gt + 1;
+				continue;
+			}
+			$tagname = O::extract_tagname_at($code, $lt, $gt);
+			$self = ($gt > $lt && $code[$gt - 1] === '/');
+			if($n >= $cap) {
+				$cap = (int)($cap * 3 / 2) + 64;
+				$opens->setSize($cap);
+				$ends->setSize($cap);
+			}
+			$idx = $n;
+			$opens[$n] = $lt;
+			$ends[$n] = $self ? $gt : -1;
+			$n++;
+			if($tagname !== false && ($want_tag === false || $tagname === $want_tag)) {
+				if(!isset($this->tag_index[$tagname])) {
+					$this->tag_index[$tagname] = array();
+				}
+				$this->tag_index[$tagname][] = $lt;
+			}
+			if(!$self) {
+				$stack[] = $idx;
+			}
+			$offset = $gt + 1;
+		}
+		while(sizeof($stack) > 0) {
+			$idx = array_pop($stack);
+			$ends[$idx] = $len - 1;
+		}
+		$opens->setSize($n);
+		$ends->setSize($n);
+		$this->slim_open_offsets = $opens;
+		$this->slim_node_ends = $ends;
+		$this->tag_index_slim_ready = true;
+		return true;
+	}
+
+	function slim_node_slice($offset) {
+		$lo = 0;
+		$hi = count($this->slim_open_offsets);
+		while($lo < $hi) {
+			$mid = ($lo + $hi) >> 1;
+			$v = $this->slim_open_offsets[$mid];
+			if($v < $offset) {
+				$lo = $mid + 1;
+			} elseif($v > $offset) {
+				$hi = $mid;
+			} else {
+				$end = $this->slim_node_ends[$mid];
+				return substr($this->code, $offset, $end - $offset + 1);
+			}
+		}
+		return '';
+	}
+
 	private function ensure_parent_children_index() {
-		O::ensure_parent_indexes();
+		if(!O::ensure_parent_indexes()) {
+			return false;
+		}
 		if($this->parent_children_index_ready && $this->parent_children_index_size === $this->opening_tag_offsets_count) {
 			return true;
 		}
@@ -3397,7 +3462,34 @@ class O {
 		if($chain === false) {
 			return false;
 		}
-		O::ensure_parent_indexes();
+		$have_full = O::ensure_parent_indexes();
+		if(!$have_full) {
+			/* Large-doc slim path: single tagname only (no parent walk). */
+			if(sizeof($chain) !== 1) {
+				return false;
+			}
+			$piece = $chain[0];
+			O::ensure_tag_index_slim($piece['tagname']);
+			$candidate_offsets = isset($this->tag_index[$piece['tagname']]) ? $this->tag_index[$piece['tagname']] : array();
+			if($piece['index'] !== false && $piece['index'] !== null) {
+				$matching_offsets = O::pick_offsets_by_index_spec($candidate_offsets, $piece['index']);
+			} else {
+				$matching_offsets = $candidate_offsets;
+			}
+			$selector_matches = array();
+			$this->offsets_from_get = array();
+			foreach($matching_offsets as $offset) {
+				$selector_matches[] = array(O::slim_node_slice($offset), $offset);
+				$this->offsets_from_get[] = $offset;
+			}
+			if($add_to_context) {
+				O::add_to_context($normalized_selector, false, O::context_array($selector_matches));
+			}
+			if($tagged_result) {
+				return $selector_matches;
+			}
+			return O::export($selector_matches);
+		}
 		if(sizeof($chain) === 1) {
 			$piece = $chain[0];
 			$candidate_offsets = O::get_tag_index_offsets($piece['tagname']);
@@ -3801,6 +3893,12 @@ class O {
 	function get($selector, $matching_array = false, $add_to_context = true, $ignore_context = false, $parent_node_only = false, $tagged_result = false) {
 		$profile_token = $this->profile_function_start('get');
 		try {
+		/* Large docs: keep depths lazy until a path that needs them (not slim/native fastpaths). */
+		if(!$this->offset_depths_pending) {
+			/* already built */
+		} elseif(strlen($this->code) < 8 * 1024 * 1024) {
+			O::ensure_offset_depths();
+		}
 		$normalized_selector = false;
 		//O::warning_once('need to garbage-collect the context to have good performance. use test.xml to test and garbage-collect according to scope of queries');
 		//print('$selector, $matching_array, $add_to_context at start of get: ');var_dump($selector, $matching_array, $add_to_context);
@@ -13098,6 +13196,9 @@ if(is_numeric($indices)) {
 	//function expand($code = false, $offset = 0, $offset_to_add = 0, $offset_depths = false, $mode = 'lazy') {
 	function expand($code = false, $offset = 0, $offset_to_add = 0, $for_writing = false) {
 		//print('start of expand()<br />' . PHP_EOL);
+		if(!$for_writing) {
+			O::ensure_offset_depths();
+		}
 		// expand does more than get_tag_string() and so each may have their place: expand should be more complete but less efficient
 		// mode (lazy or greedy) seems obsolete and may be a vestige or a prior way of thinking that didn't set offset depths for opening angle brackets and text positions
 		// would it be better if this function always received an offset on the opening angle bracket < rather than looking for it? is this a reasonable expectation?

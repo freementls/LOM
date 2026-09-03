@@ -390,6 +390,37 @@ lom_status lom_scan_indexes(
 
 	intern_free(&intern);
 	free(ostack);
+
+	/* Trim capacity to size so aux build does not inherit 2× open/attr tables. */
+	if(out->open_count && out->open_cap > out->open_count) {
+		lom_open_row *slim = realloc(out->opens, out->open_count * sizeof(lom_open_row));
+		if(slim) {
+			out->opens = slim;
+			out->open_cap = out->open_count;
+		}
+	}
+	if(out->attr_count && out->attr_cap > out->attr_count) {
+		lom_attr_row *slim = realloc(out->attrs, out->attr_count * sizeof(lom_attr_row));
+		if(slim) {
+			out->attrs = slim;
+			out->attr_cap = out->attr_count;
+		}
+	}
+	if(out->string_count && out->string_cap > out->string_count) {
+		size_t *slim = realloc(out->string_offs, out->string_count * sizeof(size_t));
+		if(slim) {
+			out->string_offs = slim;
+			out->string_cap = out->string_count;
+		}
+	}
+	if(out->string_blob_len && out->string_blob_cap > out->string_blob_len) {
+		char *slim = realloc(out->string_blob, out->string_blob_len);
+		if(slim) {
+			out->string_blob = slim;
+			out->string_blob_cap = out->string_blob_len;
+		}
+	}
+
 	out->status = LOM_OK;
 	return LOM_OK;
 }

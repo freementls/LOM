@@ -4,12 +4,17 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <limits.h>
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #ifndef LOM_MAX_PIECES
 #define LOM_MAX_PIECES 64
@@ -22,21 +27,19 @@ struct lom_doc {
 	int mmap_fd;
 	int code_is_mmap; /* 1 => code from mmap; do not free() as malloc */
 	lom_scan_result scan;
-	/* per-name sorted open indices into scan.opens */
-	size_t **tag_rows;
-	size_t *tag_row_counts;
-	size_t *tag_row_caps;
+	/* per-name open indices (uint32, exact-sized — no per-row cap waste) */
+	uint32_t **tag_rows;
+	uint32_t *tag_row_counts;
 	size_t tag_row_slots;
-	size_t **children;
-	size_t *child_counts;
-	size_t *child_caps;
-	size_t *root_children;
+	/* CSR children: child_at[child_start[i] .. child_start[i+1]) */
+	uint32_t *child_at;
+	uint32_t *child_start; /* length aux_open_count + 1 */
+	uint32_t *root_children;
 	size_t root_child_count;
-	size_t root_child_cap;
 	size_t aux_open_count;
-	size_t **attr_opens;
-	size_t *attr_open_counts;
-	size_t *attr_open_caps;
+	/* per-attr-name open indices */
+	uint32_t **attr_opens;
+	uint32_t *attr_open_counts;
 	size_t attr_slots;
 	/* Accelerators */
 	lom_fmem *fmem;
@@ -66,7 +69,8 @@ static void doc_init_accel(lom_doc *d) {
 	d->use_fmem = env_flag_on("LOM_FMEM", 1);
 	d->use_fcache = env_flag_on("LOM_FCACHE", 1);
 	d->use_pieces = env_flag_on("LOM_PIECES", 1);
-	d->use_parallel = env_flag_on("LOM_PARALLEL", 1);
+	/* Parallel tag-row build duplicates per-thread buffers; default off for RAM. */
+	d->use_parallel = env_flag_on("LOM_PARALLEL", 0);
 	d->mmap_fd = -1;
 	d->code_is_mmap = 0;
 	d->piece_count = 0;
@@ -123,45 +127,18 @@ static void doc_mark_dirty_at(lom_doc *d, size_t offset) {
 }
 
 static void doc_fmem_ingest_strings(lom_doc *d) {
+	/* Scan already interns into string_blob. Copying into fmem doubled RAM for no hit
+	 * benefit. Use zero-copy views so identical lookups share blob pointers without malloc. */
 	if(!d->fmem || !d->use_fmem) return;
-	if(!lom_fmem_roi_ok(d->fmem, 0.05, 64)) {
-		/* ROI gate: stop paying for interning when it never hits */
-		return;
-	}
+	if(!lom_fmem_roi_ok(d->fmem, 0.05, 64)) return;
 	for(size_t i = 0; i < d->scan.string_count; i++) {
 		const char *s = lom_scan_string(&d->scan, (uint32_t)i);
 		size_t n = strlen(s);
-		if(n >= 8) {
-			(void)lom_fmem_intern(d->fmem, s, n);
-		}
+		if(n >= 8) (void)lom_fmem_intern_view(d->fmem, s, n);
 	}
 }
-
-typedef struct {
-	lom_doc *d;
-	size_t begin;
-	size_t end;
-	size_t **local_rows;
-	size_t *local_counts;
-	size_t *local_caps;
-	size_t nstr;
-} tag_row_job;
 
 static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need);
-
-static void *tag_row_worker(void *arg) {
-	tag_row_job *job = (tag_row_job *)arg;
-	lom_doc *d = job->d;
-	for(size_t i = job->begin; i < job->end; i++) {
-		uint32_t nid = d->scan.opens[i].name_id;
-		if(nid >= job->nstr) continue;
-		if(!grow_cap((void **)&job->local_rows[nid], sizeof(size_t), &job->local_caps[nid], job->local_counts[nid] + 1)) {
-			continue;
-		}
-		job->local_rows[nid][job->local_counts[nid]++] = i;
-	}
-	return NULL;
-}
 
 void lom_match_list_init(lom_match_list *m) {
 	memset(m, 0, sizeof(*m));
@@ -198,37 +175,26 @@ static void doc_clear_aux(lom_doc *d) {
 	}
 	free(d->tag_rows);
 	free(d->tag_row_counts);
-	free(d->tag_row_caps);
 	d->tag_rows = NULL;
 	d->tag_row_counts = NULL;
-	d->tag_row_caps = NULL;
 	d->tag_row_slots = 0;
 
-	if(d->children) {
-		for(size_t i = 0; i < d->aux_open_count; i++) free(d->children[i]);
-	}
-	free(d->children);
-	free(d->child_counts);
-	free(d->child_caps);
-	d->children = NULL;
-	d->child_counts = NULL;
-	d->child_caps = NULL;
-	d->aux_open_count = 0;
-
+	free(d->child_at);
+	free(d->child_start);
+	d->child_at = NULL;
+	d->child_start = NULL;
 	free(d->root_children);
 	d->root_children = NULL;
 	d->root_child_count = 0;
-	d->root_child_cap = 0;
+	d->aux_open_count = 0;
 
 	if(d->attr_opens) {
 		for(size_t i = 0; i < d->attr_slots; i++) free(d->attr_opens[i]);
 	}
 	free(d->attr_opens);
 	free(d->attr_open_counts);
-	free(d->attr_open_caps);
 	d->attr_opens = NULL;
 	d->attr_open_counts = NULL;
-	d->attr_open_caps = NULL;
 	d->attr_slots = 0;
 }
 
@@ -249,99 +215,95 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	doc_clear_aux(d);
 	size_t n = d->scan.open_count;
 	size_t nstr = d->scan.string_count;
-	d->tag_row_slots = nstr;
-	d->tag_rows = calloc(nstr, sizeof(size_t *));
-	d->tag_row_counts = calloc(nstr, sizeof(size_t));
-	d->tag_row_caps = calloc(nstr, sizeof(size_t));
-	d->children = calloc(n ? n : 1, sizeof(size_t *));
-	d->child_counts = calloc(n ? n : 1, sizeof(size_t));
-	d->child_caps = calloc(n ? n : 1, sizeof(size_t));
+	if(n > UINT32_MAX) return false;
 	d->aux_open_count = n;
-	if(!d->tag_rows || !d->tag_row_counts || !d->tag_row_caps || !d->children || !d->child_counts || !d->child_caps) {
-		return false;
+	d->tag_row_slots = nstr;
+	d->tag_rows = calloc(nstr ? nstr : 1, sizeof(uint32_t *));
+	d->tag_row_counts = calloc(nstr ? nstr : 1, sizeof(uint32_t));
+	if(!d->tag_rows || !d->tag_row_counts) return false;
+
+	/* Count tag rows, then allocate exact uint32 vectors (no doubling waste). */
+	for(size_t i = 0; i < n; i++) {
+		uint32_t nid = d->scan.opens[i].name_id;
+		if(nid < nstr) d->tag_row_counts[nid]++;
+	}
+	for(size_t nid = 0; nid < nstr; nid++) {
+		if(d->tag_row_counts[nid] == 0) continue;
+		d->tag_rows[nid] = malloc(d->tag_row_counts[nid] * sizeof(uint32_t));
+		if(!d->tag_rows[nid]) return false;
+		d->tag_row_counts[nid] = 0; /* reuse as fill cursor */
+	}
+	for(size_t i = 0; i < n; i++) {
+		uint32_t nid = d->scan.opens[i].name_id;
+		if(nid >= nstr) continue;
+		d->tag_rows[nid][d->tag_row_counts[nid]++] = (uint32_t)i;
 	}
 
-	/* Parallel tag-row accumulation across open ranges (piece-aligned when possible). */
-	int nthreads = 1;
-	if(d->use_parallel && n > 4096) {
-		nthreads = 4;
-		long hc = sysconf(_SC_NPROCESSORS_ONLN);
-		if(hc > 1 && hc < nthreads) nthreads = (int)hc;
-		if(hc >= 8) nthreads = 8;
-	}
-	if(nthreads <= 1 || nstr == 0) {
-		for(size_t i = 0; i < n; i++) {
-			uint32_t nid = d->scan.opens[i].name_id;
-			if(nid >= nstr) continue;
-			if(!grow_cap((void **)&d->tag_rows[nid], sizeof(size_t), &d->tag_row_caps[nid], d->tag_row_counts[nid] + 1)) {
-				return false;
-			}
-			d->tag_rows[nid][d->tag_row_counts[nid]++] = i;
-		}
-	} else {
-		pthread_t threads[8];
-		tag_row_job jobs[8];
-		size_t chunk = (n + (size_t)nthreads - 1) / (size_t)nthreads;
-		for(int t = 0; t < nthreads; t++) {
-			jobs[t].d = d;
-			jobs[t].begin = (size_t)t * chunk;
-			jobs[t].end = jobs[t].begin + chunk;
-			if(jobs[t].end > n) jobs[t].end = n;
-			jobs[t].nstr = nstr;
-			jobs[t].local_rows = calloc(nstr, sizeof(size_t *));
-			jobs[t].local_counts = calloc(nstr, sizeof(size_t));
-			jobs[t].local_caps = calloc(nstr, sizeof(size_t));
-			if(!jobs[t].local_rows || !jobs[t].local_counts || !jobs[t].local_caps) return false;
-			pthread_create(&threads[t], NULL, tag_row_worker, &jobs[t]);
-		}
-		for(int t = 0; t < nthreads; t++) {
-			pthread_join(threads[t], NULL);
-			for(size_t nid = 0; nid < nstr; nid++) {
-				size_t add = jobs[t].local_counts[nid];
-				if(add == 0) continue;
-				if(!grow_cap((void **)&d->tag_rows[nid], sizeof(size_t), &d->tag_row_caps[nid], d->tag_row_counts[nid] + add)) {
-					return false;
-				}
-				memcpy(d->tag_rows[nid] + d->tag_row_counts[nid], jobs[t].local_rows[nid], add * sizeof(size_t));
-				d->tag_row_counts[nid] += add;
-			}
-			for(size_t nid = 0; nid < nstr; nid++) free(jobs[t].local_rows[nid]);
-			free(jobs[t].local_rows);
-			free(jobs[t].local_counts);
-			free(jobs[t].local_caps);
-		}
-	}
+	/* Optional parallel path reserved (LOM_PARALLEL); exact pack is single-pass for RAM. */
+	(void)d->use_parallel;
 
+	/* CSR children: count, prefix sum, fill — two flat arrays, no per-node malloc. */
+	uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));
+	if(!counts) return false;
+	size_t root_n = 0;
 	for(size_t i = 0; i < n; i++) {
 		int64_t parent = d->scan.opens[i].parent_off;
 		if(parent < 0) {
-			if(!grow_cap((void **)&d->root_children, sizeof(size_t), &d->root_child_cap, d->root_child_count + 1)) {
-				return false;
-			}
-			d->root_children[d->root_child_count++] = i;
-		} else {
-			size_t pi = find_open_index(d, parent);
-			if(pi == (size_t)-1) continue;
-			if(!grow_cap((void **)&d->children[pi], sizeof(size_t), &d->child_caps[pi], d->child_counts[pi] + 1)) {
-				return false;
-			}
-			d->children[pi][d->child_counts[pi]++] = i;
+			root_n++;
+			continue;
 		}
+		size_t pi = find_open_index(d, parent);
+		if(pi == (size_t)-1) continue;
+		counts[pi]++;
 	}
+	d->child_start = malloc((n + 1) * sizeof(uint32_t));
+	if(!d->child_start) { free(counts); return false; }
+	uint32_t run = 0;
+	for(size_t i = 0; i < n; i++) {
+		d->child_start[i] = run;
+		run += counts[i];
+		counts[i] = 0; /* cursor */
+	}
+	d->child_start[n] = run;
+	d->child_at = run ? malloc(run * sizeof(uint32_t)) : NULL;
+	if(run && !d->child_at) { free(counts); return false; }
+	d->root_children = root_n ? malloc(root_n * sizeof(uint32_t)) : NULL;
+	if(root_n && !d->root_children) { free(counts); return false; }
+	d->root_child_count = 0;
+	for(size_t i = 0; i < n; i++) {
+		int64_t parent = d->scan.opens[i].parent_off;
+		if(parent < 0) {
+			d->root_children[d->root_child_count++] = (uint32_t)i;
+			continue;
+		}
+		size_t pi = find_open_index(d, parent);
+		if(pi == (size_t)-1) continue;
+		uint32_t slot = d->child_start[pi] + counts[pi]++;
+		d->child_at[slot] = (uint32_t)i;
+	}
+	free(counts);
+
+	/* Attr opens: count then exact pack. */
 	d->attr_slots = nstr;
-	d->attr_opens = calloc(nstr, sizeof(size_t *));
-	d->attr_open_counts = calloc(nstr, sizeof(size_t));
-	d->attr_open_caps = calloc(nstr, sizeof(size_t));
-	if(!d->attr_opens || !d->attr_open_counts || !d->attr_open_caps) return false;
+	d->attr_opens = calloc(nstr ? nstr : 1, sizeof(uint32_t *));
+	d->attr_open_counts = calloc(nstr ? nstr : 1, sizeof(uint32_t));
+	if(!d->attr_opens || !d->attr_open_counts) return false;
+	for(size_t i = 0; i < d->scan.attr_count; i++) {
+		uint32_t anid = d->scan.attrs[i].name_id;
+		if(anid < nstr) d->attr_open_counts[anid]++;
+	}
+	for(size_t nid = 0; nid < nstr; nid++) {
+		if(d->attr_open_counts[nid] == 0) continue;
+		d->attr_opens[nid] = malloc(d->attr_open_counts[nid] * sizeof(uint32_t));
+		if(!d->attr_opens[nid]) return false;
+		d->attr_open_counts[nid] = 0;
+	}
 	for(size_t i = 0; i < d->scan.attr_count; i++) {
 		uint32_t anid = d->scan.attrs[i].name_id;
 		if(anid >= nstr) continue;
 		size_t oi = find_open_index(d, d->scan.attrs[i].open_off);
 		if(oi == (size_t)-1) continue;
-		if(!grow_cap((void **)&d->attr_opens[anid], sizeof(size_t), &d->attr_open_caps[anid], d->attr_open_counts[anid] + 1)) {
-			return false;
-		}
-		d->attr_opens[anid][d->attr_open_counts[anid]++] = oi;
+		d->attr_opens[anid][d->attr_open_counts[anid]++] = (uint32_t)oi;
 	}
 	return true;
 }
@@ -464,6 +426,9 @@ void lom_doc_free(lom_doc *doc) {
 		free(doc->code);
 	}
 	free(doc);
+#if defined(__GLIBC__)
+	malloc_trim(0);
+#endif
 }
 
 lom_status lom_doc_status(const lom_doc *doc) {
@@ -631,7 +596,7 @@ static bool inner_text_eq(const lom_doc *d, size_t open_idx, const char *text, s
 	return memcmp(d->code + start, text, tlen) == 0;
 }
 
-static void collect_named_children(const lom_doc *d, const size_t *kids, size_t kn, const sel_piece *piece, size_t **out, size_t *out_n, size_t *out_cap) {
+static void collect_named_children(const lom_doc *d, const uint32_t *kids, size_t kn, const sel_piece *piece, size_t **out, size_t *out_n, size_t *out_cap) {
 	*out_n = 0;
 	for(size_t i = 0; i < kn; i++) {
 		size_t oi = kids[i];
@@ -646,6 +611,13 @@ static void collect_named_children(const lom_doc *d, const size_t *kids, size_t 
 		if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 		(*out)[(*out_n)++] = oi;
 	}
+}
+
+static void doc_child_range(const lom_doc *d, size_t oi, const uint32_t **kids, size_t *kn) {
+	uint32_t a = d->child_start[oi];
+	uint32_t b = d->child_start[oi + 1];
+	*kids = d->child_at ? d->child_at + a : NULL;
+	*kn = (size_t)(b - a);
 }
 
 static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
@@ -673,7 +645,9 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 				/* also other parent groups in document order */
 				for(size_t oi = 0; oi < d->scan.open_count; oi++) {
 					size_t tmp_n = 0, tmp_cap = 0; size_t *tmp = NULL;
-					collect_named_children(d, d->children[oi], d->child_counts[oi], piece, &tmp, &tmp_n, &tmp_cap);
+					const uint32_t *kids = NULL; size_t kn = 0;
+					doc_child_range(d, oi, &kids, &kn);
+					collect_named_children(d, kids, kn, piece, &tmp, &tmp_n, &tmp_cap);
 					if(pick < tmp_n) {
 						grow_cap((void **)&picked, sizeof(size_t), &picked_cap, picked_n + 1);
 						picked[picked_n++] = tmp[pick];
@@ -694,7 +668,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 				} else if(nid < 0) {
 					nxt_n = 0;
 				} else {
-					size_t *rows = d->tag_rows[nid];
+					uint32_t *rows = d->tag_rows[nid];
 					size_t rc = d->tag_row_counts[nid];
 					for(size_t i = 0; i < rc; i++) {
 						size_t oi = rows[i];
@@ -709,7 +683,9 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 			for(size_t ci = 0; ci < cur_n; ci++) {
 				size_t parent_i = cur[ci];
 				size_t tmp_n = 0, tmp_cap = 0; size_t *tmp = NULL;
-				collect_named_children(d, d->children[parent_i], d->child_counts[parent_i], piece, &tmp, &tmp_n, &tmp_cap);
+				const uint32_t *kids = NULL; size_t kn = 0;
+				doc_child_range(d, parent_i, &kids, &kn);
+				collect_named_children(d, kids, kn, piece, &tmp, &tmp_n, &tmp_cap);
 				if(piece->index > 0) {
 					size_t pick = (size_t)piece->index - 1;
 					if(pick < tmp_n) {
@@ -758,7 +734,7 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 	const sel_piece *last = &chain->pieces[chain->count - 1];
 	int32_t nid = find_name_id(d, last->name, last->name_len);
 	if(nid < 0) return LOM_OK;
-	size_t *rows = d->tag_rows[nid];
+	uint32_t *rows = d->tag_rows[nid];
 	size_t rc = d->tag_row_counts[nid];
 	for(size_t i = 0; i < rc; i++) {
 		size_t oi = rows[i];
@@ -800,7 +776,7 @@ static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_m
 		int32_t anid = find_name_id(doc, piece->attr, piece->attr_len);
 		int32_t tnid = find_name_id(doc, piece->name, piece->name_len);
 		if(anid < 0 || (tnid < 0 && !(piece->name_len == 1 && piece->name[0] == '*'))) return LOM_OK;
-		size_t *rows = doc->attr_opens[anid];
+		uint32_t *rows = doc->attr_opens[anid];
 		size_t rc = doc->attr_open_counts[anid];
 		int64_t last_off = -1;
 		for(size_t i = 0; i < rc; i++) {
@@ -1017,8 +993,10 @@ lom_status lom_doc_child_text(const lom_doc *doc, int64_t open_off, const char *
 	buf[0] = 0;
 	size_t pidx = find_open_index(doc, open_off);
 	if(pidx == (size_t)-1) return LOM_ERR_NOTFOUND;
-	for(size_t i = 0; i < doc->child_counts[pidx]; i++) {
-		size_t ci = doc->children[pidx][i];
+	const uint32_t *kids = NULL; size_t kn = 0;
+	doc_child_range(doc, pidx, &kids, &kn);
+	for(size_t i = 0; i < kn; i++) {
+		size_t ci = kids[i];
 		const char *nm = lom_scan_string(&doc->scan, doc->scan.opens[ci].name_id);
 		if(strcmp(nm, child_tag) != 0) continue;
 		size_t is, il, cl;
@@ -1139,8 +1117,10 @@ lom_status lom_doc_set_child_text_offset(lom_doc *doc, int64_t open_off, const c
 	if(!doc || !child_tag || !text) return LOM_ERR_ARG;
 	size_t pidx = find_open_index(doc, open_off);
 	if(pidx == (size_t)-1) return LOM_ERR_NOTFOUND;
-	for(size_t i = 0; i < doc->child_counts[pidx]; i++) {
-		size_t ci = doc->children[pidx][i];
+	const uint32_t *kids = NULL; size_t kn = 0;
+	doc_child_range(doc, pidx, &kids, &kn);
+	for(size_t i = 0; i < kn; i++) {
+		size_t ci = kids[i];
 		const char *nm = lom_scan_string(&doc->scan, doc->scan.opens[ci].name_id);
 		if(strcmp(nm, child_tag) != 0) continue;
 		return lom_doc_set_inner_text_offset(doc, doc->scan.opens[ci].open_off, text);

@@ -22,6 +22,10 @@ void lom_fmem_free(lom_fmem *m);
  * Identical content returns the same pointer. len==0 returns static "". */
 const char *lom_fmem_intern(lom_fmem *m, const char *bytes, size_t len);
 
+/* Zero-copy intern: hash lookup only; on miss store a view into caller's bytes
+ * (no malloc copy). bytes must outlive the table (e.g. mmap document / string_blob). */
+const char *lom_fmem_intern_view(lom_fmem *m, const char *bytes, size_t len);
+
 size_t lom_fmem_entries(const lom_fmem *m);
 size_t lom_fmem_bytes_stored(const lom_fmem *m);
 size_t lom_fmem_hits(const lom_fmem *m);

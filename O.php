@@ -131,7 +131,13 @@ class O {
 	public $selector_regex_table = array(); /* id => array(pattern, flags, compiled) */
 	public $selector_regex_compile_cache = array(); /* "pattern\0flags" => compiled */
 	public $fmem_intern = array(); /* content-hash => string; L1 slice intern */
+	public $fmem_hits = 0;
+	public $fmem_misses = 0;
+	public $fmem_enabled = true; /* ROI gate may disable after poor hit rate */
 	public $fcache_regex_matches = array(); /* key => match arrays */
+	public $fcache_hits = 0;
+	public $fcache_misses = 0;
+	public $fcache_enabled = true;
 	public $fcache_compiled_patterns = array(); /* alias of compile cache for ROI stats */
 
 	function __construct($file_to_parse, $use_context = true, $array_blocks = false, $array_inline = false) {
@@ -538,10 +544,38 @@ class O {
 		return $out;
 	}
 
+	function fcache_roi_update() {
+		$total = $this->fcache_hits + $this->fcache_misses;
+		if($total >= 64) {
+			$this->fcache_enabled = ($this->fcache_hits / $total) >= 0.05;
+		}
+	}
+
+	function fmem_roi_update() {
+		$total = $this->fmem_hits + $this->fmem_misses;
+		if($total >= 64) {
+			$this->fmem_enabled = ($this->fmem_hits / $total) >= 0.05;
+		}
+	}
+
+	function clear_fmem_fcache($keep_compiled = true) {
+		$this->fmem_intern = array();
+		$this->fcache_regex_matches = array();
+		if(!$keep_compiled) {
+			$this->selector_regex_compile_cache = array();
+			$this->fcache_compiled_patterns = array();
+		}
+	}
+
 	function regex_match_array($text, $compiled, $need_all = true) {
 		$key = $compiled . "\0" . ($need_all ? '1' : '0') . "\0" . $text;
-		if(isset($this->fcache_regex_matches[$key])) {
+		if($this->fcache_enabled && isset($this->fcache_regex_matches[$key])) {
+			$this->fcache_hits++;
+			O::fcache_roi_update();
 			return $this->fcache_regex_matches[$key];
+		}
+		if($this->fcache_enabled) {
+			$this->fcache_misses++;
 		}
 		$matches = array();
 		if($need_all) {
@@ -559,16 +593,18 @@ class O {
 			}
 			$matches = array();
 		}
-		// Cap cache size to avoid unbounded growth on large documents.
-		if(sizeof($this->fcache_regex_matches) > 256) {
-			$this->fcache_regex_matches = array();
+		if($this->fcache_enabled) {
+			if(sizeof($this->fcache_regex_matches) > 256) {
+				$this->fcache_regex_matches = array();
+			}
+			$this->fcache_regex_matches[$key] = $matches;
+			O::fcache_roi_update();
 		}
-		$this->fcache_regex_matches[$key] = $matches;
 		return $matches;
 	}
 
 	function fmem_intern_string($string) {
-		if(!is_string($string) || strlen($string) < 32) {
+		if(!$this->fmem_enabled || !is_string($string) || strlen($string) < 32) {
 			return $string;
 		}
 		if(in_array('xxh3', hash_algos(), true)) {
@@ -577,12 +613,16 @@ class O {
 			$hash = hash('sha1', $string, false);
 		}
 		if(isset($this->fmem_intern[$hash]) && $this->fmem_intern[$hash] === $string) {
+			$this->fmem_hits++;
+			O::fmem_roi_update();
 			return $this->fmem_intern[$hash];
 		}
+		$this->fmem_misses++;
 		if(sizeof($this->fmem_intern) > 4096) {
 			$this->fmem_intern = array();
 		}
 		$this->fmem_intern[$hash] = $string;
+		O::fmem_roi_update();
 		return $this->fmem_intern[$hash];
 	}
 
@@ -821,6 +861,7 @@ class O {
 		$this->attribute_value_index = array();
 		$this->attribute_index_ready = array();
 		$this->attribute_full_index_ready = false;
+		O::clear_fmem_fcache(true);
 		O::debug_log_event('invalidate', 'derived state refreshed', array(
 			'recheck_tag_types' => $recheck_tag_types,
 			'rebuild_depths' => $rebuild_depths,
@@ -3068,6 +3109,7 @@ class O {
 		$this->invalidate_context_selector_index();
 		$this->parent_result_cache = array();
 		$this->parent_query_cache = array();
+		O::clear_fmem_fcache(true);
 	}
 
 	function parse_fast_direct_tag_chain($normalized_selector) {

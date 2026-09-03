@@ -1,4 +1,8 @@
 perf_fixture.xml
+.bench_out/
+.perf_fixture_*.xml
+perf_fixture_gen.xml
+.bench_out_ablation.txt
 *.o
 native/lib/
 native/bin/

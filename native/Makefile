@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -O2 -g -fPIC -Wall -Wextra -std=c11 -D_GNU_SOURCE
 CPPFLAGS += -Iinclude
 LDFLAGS_SO = -shared
-LDLIBS = -lm
+LDLIBS = -lm -lpthread
 
 LIB = lib/liblom.so
 LOMC = bin/lomc

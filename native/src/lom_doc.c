@@ -5,33 +5,163 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+
+#ifndef LOM_MAX_PIECES
+#define LOM_MAX_PIECES 64
+#endif
 
 struct lom_doc {
 	char *code;
 	size_t code_len;
 	size_t code_cap;
+	int mmap_fd;
+	int code_is_mmap; /* 1 => code from mmap; do not free() as malloc */
 	lom_scan_result scan;
 	/* per-name sorted open indices into scan.opens */
-	size_t **tag_rows; /* tag_rows[name_id] = array of open indices */
+	size_t **tag_rows;
 	size_t *tag_row_counts;
 	size_t *tag_row_caps;
-	size_t tag_row_slots; /* == string_count after rebuild */
-	/* children: parallel arrays of child open indices per open row + root */
+	size_t tag_row_slots;
 	size_t **children;
 	size_t *child_counts;
 	size_t *child_caps;
 	size_t *root_children;
 	size_t root_child_count;
 	size_t root_child_cap;
-	size_t aux_open_count; /* length of children[] parallel arrays */
-	/* attr name_id -> list of open_offs that have the attribute */
+	size_t aux_open_count;
 	size_t **attr_opens;
 	size_t *attr_open_counts;
 	size_t *attr_open_caps;
 	size_t attr_slots;
+	/* Accelerators */
+	lom_fmem *fmem;
+	lom_fcache *fcache;
+	size_t piece_starts[LOM_MAX_PIECES];
+	size_t piece_count;
+	uint8_t piece_dirty[LOM_MAX_PIECES];
+	int use_fmem;
+	int use_fcache;
+	int use_pieces;
+	int use_parallel;
 	lom_status status;
 	char error[256];
 };
+
+static int env_flag_on(const char *name, int default_on) {
+	const char *v = getenv(name);
+	if(!v || !*v) return default_on;
+	if(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N' || v[0] == 'o') {
+		if(strcasecmp(v, "off") == 0 || strcasecmp(v, "no") == 0 || strcasecmp(v, "false") == 0 || v[0] == '0')
+			return 0;
+	}
+	return 1;
+}
+
+static void doc_init_accel(lom_doc *d) {
+	d->use_fmem = env_flag_on("LOM_FMEM", 1);
+	d->use_fcache = env_flag_on("LOM_FCACHE", 1);
+	d->use_pieces = env_flag_on("LOM_PIECES", 1);
+	d->use_parallel = env_flag_on("LOM_PARALLEL", 1);
+	d->mmap_fd = -1;
+	d->code_is_mmap = 0;
+	d->piece_count = 0;
+	memset(d->piece_dirty, 0, sizeof(d->piece_dirty));
+	if(d->use_fmem) {
+		d->fmem = lom_fmem_create(2048);
+	}
+	if(d->use_fcache) {
+		d->fcache = lom_fcache_create(512);
+	}
+}
+
+static void doc_free_accel(lom_doc *d) {
+	if(d->fmem) {
+		lom_fmem_free(d->fmem);
+		d->fmem = NULL;
+	}
+	if(d->fcache) {
+		lom_fcache_free(d->fcache);
+		d->fcache = NULL;
+	}
+}
+
+static void doc_rebuild_pieces(lom_doc *d) {
+	d->piece_count = 0;
+	if(!d->use_pieces || !d->code || d->code_len == 0) {
+		d->piece_starts[0] = 0;
+		d->piece_count = 1;
+		return;
+	}
+	size_t target = d->code_len / 8;
+	if(target < 256 * 1024) target = 256 * 1024;
+	if(target > 8 * 1024 * 1024) target = 8 * 1024 * 1024;
+	d->piece_count = lom_piece_boundaries(d->code, d->code_len, target, d->piece_starts, LOM_MAX_PIECES);
+	if(d->piece_count == 0) {
+		d->piece_starts[0] = 0;
+		d->piece_count = 1;
+	}
+	memset(d->piece_dirty, 0, sizeof(d->piece_dirty));
+}
+
+static void doc_mark_dirty_at(lom_doc *d, size_t offset) {
+	if(d->piece_count == 0) return;
+	size_t pi = 0;
+	for(size_t i = 1; i < d->piece_count; i++) {
+		if(d->piece_starts[i] <= offset) pi = i;
+		else break;
+	}
+	d->piece_dirty[pi] = 1;
+	if(d->fcache) {
+		lom_fcache_free(d->fcache);
+		d->fcache = lom_fcache_create(512);
+	}
+}
+
+static void doc_fmem_ingest_strings(lom_doc *d) {
+	if(!d->fmem || !d->use_fmem) return;
+	if(!lom_fmem_roi_ok(d->fmem, 0.05, 64)) {
+		/* ROI gate: stop paying for interning when it never hits */
+		return;
+	}
+	for(size_t i = 0; i < d->scan.string_count; i++) {
+		const char *s = lom_scan_string(&d->scan, (uint32_t)i);
+		size_t n = strlen(s);
+		if(n >= 8) {
+			(void)lom_fmem_intern(d->fmem, s, n);
+		}
+	}
+}
+
+typedef struct {
+	lom_doc *d;
+	size_t begin;
+	size_t end;
+	size_t **local_rows;
+	size_t *local_counts;
+	size_t *local_caps;
+	size_t nstr;
+} tag_row_job;
+
+static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need);
+
+static void *tag_row_worker(void *arg) {
+	tag_row_job *job = (tag_row_job *)arg;
+	lom_doc *d = job->d;
+	for(size_t i = job->begin; i < job->end; i++) {
+		uint32_t nid = d->scan.opens[i].name_id;
+		if(nid >= job->nstr) continue;
+		if(!grow_cap((void **)&job->local_rows[nid], sizeof(size_t), &job->local_caps[nid], job->local_counts[nid] + 1)) {
+			continue;
+		}
+		job->local_rows[nid][job->local_counts[nid]++] = i;
+	}
+	return NULL;
+}
 
 void lom_match_list_init(lom_match_list *m) {
 	memset(m, 0, sizeof(*m));
@@ -130,14 +260,59 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	if(!d->tag_rows || !d->tag_row_counts || !d->tag_row_caps || !d->children || !d->child_counts || !d->child_caps) {
 		return false;
 	}
-	for(size_t i = 0; i < n; i++) {
-		uint32_t nid = d->scan.opens[i].name_id;
-		if(nid >= nstr) continue;
-		if(!grow_cap((void **)&d->tag_rows[nid], sizeof(size_t), &d->tag_row_caps[nid], d->tag_row_counts[nid] + 1)) {
-			return false;
-		}
-		d->tag_rows[nid][d->tag_row_counts[nid]++] = i;
 
+	/* Parallel tag-row accumulation across open ranges (piece-aligned when possible). */
+	int nthreads = 1;
+	if(d->use_parallel && n > 4096) {
+		nthreads = 4;
+		long hc = sysconf(_SC_NPROCESSORS_ONLN);
+		if(hc > 1 && hc < nthreads) nthreads = (int)hc;
+		if(hc >= 8) nthreads = 8;
+	}
+	if(nthreads <= 1 || nstr == 0) {
+		for(size_t i = 0; i < n; i++) {
+			uint32_t nid = d->scan.opens[i].name_id;
+			if(nid >= nstr) continue;
+			if(!grow_cap((void **)&d->tag_rows[nid], sizeof(size_t), &d->tag_row_caps[nid], d->tag_row_counts[nid] + 1)) {
+				return false;
+			}
+			d->tag_rows[nid][d->tag_row_counts[nid]++] = i;
+		}
+	} else {
+		pthread_t threads[8];
+		tag_row_job jobs[8];
+		size_t chunk = (n + (size_t)nthreads - 1) / (size_t)nthreads;
+		for(int t = 0; t < nthreads; t++) {
+			jobs[t].d = d;
+			jobs[t].begin = (size_t)t * chunk;
+			jobs[t].end = jobs[t].begin + chunk;
+			if(jobs[t].end > n) jobs[t].end = n;
+			jobs[t].nstr = nstr;
+			jobs[t].local_rows = calloc(nstr, sizeof(size_t *));
+			jobs[t].local_counts = calloc(nstr, sizeof(size_t));
+			jobs[t].local_caps = calloc(nstr, sizeof(size_t));
+			if(!jobs[t].local_rows || !jobs[t].local_counts || !jobs[t].local_caps) return false;
+			pthread_create(&threads[t], NULL, tag_row_worker, &jobs[t]);
+		}
+		for(int t = 0; t < nthreads; t++) {
+			pthread_join(threads[t], NULL);
+			for(size_t nid = 0; nid < nstr; nid++) {
+				size_t add = jobs[t].local_counts[nid];
+				if(add == 0) continue;
+				if(!grow_cap((void **)&d->tag_rows[nid], sizeof(size_t), &d->tag_row_caps[nid], d->tag_row_counts[nid] + add)) {
+					return false;
+				}
+				memcpy(d->tag_rows[nid] + d->tag_row_counts[nid], jobs[t].local_rows[nid], add * sizeof(size_t));
+				d->tag_row_counts[nid] += add;
+			}
+			for(size_t nid = 0; nid < nstr; nid++) free(jobs[t].local_rows[nid]);
+			free(jobs[t].local_rows);
+			free(jobs[t].local_counts);
+			free(jobs[t].local_caps);
+		}
+	}
+
+	for(size_t i = 0; i < n; i++) {
 		int64_t parent = d->scan.opens[i].parent_off;
 		if(parent < 0) {
 			if(!grow_cap((void **)&d->root_children, sizeof(size_t), &d->root_child_cap, d->root_child_count + 1)) {
@@ -163,12 +338,28 @@ static bool doc_rebuild_aux(lom_doc *d) {
 		if(anid >= nstr) continue;
 		size_t oi = find_open_index(d, d->scan.attrs[i].open_off);
 		if(oi == (size_t)-1) continue;
-		/* dedupe consecutive duplicates for same open+name is rare; allow dups and unique later if needed */
 		if(!grow_cap((void **)&d->attr_opens[anid], sizeof(size_t), &d->attr_open_caps[anid], d->attr_open_counts[anid] + 1)) {
 			return false;
 		}
 		d->attr_opens[anid][d->attr_open_counts[anid]++] = oi;
 	}
+	return true;
+}
+
+static bool doc_ensure_writable(lom_doc *d) {
+	if(!d->code_is_mmap) return true;
+	char *nb = malloc(d->code_len + 1);
+	if(!nb) return false;
+	if(d->code_len) memcpy(nb, d->code, d->code_len);
+	nb[d->code_len] = 0;
+	munmap(d->code, d->code_len);
+	if(d->mmap_fd >= 0) {
+		close(d->mmap_fd);
+		d->mmap_fd = -1;
+	}
+	d->code = nb;
+	d->code_cap = d->code_len + 1;
+	d->code_is_mmap = 0;
 	return true;
 }
 
@@ -184,6 +375,12 @@ static lom_status doc_reindex(lom_doc *d) {
 		snprintf(d->error, sizeof(d->error), "rebuild aux failed");
 		return LOM_ERR_NOMEM;
 	}
+	doc_rebuild_pieces(d);
+	doc_fmem_ingest_strings(d);
+	if(d->use_fcache) {
+		if(d->fcache) lom_fcache_free(d->fcache);
+		d->fcache = lom_fcache_create(512);
+	}
 	d->status = LOM_OK;
 	d->error[0] = 0;
 	return LOM_OK;
@@ -193,9 +390,10 @@ lom_doc *lom_doc_create(const char *code, size_t code_len) {
 	lom_doc *d = calloc(1, sizeof(lom_doc));
 	if(!d) return NULL;
 	lom_scan_result_init(&d->scan);
+	doc_init_accel(d);
 	d->code_cap = code_len + 1;
 	d->code = malloc(d->code_cap);
-	if(!d->code) { free(d); return NULL; }
+	if(!d->code) { doc_free_accel(d); free(d); return NULL; }
 	if(code_len) memcpy(d->code, code, code_len);
 	d->code[code_len] = 0;
 	d->code_len = code_len;
@@ -206,19 +404,51 @@ lom_doc *lom_doc_create(const char *code, size_t code_len) {
 }
 
 lom_doc *lom_doc_create_file(const char *path) {
-	FILE *f = fopen(path, "rb");
-	if(!f) return NULL;
-	if(fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-	long sz = ftell(f);
-	if(sz < 0) { fclose(f); return NULL; }
-	rewind(f);
-	char *buf = malloc((size_t)sz + 1);
-	if(!buf) { fclose(f); return NULL; }
-	size_t n = fread(buf, 1, (size_t)sz, f);
-	fclose(f);
-	buf[n] = 0;
-	lom_doc *d = lom_doc_create(buf, n);
-	free(buf);
+	/* Prefer mmap so large files are not fully memcpy'd. */
+	int fd = open(path, O_RDONLY);
+	if(fd < 0) return NULL;
+	struct stat st;
+	if(fstat(fd, &st) != 0 || st.st_size < 0) {
+		close(fd);
+		return NULL;
+	}
+	size_t n = (size_t)st.st_size;
+	if(n == 0) {
+		close(fd);
+		return lom_doc_create("", 0);
+	}
+	void *map = mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);
+	if(map == MAP_FAILED) {
+		/* Fallback to fread */
+		FILE *f = fdopen(fd, "rb");
+		if(!f) { close(fd); return NULL; }
+		char *buf = malloc(n + 1);
+		if(!buf) { fclose(f); return NULL; }
+		size_t got = fread(buf, 1, n, f);
+		fclose(f);
+		buf[got] = 0;
+		lom_doc *d = lom_doc_create(buf, got);
+		free(buf);
+		return d;
+	}
+	lom_doc *d = calloc(1, sizeof(lom_doc));
+	if(!d) {
+		munmap(map, n);
+		close(fd);
+		return NULL;
+	}
+	lom_scan_result_init(&d->scan);
+	doc_init_accel(d);
+	d->code = (char *)map;
+	d->code_len = n;
+	d->code_cap = n;
+	d->code_is_mmap = 1;
+	d->mmap_fd = fd;
+	/* Scanner expects a trailing NUL for some C-string helpers; MAP_PRIVATE copy-on-write
+	 * cannot extend. Reindex uses explicit lengths — ensure last byte reads are bounded. */
+	if(doc_reindex(d) != LOM_OK) {
+		/* keep doc */
+	}
 	return d;
 }
 
@@ -226,7 +456,13 @@ void lom_doc_free(lom_doc *doc) {
 	if(!doc) return;
 	doc_clear_aux(doc);
 	lom_scan_result_free(&doc->scan);
-	free(doc->code);
+	doc_free_accel(doc);
+	if(doc->code_is_mmap) {
+		if(doc->code && doc->code_len) munmap(doc->code, doc->code_len);
+		if(doc->mmap_fd >= 0) close(doc->mmap_fd);
+	} else {
+		free(doc->code);
+	}
 	free(doc);
 }
 
@@ -553,9 +789,7 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 	return LOM_OK;
 }
 
-lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out) {
-	if(!doc || !selector || !out) return LOM_ERR_ARG;
-	if(doc->status != LOM_OK) return doc->status;
+static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_match_list *out) {
 	sel_chain chain;
 	if(!parse_selector(selector, &chain)) return LOM_ERR_PARSE;
 
@@ -583,11 +817,9 @@ lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out) 
 		return LOM_OK;
 	}
 	if(chain.count >= 2 && !chain_has_index(&chain) && !chain.pieces[0].has_attr) {
-		/* Check if any piece has text on non-last — unusual */
 		bool mid_text = false;
 		for(size_t i = 0; i + 1 < chain.count; i++) if(chain.pieces[i].has_text) mid_text = true;
 		if(!mid_text && !chain.pieces[chain.count - 1].has_attr) {
-			/* For chains ending with =text, parent-walk still works */
 			return query_direct_parent_walk(doc, &chain, out);
 		}
 	}
@@ -600,6 +832,33 @@ lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out) 
 	return query_direct_parent_walk(doc, &chain, out);
 }
 
+lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out) {
+	if(!doc || !selector || !out) return LOM_ERR_ARG;
+	if(doc->status != LOM_OK) return doc->status;
+
+	size_t key_len = strlen(selector);
+	if(doc->fcache && doc->use_fcache && lom_fcache_roi_ok(doc->fcache, 0.05, 32)) {
+		size_t vlen = 0;
+		const void *v = lom_fcache_get(doc->fcache, selector, key_len, &vlen);
+		if(v && vlen % sizeof(lom_match) == 0) {
+			lom_match_list_free(out);
+			lom_match_list_init(out);
+			size_t n = vlen / sizeof(lom_match);
+			const lom_match *ms = (const lom_match *)v;
+			for(size_t i = 0; i < n; i++) {
+				if(!match_push(out, ms[i].offset, ms[i].end_off)) return LOM_ERR_NOMEM;
+			}
+			return LOM_OK;
+		}
+	}
+
+	lom_status st = lom_doc_get_uncached(doc, selector, out);
+	if(st == LOM_OK && doc->fcache && doc->use_fcache && out->count > 0 && out->items) {
+		(void)lom_fcache_put(doc->fcache, selector, key_len, out->items, out->count * sizeof(lom_match));
+	}
+	return st;
+}
+
 lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list *out) {
 	lom_match_list tmp;
 	lom_match_list_init(&tmp);
@@ -607,28 +866,48 @@ lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list
 	if(st != LOM_OK) { lom_match_list_free(&tmp); return st; }
 	lom_match_list_free(out);
 	lom_match_list_init(out);
-	/* unique parents */
-	int64_t *seen = NULL; size_t seen_n = 0, seen_cap = 0;
+	/* Open-addressing set of parent offsets — O(n) instead of O(n²) linear scan. */
+	size_t nb = 1024;
+	while(nb < tmp.count * 2 + 16) nb *= 2;
+	int64_t *seen = calloc(nb, sizeof(int64_t));
+	uint8_t *used = calloc(nb, 1);
+	if(!seen || !used) {
+		free(seen);
+		free(used);
+		lom_match_list_free(&tmp);
+		return LOM_ERR_NOMEM;
+	}
 	for(size_t i = 0; i < tmp.count; i++) {
 		size_t idx = find_open_index(doc, tmp.items[i].offset);
 		if(idx == (size_t)-1) continue;
 		int64_t parent = doc->scan.opens[idx].parent_off;
 		if(parent < 0) continue;
-		bool dup = false;
-		for(size_t s = 0; s < seen_n; s++) if(seen[s] == parent) { dup = true; break; }
-		if(dup) continue;
-		grow_cap((void **)&seen, sizeof(int64_t), &seen_cap, seen_n + 1);
-		seen[seen_n++] = parent;
+		uint64_t h = (uint64_t)parent;
+		size_t slot = (size_t)(h % nb);
+		int found = 0;
+		for(size_t probe = 0; probe < nb; probe++) {
+			size_t j = (slot + probe) % nb;
+			if(!used[j]) {
+				used[j] = 1;
+				seen[j] = parent;
+				break;
+			}
+			if(seen[j] == parent) { found = 1; break; }
+		}
+		if(found) continue;
 		size_t pidx = find_open_index(doc, parent);
 		if(pidx == (size_t)-1) continue;
 		match_push(out, parent, doc->scan.opens[pidx].node_end_off);
 	}
 	free(seen);
+	free(used);
 	lom_match_list_free(&tmp);
 	return LOM_OK;
 }
 
-static lom_status splice(lom_doc *d, size_t at, size_t remove_len, const char *insert, size_t insert_len) {
+static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const char *insert, size_t insert_len) {
+	if(!doc_ensure_writable(d)) return LOM_ERR_NOMEM;
+	doc_mark_dirty_at(d, at);
 	size_t new_len = d->code_len - remove_len + insert_len;
 	if(new_len + 1 > d->code_cap) {
 		size_t ncap = d->code_cap ? d->code_cap : 64;
@@ -671,7 +950,7 @@ lom_status lom_doc_set_inner_text(lom_doc *doc, const char *selector, const char
 		if(idx == (size_t)-1) continue;
 		size_t is, il, cl;
 		if(!find_inner_range(doc, idx, &is, &il, &cl)) continue;
-		st = splice(doc, is, il, text, strlen(text));
+		st = doc_splice(doc, is, il, text, strlen(text));
 		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
 		/* after splice, lower offsets still valid; higher already done */
 	}
@@ -692,7 +971,7 @@ lom_status lom_doc_new_before_close(lom_doc *doc, const char *parent_selector, c
 		if(idx == (size_t)-1) continue;
 		size_t is, il, cl;
 		if(!find_inner_range(doc, idx, &is, &il, &cl)) continue;
-		st = splice(doc, cl, 0, fragment, frag_len);
+		st = doc_splice(doc, cl, 0, fragment, frag_len);
 		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
 	}
 	lom_match_list_free(&m);
@@ -711,7 +990,7 @@ lom_status lom_doc_delete(lom_doc *doc, const char *selector) {
 		const lom_open_row *row = &doc->scan.opens[idx];
 		size_t start = (size_t)row->open_off;
 		size_t len = (size_t)(row->node_end_off - row->open_off + 1);
-		st = splice(doc, start, len, "", 0);
+		st = doc_splice(doc, start, len, "", 0);
 		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
 	}
 	lom_match_list_free(&m);
@@ -793,7 +1072,7 @@ lom_status lom_doc_set_attr(lom_doc *doc, int64_t open_off, const char *attr, co
 		new_tag[ins + w + (tag_len - ins)] = 0;
 	}
 	free(tag);
-	lom_status st = splice(doc, start, tag_len, new_tag, strlen(new_tag));
+	lom_status st = doc_splice(doc, start, tag_len, new_tag, strlen(new_tag));
 	free(new_tag);
 	return st;
 }
@@ -844,7 +1123,7 @@ lom_status lom_doc_delete_offset(lom_doc *doc, int64_t open_off) {
 	size_t idx = find_open_index(doc, open_off);
 	if(idx == (size_t)-1) return LOM_ERR_NOTFOUND;
 	const lom_open_row *row = &doc->scan.opens[idx];
-	return splice(doc, (size_t)row->open_off, (size_t)(row->node_end_off - row->open_off + 1), "", 0);
+	return doc_splice(doc, (size_t)row->open_off, (size_t)(row->node_end_off - row->open_off + 1), "", 0);
 }
 
 lom_status lom_doc_set_inner_text_offset(lom_doc *doc, int64_t open_off, const char *text) {
@@ -853,7 +1132,7 @@ lom_status lom_doc_set_inner_text_offset(lom_doc *doc, int64_t open_off, const c
 	if(idx == (size_t)-1) return LOM_ERR_NOTFOUND;
 	size_t is, il, cl;
 	if(!find_inner_range(doc, idx, &is, &il, &cl)) return LOM_ERR_PARSE;
-	return splice(doc, is, il, text, strlen(text));
+	return doc_splice(doc, is, il, text, strlen(text));
 }
 
 lom_status lom_doc_set_child_text_offset(lom_doc *doc, int64_t open_off, const char *child_tag, const char *text) {
@@ -870,5 +1149,5 @@ lom_status lom_doc_set_child_text_offset(lom_doc *doc, int64_t open_off, const c
 	snprintf(frag, sizeof(frag), "<%s>%s</%s>", child_tag, text, child_tag);
 	size_t is, il, cl;
 	if(!find_inner_range(doc, pidx, &is, &il, &cl)) return LOM_ERR_PARSE;
-	return splice(doc, cl, 0, frag, strlen(frag));
+	return doc_splice(doc, cl, 0, frag, strlen(frag));
 }

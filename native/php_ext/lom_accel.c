@@ -124,8 +124,8 @@ PHP_FUNCTION(lom_accel_scan)
 		zend_ulong okey = (zend_ulong)row->open_off;
 		add_next_index_long(&opens, (zend_long)row->open_off);
 		add_index_long(&tag_ends, okey, (zend_long)row->tag_end_off);
-		if(row->parent_off < 0) add_index_bool(&parents, okey, 0);
-		else add_index_long(&parents, okey, (zend_long)row->parent_off);
+		if(row->parent_idx < 0) add_index_bool(&parents, okey, 0);
+		else add_index_long(&parents, okey, (zend_long)r.opens[row->parent_idx].open_off);
 		add_index_long(&node_ends, okey, (zend_long)row->node_end_off);
 		const char *tname = lom_scan_string(&r, row->name_id);
 		add_index_string(&names, okey, tname);

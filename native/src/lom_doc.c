@@ -247,14 +247,11 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	if(!counts) return false;
 	size_t root_n = 0;
 	for(size_t i = 0; i < n; i++) {
-		int64_t parent = d->scan.opens[i].parent_off;
-		if(parent < 0) {
-			root_n++;
-			continue;
+		if(d->scan.opens[i].parent_idx < 0) root_n++;
+		else {
+			int32_t pi = d->scan.opens[i].parent_idx;
+			if(pi >= 0 && (size_t)pi < n) counts[(size_t)pi]++;
 		}
-		size_t pi = find_open_index(d, parent);
-		if(pi == (size_t)-1) continue;
-		counts[pi]++;
 	}
 	d->child_start = malloc((n + 1) * sizeof(uint32_t));
 	if(!d->child_start) { free(counts); return false; }
@@ -271,14 +268,13 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	if(root_n && !d->root_children) { free(counts); return false; }
 	d->root_child_count = 0;
 	for(size_t i = 0; i < n; i++) {
-		int64_t parent = d->scan.opens[i].parent_off;
+		int32_t parent = d->scan.opens[i].parent_idx;
 		if(parent < 0) {
 			d->root_children[d->root_child_count++] = (uint32_t)i;
 			continue;
 		}
-		size_t pi = find_open_index(d, parent);
-		if(pi == (size_t)-1) continue;
-		uint32_t slot = d->child_start[pi] + counts[pi]++;
+		if((size_t)parent >= n) continue;
+		uint32_t slot = d->child_start[(size_t)parent] + counts[(size_t)parent]++;
 		d->child_at[slot] = (uint32_t)i;
 	}
 	free(counts);
@@ -746,17 +742,16 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 		for(ssize_t pi = (ssize_t)chain->count - 2; pi >= 0; pi--) {
 			size_t cidx = find_open_index(d, cur);
 			if(cidx == (size_t)-1) { ok = false; break; }
-			int64_t parent = d->scan.opens[cidx].parent_off;
-			if(parent < 0) { ok = false; break; }
-			size_t pidx = find_open_index(d, parent);
-			if(pidx == (size_t)-1) { ok = false; break; }
+			int32_t pidx32 = d->scan.opens[cidx].parent_idx;
+			if(pidx32 < 0) { ok = false; break; }
+			size_t pidx = (size_t)pidx32;
 			const sel_piece *pp = &chain->pieces[pi];
 			if(!name_eq(d, d->scan.opens[pidx].name_id, pp->name, pp->name_len)) {
 				ok = false;
 				break;
 			}
-			if(pp->has_attr && !row_has_attr(d, parent, pp)) { ok = false; break; }
-			cur = parent;
+			if(pp->has_attr && !row_has_attr(d, d->scan.opens[pidx].open_off, pp)) { ok = false; break; }
+			cur = d->scan.opens[pidx].open_off;
 		}
 		if(ok) {
 			if(!match_push(out, row->open_off, row->node_end_off)) return LOM_ERR_NOMEM;
@@ -856,8 +851,9 @@ lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list
 	for(size_t i = 0; i < tmp.count; i++) {
 		size_t idx = find_open_index(doc, tmp.items[i].offset);
 		if(idx == (size_t)-1) continue;
-		int64_t parent = doc->scan.opens[idx].parent_off;
-		if(parent < 0) continue;
+		int32_t pidx32 = doc->scan.opens[idx].parent_idx;
+		if(pidx32 < 0) continue;
+		int64_t parent = doc->scan.opens[pidx32].open_off;
 		uint64_t h = (uint64_t)parent;
 		size_t slot = (size_t)(h % nb);
 		int found = 0;
@@ -871,9 +867,7 @@ lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list
 			if(seen[j] == parent) { found = 1; break; }
 		}
 		if(found) continue;
-		size_t pidx = find_open_index(doc, parent);
-		if(pidx == (size_t)-1) continue;
-		match_push(out, parent, doc->scan.opens[pidx].node_end_off);
+		match_push(out, parent, doc->scan.opens[pidx32].node_end_off);
 	}
 	free(seen);
 	free(used);
@@ -881,8 +875,42 @@ lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list
 	return LOM_OK;
 }
 
+static int span_has_lt(const char *p, size_t n) {
+	for(size_t i = 0; i < n; i++) if(p[i] == '<') return 1;
+	return 0;
+}
+
+static void shift_scan_offsets(lom_scan_result *s, int64_t from, int64_t delta) {
+	if(delta == 0) return;
+	for(size_t i = 0; i < s->open_count; i++) {
+		lom_open_row *row = &s->opens[i];
+		if(row->open_off >= from) row->open_off += delta;
+		if(row->tag_end_off >= from) row->tag_end_off += delta;
+		if(row->node_end_off >= from) row->node_end_off += delta;
+	}
+	for(size_t i = 0; i < s->attr_count; i++) {
+		if(s->attrs[i].open_off >= from) s->attrs[i].open_off += delta;
+	}
+}
+
+/* True when remove/insert cannot change tag structure: no '<' and no open starts in the removed span. */
+static int splice_is_structure_preserving(const lom_doc *d, size_t at, size_t remove_len,
+	const char *insert, size_t insert_len) {
+	if(span_has_lt(insert, insert_len)) return 0;
+	if(remove_len && span_has_lt(d->code + at, remove_len)) return 0;
+	int64_t lo = (int64_t)at;
+	int64_t hi = (int64_t)(at + remove_len);
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		int64_t o = d->scan.opens[i].open_off;
+		if(o >= lo && o < hi) return 0;
+	}
+	return 1;
+}
+
 static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const char *insert, size_t insert_len) {
 	if(!doc_ensure_writable(d)) return LOM_ERR_NOMEM;
+	if(at > d->code_len || remove_len > d->code_len - at) return LOM_ERR_ARG;
+	int incr = splice_is_structure_preserving(d, at, remove_len, insert, insert_len);
 	doc_mark_dirty_at(d, at);
 	size_t new_len = d->code_len - remove_len + insert_len;
 	if(new_len + 1 > d->code_cap) {
@@ -897,6 +925,16 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 	if(insert_len) memcpy(d->code + at, insert, insert_len);
 	d->code_len = new_len;
 	d->code[d->code_len] = 0;
+
+	if(incr) {
+		int64_t delta = (int64_t)insert_len - (int64_t)remove_len;
+		shift_scan_offsets(&d->scan, (int64_t)at, delta);
+		/* Indices/CSR unchanged; only byte offsets moved. Refresh piece map + fcache. */
+		doc_rebuild_pieces(d);
+		d->status = LOM_OK;
+		d->error[0] = 0;
+		return LOM_OK;
+	}
 	return doc_reindex(d);
 }
 

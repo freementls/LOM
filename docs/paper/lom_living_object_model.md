@@ -40,7 +40,7 @@ LOM keeps the document as one mutable string, answers selectors with offset-back
 
 Let the document be byte string \(C[0..n)\). Opening tags are indexed as rows \((o, e, p, n_{\mathrm{end}}, \mathrm{name\_id}, \ldots)\). A match is \((o, n_{\mathrm{end}})\); materializing text is a slice of \(C\) (interned when fmem ROI allows).
 
-**Write.** `splice(at, remove, insert)` updates \(C\), then reindexes (native) or patches offset maps and parent/tag indexes (PHP). mmap-backed loads demote to a private buffer before growth.
+**Write.** `splice(at, remove, insert)` updates \(C\). Native path: if the edit is *structure-preserving* (no `<` in remove/insert and no open starts inside the removed span), shift existing open/attr byte offsets by \(\Delta\) and skip rescan; otherwise full `lom_scan_indexes` + CSR rebuild. PHP patches offset maps and parent/tag indexes. mmap-backed loads demote to a private buffer before growth. Open rows store `parent_idx` (int32 into `opens[]`) instead of parent byte offset, which shrinks the open table and makes CSR child packing \(O(n)\) without offset→index searches.
 
 ### 3.2 Conversational context
 
@@ -100,7 +100,8 @@ After any comparison operator, `/pattern/flags` is a regex value (slash is not a
 | Fractal selective end | \(O(n)\) scan once + \(O(h)\) ancestor checks per hit |
 | Regex per candidate text | \(O(\mathrm{PCRE}(|t|))\) per text; memoized under fcache |
 | Warm identical `get` (native fcache) | \(O(k)\) copy of cached matches |
-| `set` small text | splice \(O(n)\) memmove in worst case today; piece-local edits are the path to sublinear wall cost on huge files |
+| `set` small text (no `<`) | \(O(n)\) memmove + \(O(\#opens)\) offset shift; no rescan | 
+| `set` / `new_` that insert tags | \(O(n)\) full rescan + CSR rebuild; piece-local rebuild is future work |
 | Parent unique (fixed) | \(O(k)\) with hash set (was \(O(k^2)\) linear scan—fixed in this draft) |
 
 ## 5. Empirical evaluation
@@ -123,18 +124,20 @@ Indexed warm similarly collapses with fcache (≈0.00 ms vs ≈4.4 ms). fmem
 
 ### 5.2 Size scaling (native)
 
-| Size | Bytes | Opens | Construct (ms) | Descendant cold (ms) | Descendant warm (ms) | Parent cold (ms) | set (ms) |
-|------|-------|-------|----------------|----------------------|----------------------|------------------|----------|
-| 1 MB | 1.05e6 | 4.6e4 | 23 | 2.5 | 0.02 | 4.6 | 20 |
-| ~2.58 MB | 2.58e6 | 1.1e5 | ~50–65 | ~4 | ~0.03 | ~12 | ~40–60 |
-| 100 MB | 1.05e8 | 4.4e6 | 5404 | 187 | 3.6 | **127** (was ~28612 before hash-set fix) | 1810 |
-| 1 GB | 1.07e9 | ~4.4e7 est. | — | — | — | — | — |
+| Size | Bytes | Opens | Construct (ms) | Descendant cold (ms) | Descendant warm (ms) | Parent cold (ms) | set text (ms) |
+|------|-------|-------|----------------|----------------------|----------------------|------------------|---------------|
+| 1 MB | 1.05e6 | 4.6e4 | 23 | 2.5 | 0.02 | 4.6 | ~20 |
+| ~2.58 MB | 2.58e6 | 1.1e5 | ~38 | ~3.9 | ~0.05 | ~2.8 | **~7.5** (incr.) |
+| 100 MB | 1.05e8 | 4.4e6 | **~3100** | ~147 | ~3.0 | ~86 | **~228** (incr.; was ~1810 full reindex) |
+| 1 GB | 1.07e9 | 44.8M | load RSS **~3.9 GB** | — | — | — | — |
 
-**1 GB native:** fixture generated on disk; full index+query on this host (~38 GiB RAM) entered heavy swap (~14 GiB RSS during construct) and was aborted. Treat 1 GB as a capacity target requiring more RAM or piece-local indexes; do not invent timings. Extrapolation: construct roughly linear in opens (~10× 100 MB ⇒ order of ~1 min CPU if RAM fits).
+**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes + view-fmem → ~385 MB load / ~2 MB after free. Peak during a full `lomc` 100 MB run (queries+writes) ~528 MB. 1 GB native loads at ~3.9 GB RSS (earlier per-node child mallocs swapped to ~14 GB and were aborted).
 
-Parent uniqueness was \(O(k^2)\) and dominated early 100 MB runs (~28 s); hash-set uniqueness brings parent to ~127 ms for 334k matches.
+**Writes.** Structure-preserving `set` (text without `<`) skips rescan: 100 MB ~228 ms dominated by memmove. Nested `new_` that inserts markup still full-reindexes (~1.2 s on 100 MB).
 
-**PHP:** 1 MB and 2.58 MB complete under default memory. **100 MB PHP** with `memory_limit=8G`: construct ~4.6 s, `region` cold ~14.3 s / warm ~0.4 s, descendant cold ~0.95 s / warm ~1.1 s (334k matches). Default 1 G limit OOMs during depth expand. **1 GB PHP** cannot load via a single `file_get_contents` under a 1 G limit. Large-file story is **`liblom` + mmap + pieces**, not one PHP string.
+Parent uniqueness was \(O(k^2)\) and dominated early 100 MB runs (~28 s); hash-set uniqueness brings parent to tens of ms for 334k matches.
+
+**PHP:** 1 MB and 2.58 MB complete under default memory. **100 MB PHP** slim path (`memory_limit=512M`): construct ~134 MB; `region` via slim tag index ~402 MB. Heavy parent indexes opt-in via `LOM_PHP_HEAVY_INDEX=1`. **1 GB PHP** cannot load via a single `file_get_contents` under a 1 G limit. Large-file story is **`liblom` + mmap + CSR**, not one PHP string.
 
 ### 5.3 Regex (PHP, ~2.58 MB)
 
@@ -146,7 +149,7 @@ Same file, count all `name` nodes: LOM get ~451 ms vs DOM XPath ~19 ms vs XM
 
 ## 6. Threats to validity
 
-Single machine; synthetic fixture (regular region/zone/entity); native selector subset ≠ full PHP LOM; full reindex on native splice still \(O(n)\); PHP depth maps blow memory on large files; bake-offs are unfair as primary evidence.
+Single machine; synthetic fixture (regular region/zone/entity); native selector subset ≠ full PHP LOM; structure-changing splices still full-reindex \(O(n)\); PHP depth maps blow memory on large files without slim/liblom paths; bake-offs are unfair as primary evidence.
 
 ## 7. Availability
 
@@ -154,7 +157,7 @@ Apache License 2.0. Repository includes `O.php`, `native/liblom`, `lomc`, `lomd`
 
 ## 8. Conclusion
 
-LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields orders-of-magnitude warm-query wins; **mmap native** is what makes 100 MB–1 GB practical; PHP remains the full-language reference for smaller documents.
+LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields warm-query wins; **CSR + packed opens (`parent_idx`)** cut 100 MB RSS by ~3–4× vs per-node child lists; **structure-preserving splice** cuts text `set` cost without rescan; **mmap native** makes 100 MB–1 GB practical; PHP remains the full-language reference for smaller documents.
 
 ## References (selected)
 

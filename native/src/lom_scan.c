@@ -341,7 +341,7 @@ lom_status lom_scan_indexes(
 		lom_open_row *row = &out->opens[oi];
 		row->open_off = (int64_t)offset;
 		row->tag_end_off = (int64_t)tag_end;
-		row->parent_off = (ostack_n > 0) ? out->opens[ostack[ostack_n - 1]].open_off : (int64_t)-1;
+		row->parent_idx = (ostack_n > 0) ? (int32_t)ostack[ostack_n - 1] : -1;
 		row->node_end_off = -1;
 		row->self_closing = 0;
 		row->name_id = empty_id;

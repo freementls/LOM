@@ -25,8 +25,8 @@ typedef enum {
 typedef struct lom_open_row {
 	int64_t open_off;
 	int64_t tag_end_off;
-	int64_t parent_off;
 	int64_t node_end_off;
+	int32_t parent_idx; /* -1 = root; index into opens[] */
 	uint32_t name_id;
 	uint8_t self_closing;
 } lom_open_row;

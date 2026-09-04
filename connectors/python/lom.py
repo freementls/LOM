@@ -29,6 +29,27 @@ class LomNative:
 		if not self._doc:
 			raise RuntimeError("lom_doc_create_file failed")
 
+	def get(self, selector: str):
+		"""Return list of (offset, end_off) from lom_doc_get."""
+		class Match(ctypes.Structure):
+			_fields_ = [("offset", ctypes.c_int64), ("end_off", ctypes.c_int64)]
+
+		class MatchList(ctypes.Structure):
+			_fields_ = [("items", ctypes.POINTER(Match)), ("count", ctypes.c_size_t), ("cap", ctypes.c_size_t)]
+
+		self._lib.lom_match_list_init.argtypes = [ctypes.POINTER(MatchList)]
+		self._lib.lom_match_list_free.argtypes = [ctypes.POINTER(MatchList)]
+		self._lib.lom_doc_get.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(MatchList)]
+		ml = MatchList()
+		self._lib.lom_match_list_init(ctypes.byref(ml))
+		st = self._lib.lom_doc_get(self._doc, selector.encode(), ctypes.byref(ml))
+		if st != 0:
+			self._lib.lom_match_list_free(ctypes.byref(ml))
+			raise RuntimeError(f"get failed: {st}")
+		out = [(ml.items[i].offset, ml.items[i].end_off) for i in range(ml.count)]
+		self._lib.lom_match_list_free(ctypes.byref(ml))
+		return out
+
 	def set(self, selector: str, text: str) -> None:
 		st = self._lib.lom_doc_set_inner_text(self._doc, selector.encode(), text.encode())
 		if st != 0:

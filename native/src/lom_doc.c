@@ -228,7 +228,6 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	d->tag_row_counts = calloc(tag_slots ? tag_slots : 1, sizeof(uint32_t));
 	if(!d->tag_rows || !d->tag_row_counts) return false;
 
-	/* Count tag rows, then allocate exact uint32 vectors (no doubling waste). */
 	for(size_t i = 0; i < n; i++) {
 		uint32_t nid = d->scan.opens[i].name_id;
 		if(nid < tag_slots) d->tag_row_counts[nid]++;
@@ -237,7 +236,7 @@ static bool doc_rebuild_aux(lom_doc *d) {
 		if(d->tag_row_counts[nid] == 0) continue;
 		d->tag_rows[nid] = malloc(d->tag_row_counts[nid] * sizeof(uint32_t));
 		if(!d->tag_rows[nid]) return false;
-		d->tag_row_counts[nid] = 0; /* reuse as fill cursor */
+		d->tag_row_counts[nid] = 0;
 	}
 	for(size_t i = 0; i < n; i++) {
 		uint32_t nid = d->scan.opens[i].name_id;
@@ -245,10 +244,11 @@ static bool doc_rebuild_aux(lom_doc *d) {
 		d->tag_rows[nid][d->tag_row_counts[nid]++] = (uint32_t)i;
 	}
 
-	/* Optional parallel path reserved (LOM_PARALLEL); exact pack is single-pass for RAM. */
+	/* LOM_PARALLEL atomic shared-count workers were measured slower on 100MB–1GB
+	 * (cache-line contention). Fill must stay ordered for sibling [n]. Reserved for
+	 * future piece-local scan merge. */
 	(void)d->use_parallel;
 
-	/* CSR children: count, prefix sum, fill — two flat arrays, no per-node malloc. */
 	uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));
 	if(!counts) return false;
 	size_t root_n = 0;
@@ -265,7 +265,7 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	for(size_t i = 0; i < n; i++) {
 		d->child_start[i] = run;
 		run += counts[i];
-		counts[i] = 0; /* cursor */
+		counts[i] = 0;
 	}
 	d->child_start[n] = run;
 	d->child_at = run ? malloc(run * sizeof(uint32_t)) : NULL;
@@ -285,7 +285,6 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	}
 	free(counts);
 
-	/* Attr opens: size by max attr *name* id only (values dominate string_count). */
 	uint32_t max_attr_nid = 0;
 	for(size_t i = 0; i < d->scan.attr_count; i++) {
 		uint32_t anid = d->scan.attrs[i].name_id;

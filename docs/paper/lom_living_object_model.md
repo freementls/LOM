@@ -63,12 +63,17 @@ function get(selector, ignore_context=false):
 When the selector ends in a selective tag-value or attribute equality, prefer one document-level scan for that end, map hits to nodes via offset→open indexes, then verify ancestor chain—rather than only expanding every region. Regex values use the same shape: for a known leaf tag, a selective `/pattern/` may `preg_match_all` the document once and map match offsets to that tag’s opens (falling back to per-candidate inner-text filters when the pattern is not selective).
 
 ```
-function fractal_get(pieces):
-  if has_non_eq_ops_or_regex: return recursive_select(pieces)  # regex disables exact-= fractal shortcut
-  end = last_selective_piece(pieces)
-  hits = document_scan(end)           # one pass on C or span
-  nodes = map_offsets_to_opens(hits)
-  return filter_ancestors(nodes, pieces_without_end)
+function fractal_or_regex_leaf(pieces):
+  end = last_piece(pieces)
+  if end.has_regex_value and end.tagname known:
+    hits = preg_match_all(document, end.pattern)   # if selective vs tag index
+    if hits selective:
+      return map_offsets_to_named_opens(hits, end.tagname) filtered by operator
+    return filter_tag_index(end.tagname, end.op, end.pattern)
+  if has_only_exact_eq:
+    hits = document_scan(end)
+    return filter_ancestors(map_offsets_to_opens(hits), pieces_without_end)
+  return recursive_select(pieces)
 ```
 
 ### 3.4 Regex as value form
@@ -88,7 +93,8 @@ After any comparison operator, `/pattern/flags` is a regex value (slash is not a
 
 - **fmem:** optional L1 intern API retained; bulk ingest on construct was disabled after it proved harmful on high-cardinality docs (unique attr values) while queries use `string_blob` / name ids.
 - **fcache:** memo selector→match-list (native) and regex match arrays (PHP); cleared on invalidate / reindex.
-- **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice; parallel workers reserved (`LOM_PARALLEL`, default off for RAM).
+- **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice.
+- **parallel (`LOM_PARALLEL`):** default off. Shared-atomic CSR count workers were tried and **slowed** 100 MB–1 GB construct (cache-line contention; fill must stay ordered for `[n]`). Left as a hook for future piece-local scan merge, not a claimed win.
 
 ## 4. Complexity (expected)
 

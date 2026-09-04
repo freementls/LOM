@@ -39,7 +39,20 @@ Root cause: ingesting ~3.9M unique strings into a 2048-bucket fmem table was \(O
 | 100 MB | ~3 ms | ~2.9 s |
 | 1 GB | ~55 ms | **~27 s** (was ~430 s) |
 
-## Regex (PHP, ~2.58 MB)
+## Parallel ablation (honest miss)
+
+`LOM_PARALLEL=1` atomic shared-count CSR workers: **slower** than serial on 100 MB and 1 GB (contention). Default remains off. Piece-local parallel *scan* is still future work.
+
+## C# connectors
+
+`connectors/csharp/Lom.Native` now exposes `Get`; demos:
+
+```bash
+make -C native
+cd connectors/csharp
+LD_LIBRARY_PATH=../../native/lib dotnet run --project Lom.Native.Demo -- ../../test.xml person
+```
+
 
 | Query | Time (indexes warm) | Hits |
 |-------|---------------------|------|

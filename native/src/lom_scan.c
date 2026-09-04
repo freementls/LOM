@@ -1,4 +1,5 @@
 #include "lom.h"
+#include "lom_fss.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -307,13 +308,13 @@ static lom_status scan_bytes(
 
 		if(next == '!') {
 			if(offset + 4 <= hi && memcmp(code + offset, "<!--", 4) == 0) {
-				const char *end = (const char *)memmem(code + offset + 4, hi - (offset + 4), "-->", 3);
+				const char *end = (const char *)lom_fss_memmem(code + offset + 4, hi - (offset + 4), "-->", 3);
 				if(!end) break;
 				offset = (size_t)(end - code) + 3;
 				continue;
 			}
 			if(offset + 9 <= hi && memcmp(code + offset, "<![CDATA[", 9) == 0) {
-				const char *end = (const char *)memmem(code + offset + 9, hi - (offset + 9), "]]>", 3);
+				const char *end = (const char *)lom_fss_memmem(code + offset + 9, hi - (offset + 9), "]]>", 3);
 				if(!end) break;
 				offset = (size_t)(end - code) + 3;
 				continue;
@@ -326,13 +327,13 @@ static lom_status scan_bytes(
 			}
 		}
 		if(next == '?') {
-			const char *end = (const char *)memmem(code + offset + 2, hi - (offset + 2), "?>", 2);
+			const char *end = (const char *)lom_fss_memmem(code + offset + 2, hi - (offset + 2), "?>", 2);
 			if(!end) break;
 			offset = (size_t)(end - code) + 2;
 			continue;
 		}
 		if(next == '%') {
-			const char *end = (const char *)memmem(code + offset + 2, hi - (offset + 2), "%>", 2);
+			const char *end = (const char *)lom_fss_memmem(code + offset + 2, hi - (offset + 2), "%>", 2);
 			if(!end) break;
 			offset = (size_t)(end - code) + 2;
 			continue;
@@ -460,13 +461,13 @@ static size_t find_sibling_ranges(const char *code, size_t code_len, int want_de
 		if(next == '!' || next == '?' || next == '%') {
 			size_t tag_end;
 			if(next == '!' && offset + 4 <= code_len && memcmp(code + offset, "<!--", 4) == 0) {
-				const char *end = (const char *)memmem(code + offset + 4, code_len - (offset + 4), "-->", 3);
+				const char *end = (const char *)lom_fss_memmem(code + offset + 4, code_len - (offset + 4), "-->", 3);
 				if(!end) break;
 				offset = (size_t)(end - code) + 3;
 				continue;
 			}
 			if(next == '!' && offset + 9 <= code_len && memcmp(code + offset, "<![CDATA[", 9) == 0) {
-				const char *end = (const char *)memmem(code + offset + 9, code_len - (offset + 9), "]]>", 3);
+				const char *end = (const char *)lom_fss_memmem(code + offset + 9, code_len - (offset + 9), "]]>", 3);
 				if(!end) break;
 				offset = (size_t)(end - code) + 3;
 				continue;
@@ -474,13 +475,13 @@ static size_t find_sibling_ranges(const char *code, size_t code_len, int want_de
 			tag_end = find_tag_close(code, code_len, offset);
 			if(tag_end == (size_t)-1) break;
 			if(next == '?') {
-				const char *end = (const char *)memmem(code + offset + 2, code_len - (offset + 2), "?>", 2);
+				const char *end = (const char *)lom_fss_memmem(code + offset + 2, code_len - (offset + 2), "?>", 2);
 				if(!end) break;
 				offset = (size_t)(end - code) + 2;
 				continue;
 			}
 			if(next == '%') {
-				const char *end = (const char *)memmem(code + offset + 2, code_len - (offset + 2), "%>", 2);
+				const char *end = (const char *)lom_fss_memmem(code + offset + 2, code_len - (offset + 2), "%>", 2);
 				if(!end) break;
 				offset = (size_t)(end - code) + 2;
 				continue;

@@ -26,6 +26,9 @@ size_t lom_fcache_hits(const lom_fcache *c);
 size_t lom_fcache_misses(const lom_fcache *c);
 bool lom_fcache_roi_ok(const lom_fcache *c, double min_hit_rate, size_t min_samples);
 
+/* Drop all entries; keep the bucket table for reuse after writes. */
+void lom_fcache_clear(lom_fcache *c);
+
 /* Tag-aligned piece split: fill starts[] with offsets of top-level '<' tags
  * roughly every target_piece_bytes. starts[0]=0; returns count (max max_pieces). */
 size_t lom_piece_boundaries(const char *code, size_t code_len, size_t target_piece_bytes,

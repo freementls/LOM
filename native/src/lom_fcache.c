@@ -57,6 +57,23 @@ void lom_fcache_free(lom_fcache *c) {
 	free(c);
 }
 
+void lom_fcache_clear(lom_fcache *c) {
+	if(!c) return;
+	for(size_t i = 0; i < c->nbuckets; i++) {
+		lom_fcache_entry *e = c->buckets[i];
+		while(e) {
+			lom_fcache_entry *n = e->next;
+			free(e->key);
+			free(e->val);
+			free(e);
+			e = n;
+		}
+		c->buckets[i] = NULL;
+	}
+	c->hits = 0;
+	c->misses = 0;
+}
+
 bool lom_fcache_put(lom_fcache *c, const void *key, size_t key_len, const void *val, size_t val_len) {
 	if(!c || !key || !val) return false;
 	uint64_t h = fnv1a64(key, key_len);

@@ -8,7 +8,9 @@ Living Object Model — hierarchical XML document engine (PHP `O.php`) with a na
 
 Selectors use `_` / `__` for child / descendant. Comparison values may be PCRE literals: `hobby%=/s.*/i` (see `regex_selector_test.php`). Multi-language connectors: [`connectors/`](connectors/).
 
-**Research draft:** [`docs/paper/lom_living_object_model.md`](docs/paper/lom_living_object_model.md) · **Numbers:** [`docs/RESULTS.md`](docs/RESULTS.md) (native 1 GB construct ~10 s / ~5 GB peak RSS; PHP regex tagvalue fast path).
+Large-document scans optionally use sibling [fractal_substring](https://github.com/freementls/fractal_substring) (`libfss`; `LOM_FSS_SCAN=0` to disable).
+
+**Research draft:** [`docs/paper/lom_living_object_model.md`](docs/paper/lom_living_object_model.md) (includes [§9 Competing interests](docs/paper/lom_living_object_model.md#9-competing-interests--conflict-of-interest)) · **Numbers:** [`docs/RESULTS.md`](docs/RESULTS.md) (native 100 MB construct ~0.7–1.2 s; 1 GB ~5–7 s; connectors under [`connectors/`](connectors/)).
 
 ## Live demo
 

@@ -13,8 +13,12 @@
 #include <sys/mman.h>
 
 const char *lom_version(void) {
-	return "0.2.6-splice";
+	return "0.2.42-easywin";
 }
+
+_Static_assert(sizeof(lom_open_row) == 24, "lom_open_row must stay 24 bytes");
+
+static size_t mem_available_bytes(void);
 
 void lom_scan_result_init(lom_scan_result *r) {
 	memset(r, 0, sizeof(*r));
@@ -40,9 +44,40 @@ static void opens_release(lom_scan_result *r) {
 	r->opens_is_mmap = 0;
 }
 
+/* Move anonymous open table to a file-backed map so MADV_DONTNEED can drop RSS
+ * without zeroing content. No-op if already file-backed or heap. */
+int lom_scan_opens_spill_to_file(lom_scan_result *r) {
+	if(!r || !r->opens || !r->opens_is_mmap || r->opens_fd >= 0) return 0;
+	size_t nbytes = r->open_count * sizeof(lom_open_row);
+	if(nbytes == 0) nbytes = sizeof(lom_open_row);
+	char tmpl[512];
+	const char *dir = getenv("LOM_OPEN_TMPDIR");
+	if(!dir || !dir[0]) dir = getenv("TMPDIR");
+	if(!dir || !dir[0] || strcmp(dir, "/tmp") == 0) dir = "/var/tmp";
+	snprintf(tmpl, sizeof(tmpl), "%s/lom_opens_XXXXXX", dir);
+	int fd = mkstemp(tmpl);
+	if(fd < 0) {
+		snprintf(tmpl, sizeof(tmpl), "/tmp/lom_opens_XXXXXX");
+		fd = mkstemp(tmpl);
+	}
+	if(fd < 0) return -1;
+	unlink(tmpl);
+	if(ftruncate(fd, (off_t)nbytes) != 0) { close(fd); return -1; }
+	void *p = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if(p == MAP_FAILED) { close(fd); return -1; }
+	memcpy(p, r->opens, r->open_count * sizeof(lom_open_row));
+	munmap(r->opens, r->opens_map_bytes ? r->opens_map_bytes : r->open_cap * sizeof(lom_open_row));
+	r->opens = p;
+	r->opens_fd = fd;
+	r->opens_map_bytes = nbytes;
+	r->open_cap = r->open_count;
+	return 0;
+}
+
 void lom_scan_result_free(lom_scan_result *r) {
 	if(!r) return;
 	opens_release(r);
+	free(r->ne_ovf_rel);
 	free(r->attrs);
 	free(r->string_blob);
 	free(r->string_offs);
@@ -65,8 +100,10 @@ static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need) {
 	return true;
 }
 
-/* Prefer file-backed opens once the document is large enough that a heap
- * open table would dominate RSS. LOM_OPEN_MMAP=0 disables; =1 forces. */
+/* Prefer mmap'd opens for medium+ docs.
+ * LOM_OPEN_MMAP=0 → heap realloc; =1 → force file-backed; =a → force anon.
+ * Default: anon while the open table is likely <~512 MB (faster construct);
+ * file-backed at GB-class so idle RSS can drop after index build. */
 static int opens_mmap_wanted(size_t code_span) {
 	const char *v = getenv("LOM_OPEN_MMAP");
 	if(v && v[0]) {
@@ -74,7 +111,23 @@ static int opens_mmap_wanted(size_t code_span) {
 			return 0;
 		return 1;
 	}
-	return code_span >= (size_t)512 * 1024 * 1024;
+	return code_span >= (size_t)64 * 1024 * 1024;
+}
+
+static int opens_file_backed(size_t code_span) {
+	const char *v = getenv("LOM_OPEN_MMAP");
+	if(v && v[0]) {
+		if(v[0] == 'a' || v[0] == 'A') return 0;
+		if(v[0] == '1' || v[0] == 'y' || v[0] == 'Y') return 1;
+	}
+	/* Mid-size: anon (faster construct). GB-class: file-backed for droppable RSS,
+	 * unless MemAvailable comfortably covers code + open table + 1 GiB slack. */
+	if(code_span < (size_t)512 * 1024 * 1024) return 0;
+	size_t open_est = (code_span / 24 + 64) * sizeof(lom_open_row);
+	size_t need = code_span + open_est + ((size_t)1 << 30);
+	size_t avail = mem_available_bytes();
+	if(avail && avail >= need + open_est) return 0; /* hardware-gated anon */
+	return 1;
 }
 
 static bool opens_ensure(lom_scan_result *r, size_t need, size_t code_span_hint) {
@@ -85,28 +138,41 @@ static bool opens_ensure(lom_scan_result *r, size_t need, size_t code_span_hint)
 
 	if(r->opens_is_mmap || (!r->opens && opens_mmap_wanted(code_span_hint))) {
 		if(!r->opens_is_mmap) {
-			char tmpl[512];
-			const char *dir = getenv("LOM_OPEN_TMPDIR");
-			if(!dir || !dir[0]) dir = getenv("TMPDIR");
-			/* /tmp is often small tmpfs — prefer /var/tmp for multi-GB open tables. */
-			if(!dir || !dir[0] || strcmp(dir, "/tmp") == 0) dir = "/var/tmp";
-			snprintf(tmpl, sizeof(tmpl), "%s/lom_opens_XXXXXX", dir);
-			int fd = mkstemp(tmpl);
-			if(fd < 0) {
-				snprintf(tmpl, sizeof(tmpl), "/tmp/lom_opens_XXXXXX");
+			int file_backed = opens_file_backed(code_span_hint);
+			int fd = -1;
+			void *p = MAP_FAILED;
+			if(file_backed) {
+				char tmpl[512];
+				const char *dir = getenv("LOM_OPEN_TMPDIR");
+				if(!dir || !dir[0]) dir = getenv("TMPDIR");
+				/* /tmp is often small tmpfs — prefer /var/tmp for multi-GB open tables. */
+				if(!dir || !dir[0] || strcmp(dir, "/tmp") == 0) dir = "/var/tmp";
+				snprintf(tmpl, sizeof(tmpl), "%s/lom_opens_XXXXXX", dir);
 				fd = mkstemp(tmpl);
+				if(fd < 0) {
+					snprintf(tmpl, sizeof(tmpl), "/tmp/lom_opens_XXXXXX");
+					fd = mkstemp(tmpl);
+				}
+				if(fd < 0) return false;
+				unlink(tmpl);
+				if(ftruncate(fd, (off_t)nbytes) != 0) {
+					close(fd);
+					return false;
+				}
+				p = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+				if(p == MAP_FAILED) {
+					close(fd);
+					return false;
+				}
+			} else {
+				p = mmap(NULL, nbytes, PROT_READ | PROT_WRITE,
+					MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+				if(p == MAP_FAILED) return false;
 			}
-			if(fd < 0) return false;
-			unlink(tmpl);
-			if(ftruncate(fd, (off_t)nbytes) != 0) {
-				close(fd);
-				return false;
-			}
-			void *p = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-			if(p == MAP_FAILED) {
-				close(fd);
-				return false;
-			}
+			(void)madvise(p, nbytes, MADV_SEQUENTIAL);
+#ifdef MADV_HUGEPAGE
+			(void)madvise(p, nbytes, MADV_HUGEPAGE);
+#endif
 			r->opens = p;
 			r->opens_fd = fd;
 			r->opens_map_bytes = nbytes;
@@ -114,15 +180,21 @@ static bool opens_ensure(lom_scan_result *r, size_t need, size_t code_span_hint)
 			r->open_cap = ncap;
 			return true;
 		}
-		if(ftruncate(r->opens_fd, (off_t)nbytes) != 0) return false;
+		if(r->opens_fd >= 0 && ftruncate(r->opens_fd, (off_t)nbytes) != 0)
+			return false;
 #ifdef MREMAP_MAYMOVE
 		void *np = mremap(r->opens, r->opens_map_bytes, nbytes, MREMAP_MAYMOVE);
 		if(np == MAP_FAILED) return false;
 #else
-		void *np = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, r->opens_fd, 0);
+		void *np = MAP_FAILED;
+		if(r->opens_fd >= 0)
+			np = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, r->opens_fd, 0);
+		else
+			np = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if(np == MAP_FAILED) return false;
 		munmap(r->opens, r->opens_map_bytes);
 #endif
+		(void)madvise(np, nbytes, MADV_SEQUENTIAL);
 		r->opens = np;
 		r->opens_map_bytes = nbytes;
 		r->open_cap = ncap;
@@ -137,7 +209,8 @@ static bool opens_ensure(lom_scan_result *r, size_t need, size_t code_span_hint)
 }
 
 static void opens_dontneed_prefix(lom_scan_result *r, size_t live_lo) {
-	if(!r || !r->opens_is_mmap || !r->opens || live_lo < 4096) return;
+	/* Anonymous pages are destroyed by DONTNEED (zero-fill on fault). File-backed only. */
+	if(!r || !r->opens_is_mmap || r->opens_fd < 0 || !r->opens || live_lo < 4096) return;
 	size_t bytes = (live_lo * sizeof(lom_open_row)) & ~(size_t)4095;
 	if(bytes < 4096) return;
 	(void)madvise(r->opens, bytes, MADV_DONTNEED);
@@ -242,17 +315,14 @@ static bool intern_get(lom_intern *t, lom_scan_result *r, const char *s, size_t 
 }
 
 static size_t find_tag_close(const char *code, size_t length, size_t tag_offset) {
-	bool in_q = false;
-	char q = 0;
+	/* Unquoted: look for '>'. Quoted attr values: memchr to closing quote. */
 	for(size_t offset = tag_offset + 1; offset < length; offset++) {
 		char c = code[offset];
-		if(in_q) {
-			if(c == q) in_q = false;
-		} else if(c == '"' || c == '\'') {
-			in_q = true;
-			q = c;
-		} else if(c == '>') {
-			return offset;
+		if(c == '>') return offset;
+		if(c == '"' || c == '\'') {
+			const char *end = (const char *)memchr(code + offset + 1, c, length - (offset + 1));
+			if(!end) return (size_t)-1;
+			offset = (size_t)(end - code); /* for-loop ++ lands after quote */
 		}
 	}
 	return (size_t)-1;
@@ -395,6 +465,8 @@ static lom_status scan_bytes(
 		out->status = LOM_ERR_NOMEM;
 		return LOM_ERR_NOMEM;
 	}
+	if(span >= (size_t)4 * 1024 * 1024)
+		(void)madvise((void *)(uintptr_t)(code + lo), span, MADV_SEQUENTIAL);
 	size_t est_attrs = capture_attributes ? (est_opens / 2 + 64) : 0;
 	if(est_attrs && !grow_cap((void **)&out->attrs, sizeof(lom_attr_row), &out->attr_cap, out->attr_count + est_attrs)) {
 		intern_free(&intern);
@@ -451,6 +523,26 @@ static lom_status scan_bytes(
 			continue;
 		}
 
+		if(next == '/') {
+			/* Closing tags have no attributes — memchr straight to '>'. */
+			if(offset + 2 >= hi) break;
+			const char *gt = (const char *)memchr(code + offset + 2, '>', hi - (offset + 2));
+			if(!gt) {
+				intern_free(&intern);
+				free(ostack);
+				out->status = LOM_ERR_PARSE;
+				snprintf(out->error, sizeof(out->error), "unclosed tag at %zu", offset);
+				return LOM_ERR_PARSE;
+			}
+			size_t tag_end = (size_t)(gt - code);
+			if(ostack_n > 0) {
+				size_t oi = ostack[--ostack_n];
+				(void)lom_open_set_node_end(out, &out->opens[oi], (int64_t)tag_end);
+			}
+			offset = tag_end + 1;
+			continue;
+		}
+
 		size_t tag_end = find_tag_close(code, hi, offset);
 		if(tag_end == (size_t)-1) {
 			intern_free(&intern);
@@ -460,16 +552,7 @@ static lom_status scan_bytes(
 			return LOM_ERR_PARSE;
 		}
 
-		if(next == '/') {
-			if(ostack_n > 0) {
-				size_t oi = ostack[--ostack_n];
-				out->opens[oi].node_end_off = (int64_t)tag_end;
-			}
-			offset = tag_end + 1;
-			continue;
-		}
-
-		if(!opens_ensure(out, out->open_count + 1, span)) {
+		if(out->open_count >= out->open_cap && !opens_ensure(out, out->open_count + 1, span)) {
 			intern_free(&intern);
 			free(ostack);
 			out->status = LOM_ERR_NOMEM;
@@ -478,11 +561,12 @@ static lom_status scan_bytes(
 		size_t oi = out->open_count++;
 		lom_open_row *row = &out->opens[oi];
 		row->open_off = (int64_t)offset;
-		row->tag_end_off = (int64_t)tag_end;
+		lom_open_set_tag_end(row, (int64_t)tag_end);
 		row->parent_idx = (ostack_n > 0) ? (int32_t)ostack[ostack_n - 1] : -1;
-		row->node_end_off = -1;
+		row->node_end_rel = 0;
 		row->self_closing = 0;
 		row->name_id = empty_id;
+		row->_pad = 0;
 
 		size_t name_start = 0;
 		size_t name_len = extract_tagname(code, offset, tag_end, &name_start);
@@ -506,8 +590,8 @@ static lom_status scan_bytes(
 		}
 
 		if(tag_is_self_closing(code, offset, tag_end)) {
-			row->self_closing = 1;
-			row->node_end_off = (int64_t)tag_end;
+			row->self_closing = LOM_OPEN_SC;
+			(void)lom_open_set_node_end(out, row, (int64_t)tag_end);
 			out->self_closing_count++;
 		} else {
 			if(!grow_cap((void **)&ostack, sizeof(size_t), &ostack_cap, ostack_n + 1)) {
@@ -521,7 +605,8 @@ static lom_status scan_bytes(
 		offset = tag_end + 1;
 
 		/* Drop completed open-table / document prefixes to keep RSS low on huge files. */
-		if(out->opens_is_mmap && out->open_count - last_open_advise > 65536) {
+		if(out->opens_is_mmap && out->open_count >= (size_t)100000000 &&
+		   out->open_count - last_open_advise > 65536) {
 			size_t live = out->open_count;
 			for(size_t s = 0; s < ostack_n; s++) {
 				if(ostack[s] < live) live = ostack[s];
@@ -539,10 +624,13 @@ static lom_status scan_bytes(
 
 	while(ostack_n > 0) {
 		size_t oi = ostack[--ostack_n];
-		out->opens[oi].node_end_off = (int64_t)(hi ? hi - 1 : 0);
+		(void)lom_open_set_node_end(out, &out->opens[oi], (int64_t)(hi ? hi - 1 : 0));
 	}
 
-	if(out->opens_is_mmap && out->open_count > 0) {
+	/* Keep opens warm into aux index build when the table fits comfortably.
+	 * Huge tables (≥100M opens) still drop so construct RSS stays low. */
+	if(out->opens_is_mmap && out->open_count > 0 &&
+	   out->open_count >= (size_t)100000000) {
 		opens_dontneed_prefix(out, out->open_count);
 	}
 	if(code_may_dontneed && hi > lo) {
@@ -560,7 +648,10 @@ static void scan_trim(lom_scan_result *out) {
 		if(out->opens_is_mmap) {
 			size_t nbytes = out->open_count * sizeof(lom_open_row);
 			if(nbytes == 0) nbytes = sizeof(lom_open_row);
-			if(ftruncate(out->opens_fd, (off_t)nbytes) == 0) {
+			int ok = 1;
+			if(out->opens_fd >= 0)
+				ok = (ftruncate(out->opens_fd, (off_t)nbytes) == 0);
+			if(ok) {
 #ifdef MREMAP_MAYMOVE
 				void *np = mremap(out->opens, out->opens_map_bytes, nbytes, MREMAP_MAYMOVE);
 				if(np != MAP_FAILED) {
@@ -679,10 +770,41 @@ static size_t find_sibling_ranges(const char *code, size_t code_len, int want_de
 	return count;
 }
 
-static bool env_parallel_on(void) {
+static bool env_parallel_requested(void) {
 	const char *e = getenv("LOM_PARALLEL");
 	if(!e || !*e) return false;
-	return !(e[0] == '0' && e[1] == 0);
+	if(e[0] == '0' && e[1] == 0) return false;
+	if(e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N') return false;
+	return true; /* 1 / on / yes / auto — still opt-in; never the unset default */
+}
+
+static size_t mem_available_bytes(void) {
+	FILE *f = fopen("/proc/meminfo", "r");
+	if(!f) return 0;
+	char line[256];
+	size_t avail_kb = 0, total_kb = 0;
+	while(fgets(line, sizeof line, f)) {
+		unsigned long v = 0;
+		if(sscanf(line, "MemAvailable: %lu", &v) == 1) avail_kb = (size_t)v;
+		else if(sscanf(line, "MemTotal: %lu", &v) == 1) total_kb = (size_t)v;
+	}
+	fclose(f);
+	if(avail_kb) return avail_kb * 1024ull;
+	return (total_kb / 2) * 1024ull; /* crude fallback */
+}
+
+/* Parallel is opt-in only. Hardware gate: enough CPUs + RAM for workers + merge.
+ * Peak ≈ shared code + ~2× open-table (workers then dest) + slack. */
+static int parallel_hw_ok(size_t code_len, long *out_ncpu) {
+	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	if(ncpu < 1) ncpu = 1;
+	if(out_ncpu) *out_ncpu = ncpu;
+	if(ncpu < 4) return 0;
+	size_t open_est = (code_len / 24 + 64) * sizeof(lom_open_row);
+	size_t need = code_len + 2 * open_est + ((size_t)512 << 20);
+	size_t avail = mem_available_bytes();
+	if(avail && avail < need) return 0;
+	return 1;
 }
 
 typedef struct {
@@ -771,42 +893,32 @@ static bool merge_piece(lom_scan_result *dst, lom_scan_result *src, int32_t root
 static lom_byte_range *collect_ranges(const char *code, size_t code_len, int *inject_root, size_t *out_n, size_t *root_end) {
 	*inject_root = 0;
 	*out_n = 0;
-	/* Prefer one fill pass: estimate capacity from size, collect depth-1 (single-root docs). */
-	size_t cap = code_len / 8192 + 256;
-	if(cap < 64) cap = 64;
-	lom_byte_range *ranges = malloc(cap * sizeof(lom_byte_range));
-	if(!ranges) return NULL;
-
-	size_t n1 = find_sibling_ranges(code, code_len, 1, ranges, cap, root_end);
-	while(n1 >= cap) {
-		cap = n1 + 1024;
-		lom_byte_range *nr = realloc(ranges, cap * sizeof(lom_byte_range));
-		if(!nr) { free(ranges); return NULL; }
-		ranges = nr;
-		n1 = find_sibling_ranges(code, code_len, 1, ranges, cap, root_end);
-	}
+	/* Count then one fill — avoids grow-loop re-scans of the whole document. */
+	size_t n1 = find_sibling_ranges(code, code_len, 1, NULL, 0, root_end);
 	if(n1 >= 2) {
+		lom_byte_range *ranges = malloc(n1 * sizeof(lom_byte_range));
+		if(!ranges) return NULL;
+		size_t got = find_sibling_ranges(code, code_len, 1, ranges, n1, root_end);
+		if(got != n1) { free(ranges); return NULL; }
 		*inject_root = 1;
 		*out_n = n1;
 		return ranges;
 	}
 
-	size_t n0 = find_sibling_ranges(code, code_len, 0, ranges, cap, root_end);
-	while(n0 >= cap) {
-		cap = n0 + 1024;
-		lom_byte_range *nr = realloc(ranges, cap * sizeof(lom_byte_range));
-		if(!nr) { free(ranges); return NULL; }
-		ranges = nr;
-		n0 = find_sibling_ranges(code, code_len, 0, ranges, cap, root_end);
-	}
+	size_t n0 = find_sibling_ranges(code, code_len, 0, NULL, 0, root_end);
+	if(n0 == 0) return NULL;
+	lom_byte_range *ranges = malloc(n0 * sizeof(lom_byte_range));
+	if(!ranges) return NULL;
+	size_t got = find_sibling_ranges(code, code_len, 0, ranges, n0, root_end);
+	if(got != n0) { free(ranges); return NULL; }
 	*out_n = n0;
 	return ranges;
 }
 
 static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_result *out, bool capture_attributes) {
-	enum { MAX_JOBS = 8 };
-	/* Name-only dedup merge reaches ~parity at ~100MB; at ≥256MB still loses to serial. */
-	if(code_len < (4u << 20) || code_len >= (256u << 20)) {
+	enum { MAX_JOBS = 16 };
+	long ncpu = 1;
+	if(code_len < (4u << 20) || !parallel_hw_ok(code_len, &ncpu)) {
 		lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);
 		if(st == LOM_OK) scan_trim(out);
 		return st;
@@ -822,8 +934,6 @@ static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_resu
 		return st;
 	}
 
-	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-	if(ncpu < 1) ncpu = 1;
 	if(ncpu > MAX_JOBS) ncpu = MAX_JOBS;
 	size_t jobs = (size_t)ncpu;
 	if(jobs > n) jobs = n;
@@ -872,8 +982,26 @@ static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_resu
 	size_t first_child_start = ranges[0].start;
 	free(ranges);
 
+	size_t total_opens = 0;
+	for(size_t i = 0; i < jobs; i++) {
+		if(js[i].st != LOM_OK) {
+			for(size_t k = 0; k < jobs; k++) lom_scan_result_free(&js[k].local);
+			free(js); free(th);
+			lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);
+			if(st == LOM_OK) scan_trim(out);
+			return st;
+		}
+		total_opens += js[i].local.open_count;
+	}
+
 	lom_scan_result_free(out);
 	lom_scan_result_init(out);
+	/* Pre-size dest with the full document span so GB merges use mmap, not heap realloc. */
+	if(!opens_ensure(out, (inject_root ? 1 : 0) + total_opens + 64, code_len)) {
+		for(size_t i = 0; i < jobs; i++) lom_scan_result_free(&js[i].local);
+		free(js); free(th);
+		return LOM_ERR_NOMEM;
+	}
 	lom_intern intern;
 	if(!intern_init(&intern, 4096)) {
 		for(size_t i = 0; i < jobs; i++) lom_scan_result_free(&js[i].local);
@@ -911,12 +1039,7 @@ static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_resu
 		}
 		root.name_id = rid;
 		root.parent_idx = -1;
-		root.node_end_off = (int64_t)root_end;
-		if(!opens_ensure(out, 1, 0)) {
-			lom_scan_result_free(&pref); intern_free(&intern);
-			for(size_t i = 0; i < jobs; i++) lom_scan_result_free(&js[i].local);
-			free(js); free(th); return LOM_ERR_NOMEM;
-		}
+		(void)lom_open_set_node_end(out, &root, (int64_t)root_end);
 		out->opens[out->open_count++] = root;
 		for(size_t ai = 0; ai < pref.attr_count; ai++) {
 			if(pref.attrs[ai].open_idx != 0) continue;
@@ -935,7 +1058,7 @@ static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_resu
 	}
 
 	for(size_t i = 0; i < jobs; i++) {
-		if(js[i].st != LOM_OK || !merge_piece(out, &js[i].local, root_parent, &intern)) {
+		if(!merge_piece(out, &js[i].local, root_parent, &intern)) {
 			intern_free(&intern);
 			for(size_t k = 0; k < jobs; k++) lom_scan_result_free(&js[k].local);
 			free(js); free(th);
@@ -959,7 +1082,8 @@ lom_status lom_scan_indexes(
 	bool capture_attributes
 ) {
 	if(!code || !out) return LOM_ERR_ARG;
-	if(env_parallel_on()) {
+	/* Default off. Opt-in via LOM_PARALLEL=1|auto; hardware gate may still force serial. */
+	if(env_parallel_requested()) {
 		return scan_parallel(code, code_len, out, capture_attributes);
 	}
 	lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);

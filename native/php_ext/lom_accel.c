@@ -123,10 +123,10 @@ PHP_FUNCTION(lom_accel_scan)
 		const lom_open_row *row = &r.opens[i];
 		zend_ulong okey = (zend_ulong)row->open_off;
 		add_next_index_long(&opens, (zend_long)row->open_off);
-		add_index_long(&tag_ends, okey, (zend_long)row->tag_end_off);
+		add_index_long(&tag_ends, okey, (zend_long)lom_open_tag_end(row));
 		if(row->parent_idx < 0) add_index_bool(&parents, okey, 0);
 		else add_index_long(&parents, okey, (zend_long)r.opens[row->parent_idx].open_off);
-		add_index_long(&node_ends, okey, (zend_long)row->node_end_off);
+		add_index_long(&node_ends, okey, (zend_long)lom_open_node_end(&r, row));
 		const char *tname = lom_scan_string(&r, row->name_id);
 		add_index_string(&names, okey, tname);
 		zval *bucket = zend_hash_str_find(Z_ARRVAL(tag_index), tname, strlen(tname));

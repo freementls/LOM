@@ -24,7 +24,7 @@ namespace Lom.Native
 	/// <summary>P/Invoke wrapper around liblom (in-process document engine).</summary>
 	public sealed class LomDoc : IDisposable
 	{
-		const string Lib = "lom"; // liblom.so / lom.dll — set LD_LIBRARY_PATH
+		const string Lib = "lom"; // liblom.so / lom.dll — set LD_LIBRARY_PATH / PATH
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern IntPtr lom_doc_create_file(byte[] pathUtf8);
@@ -34,6 +34,9 @@ namespace Lom.Native
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern int lom_doc_get(IntPtr doc, byte[] selectorUtf8, IntPtr matchList);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern int lom_doc_count(IntPtr doc, byte[] selectorUtf8, out UIntPtr count);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern int lom_doc_node_slice(IntPtr doc, long openOff, out IntPtr ptr, out UIntPtr len);
@@ -49,6 +52,15 @@ namespace Lom.Native
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern int lom_doc_save_file(IntPtr doc, byte[] pathUtf8);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern UIntPtr lom_doc_open_count(IntPtr doc);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern IntPtr lom_doc_error(IntPtr doc);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern int lom_doc_status(IntPtr doc);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern void lom_match_list_init(IntPtr list);
@@ -78,6 +90,32 @@ namespace Lom.Native
 			_doc = lom_doc_create_file(Z(path));
 			if(_doc == IntPtr.Zero)
 				throw new InvalidOperationException("lom_doc_create_file failed");
+			if(lom_doc_status(_doc) != 0)
+			{
+				string err = Error;
+				Dispose();
+				throw new InvalidOperationException("lom_doc_create_file: " + err);
+			}
+		}
+
+		public long OpenCount => (long)lom_doc_open_count(_doc);
+
+		public string Error
+		{
+			get
+			{
+				var p = lom_doc_error(_doc);
+				return p == IntPtr.Zero ? "" : Marshal.PtrToStringUTF8(p) ?? "";
+			}
+		}
+
+		/// <summary>Cardinality without allocating match pairs — prefer for broad selectors.</summary>
+		public long Count(string selector)
+		{
+			int st = lom_doc_count(_doc, Z(selector), out UIntPtr n);
+			if(st != 0)
+				throw new InvalidOperationException("count failed: " + st + " " + Error);
+			return (long)n;
 		}
 
 		/// <summary>Run a LOM selector; returns (offset, end, node XML slice) for each hit.</summary>
@@ -90,7 +128,7 @@ namespace Lom.Native
 				lom_match_list_init(listPtr);
 				int st = lom_doc_get(_doc, Z(selector), listPtr);
 				if(st != 0)
-					throw new InvalidOperationException("get failed: " + st);
+					throw new InvalidOperationException("get failed: " + st + " " + Error);
 				var ml = Marshal.PtrToStructure<LomMatchList>(listPtr);
 				int n = (int)ml.Count;
 				var results = new List<(long, long, string)>(n);
@@ -115,25 +153,25 @@ namespace Lom.Native
 		public void Set(string selector, string text)
 		{
 			var st = lom_doc_set_inner_text(_doc, Z(selector), Z(text));
-			if(st != 0) throw new InvalidOperationException("set failed: " + st);
+			if(st != 0) throw new InvalidOperationException("set failed: " + st + " " + Error);
 		}
 
 		public void New(string parentSelector, string fragment)
 		{
 			var st = lom_doc_new_before_close(_doc, Z(parentSelector), Z(fragment));
-			if(st != 0) throw new InvalidOperationException("new failed: " + st);
+			if(st != 0) throw new InvalidOperationException("new failed: " + st + " " + Error);
 		}
 
 		public void Delete(string selector)
 		{
 			var st = lom_doc_delete(_doc, Z(selector));
-			if(st != 0) throw new InvalidOperationException("delete failed: " + st);
+			if(st != 0) throw new InvalidOperationException("delete failed: " + st + " " + Error);
 		}
 
 		public void Save(string path)
 		{
 			var st = lom_doc_save_file(_doc, Z(path));
-			if(st != 0) throw new InvalidOperationException("save failed: " + st);
+			if(st != 0) throw new InvalidOperationException("save failed: " + st + " " + Error);
 		}
 
 		public void Dispose()

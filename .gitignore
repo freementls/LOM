@@ -6,3 +6,11 @@ perf_fixture_gen.xml
 *.o
 native/lib/
 native/bin/
+**/bin/
+**/obj/
+**/__pycache__/
+*.bak
+O-*.php
+old/
+*.7z
+*.zip

@@ -481,6 +481,29 @@ static char *json_get_string(const char *json, const char *key, char *out, size_
 	return out;
 }
 
+/* Escape for embedding untrusted strings into XML attributes/text (lomd writes). */
+static size_t xml_escape_append(char *dst, size_t dst_cap, size_t at, const char *s) {
+	for(; s && *s; s++) {
+		const char *rep = NULL;
+		size_t rlen = 1;
+		char ch = *s;
+		if(ch == '&') { rep = "&amp;"; rlen = 5; }
+		else if(ch == '<') { rep = "&lt;"; rlen = 4; }
+		else if(ch == '>') { rep = "&gt;"; rlen = 4; }
+		else if(ch == '"') { rep = "&quot;"; rlen = 6; }
+		else if(ch == '\'') { rep = "&apos;"; rlen = 6; }
+		if(rep) {
+			if(at + rlen >= dst_cap) return at;
+			memcpy(dst + at, rep, rlen);
+			at += rlen;
+		} else {
+			if(at + 1 >= dst_cap) return at;
+			dst[at++] = ch;
+		}
+	}
+	return at;
+}
+
 static void handle_request(int fd, char *req, size_t req_len) {
 	(void)req_len;
 	if(strncmp(req, "OPTIONS ", 8) == 0) {
@@ -660,14 +683,19 @@ static void handle_request(int fd, char *req, size_t req_len) {
 			if(e->cols[i].kind != COL_ATTR) continue;
 			char val[256];
 			if(!json_get_string(body_in, e->cols[i].name, val, sizeof(val))) continue;
-			n += (size_t)snprintf(frag + n, sizeof(frag) - n, " %s=\"%s\"", e->cols[i].source, val);
+			n += (size_t)snprintf(frag + n, sizeof(frag) - n, " %s=\"", e->cols[i].source);
+			n = xml_escape_append(frag, sizeof(frag), n, val);
+			if(n + 1 < sizeof(frag)) frag[n++] = '"';
+			frag[n] = 0;
 		}
 		n += (size_t)snprintf(frag + n, sizeof(frag) - n, ">");
 		for(size_t i = 0; i < e->col_count; i++) {
 			if(e->cols[i].kind != COL_CHILD) continue;
 			char val[256];
 			if(!json_get_string(body_in, e->cols[i].name, val, sizeof(val))) continue;
-			n += (size_t)snprintf(frag + n, sizeof(frag) - n, "<%s>%s</%s>", e->cols[i].source, val, e->cols[i].source);
+			n += (size_t)snprintf(frag + n, sizeof(frag) - n, "<%s>", e->cols[i].source);
+			n = xml_escape_append(frag, sizeof(frag), n, val);
+			n += (size_t)snprintf(frag + n, sizeof(frag) - n, "</%s>", e->cols[i].source);
 		}
 		snprintf(frag + n, sizeof(frag) - n, "</%s>", tagname);
 		const char *parent = e->parent_selector[0] ? e->parent_selector : NULL;
@@ -704,9 +732,12 @@ static void handle_request(int fd, char *req, size_t req_len) {
 		}
 		for(size_t i = 0; i < e->col_count; i++) {
 			char val[256];
+			char esc[768];
 			if(!json_get_string(body_in, e->cols[i].name, val, sizeof(val))) continue;
-			if(e->cols[i].kind == COL_ATTR) lom_doc_set_attr(g_svc.doc, off, e->cols[i].source, val);
-			else lom_doc_set_child_text_offset(g_svc.doc, off, e->cols[i].source, val);
+			size_t en = xml_escape_append(esc, sizeof(esc), 0, val);
+			esc[en] = 0;
+			if(e->cols[i].kind == COL_ATTR) lom_doc_set_attr(g_svc.doc, off, e->cols[i].source, esc);
+			else lom_doc_set_child_text_offset(g_svc.doc, off, e->cols[i].source, esc);
 			/* refresh offset after mutations */
 			if(!find_row_by_id(e, id_buf, &off)) break;
 		}

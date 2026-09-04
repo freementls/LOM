@@ -138,15 +138,15 @@ Indexed warm similarly collapses with fcache (≈0.00 ms vs ≈4.4 ms). fmem
 | Size | Bytes | Opens | Construct (ms) | Descendant cold (ms) | Descendant warm (ms) | set text (ms) | new_ (ms) |
 |------|-------|-------|----------------|----------------------|----------------------|---------------|-----------|
 | ~2.58 MB | 2.58e6 | 1.1e5 | ~30 | ~3 | ~0.03 | ~6 | ~7 |
-| 100 MB | 1.05e8 | 4.4e6 | **~1100** | ~180 | ~3 | ~296 | ~387 |
-| 1 GB | 1.07e9 | 44.8M | **~10500** | ~1650 | **~55** | ~2548 | ~3439 |
-| 20 GB | 2.15e10 | 882M | **~740000** | **~63100** | **~880** | **~137000–212000** | **~973000** |
+| 100 MB | 1.05e8 | 4.4e6 | **~1100–1400** | ~180 | ~3 | **~30** | **~33** |
+| 1 GB | 1.07e9 | 44.8M | **~8000–12000** | ~1650 | **~55** | **~1** | **~2** |
+| 20 GB | 2.15e10 | 882M | **~740000–860000** | **~63100** | **~880** | **~29** | **~3** |
 
-**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes → ~385 MB load / ~2 MB after free. Peak `lomc` 100 MB ~528 MB. At 1 GB, heap opens+attrs ~3.9 GB load; file-backed opens + no attrs + no CSR → **~180 MB** construct RSS. **20 GB measured:** construct leaves ~6 MB resident; query peak ~24.6 GiB; write peak ~34.3 GiB; free → ~2 MB (§5.4).
+**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes → ~385 MB load / ~2 MB after free. Peak `lomc` 100 MB ~528 MB. At 1 GB, file-backed opens + no attrs + no CSR → **~180–520 MB** construct RSS (post-`new_` ~180 MB). **20 GB measured:** construct leaves ~6 MB resident; path select / set / new_ / delete thrash stays **~6–10 MB**; older broad-query peak ~24.6 GiB (§5.4).
 
-**Construct.** An earlier bulk **fmem ingest** of every interned string into a fixed 2048-bucket table made 1 GB construct ~415 s (superlinear). Queries never consulted fmem; ingest is skipped. Tag/attr aux vectors are sized by max *name* id rather than the full string table (attr values dominate `string_count`). Scan alone was already ~6 s on 1 GB; full construct is now ~10.5 s.
+**Construct.** An earlier bulk **fmem ingest** of every interned string into a fixed 2048-bucket table made 1 GB construct ~415 s (superlinear). Queries never consulted fmem; ingest is skipped. Tag/attr aux vectors are sized by max *name* id rather than the full string table (attr values dominate `string_count`). Scan alone was already ~6 s on 1 GB; full construct is now ~8–12 s.
 
-**Writes.** Structure-preserving `set` shifts offsets only. Markup `new_` merges open rows from a fragment scan and defers CSR rebuild to the next query.
+**Writes.** Growth `set` uses a code overlay + deferred open-offset bias (no full mmap COW). Markup `new_` merges a fragment scan: small tails insert in-place; large tails **append** out of document order (`open_sorted_n`) to avoid multi-GB `memmove`. Complete-subtree `delete` **tombstones** opens (`LOM_OPEN_DEAD`) without compacting tag-rows.
 
 **PHP:** slim large-doc path under 512 M; prefer `liblom` above ~100 MB.
 
@@ -164,26 +164,31 @@ Tagvalue regex with a known tag name uses the **indexed direct-chain** fast path
 
 ### 5.4 20 GB (measured)
 
-Gated runs on this host (`./bench_20gb.sh` + write continuation; file-backed opens on `/var/tmp`, attrs off, CSR omitted above ~100 M opens):
+Gated runs on this host (`./bench_20gb.sh` + write thrash; file-backed opens on `/var/tmp`, attrs off, CSR omitted above ~100 M opens):
 
 | Metric | Value |
 |--------|-------|
 | Bytes / opens | 21 474 844 641 / **881 738 929** |
-| Construct | **~625–742 s**; RSS after index **~6 MB** |
+| Construct | **~625–860 s**; RSS after index **~6 MB** |
+| Path select (indexed) | **~2 ms** / ~6 MB |
+| `set` / `new_` / post / `delete` | **~29 ms** / **~3 ms** / **~0 ms n=1** / **~0 ms** — RSS **~10 MB** (`ver≥0.2.15-tombaux`) |
+| After `lom_doc_free` | **~2 MB** |
+
+Older broad-query suite (same fixture; still useful for cold-scan cost):
+
+| Metric | Value |
+|--------|-------|
 | `region` cold / warm | **47.7 s** / **32 ms** (1 657 404 hits) |
 | Descendant cold / warm | **63.1 s** / **0.88 s** (66 296 160 hits) |
 | `entity@kind` cold / warm | **113 s** / **0.81 s** (66 296 160; open-tag parse, no attr index) |
 | `name=/^Entity_42$/` | **68.7 s** (1 hit) |
-| Indexed `region[10]_zone[5]_entity[7]_stats` | **137 s** (1 hit; no-CSR sibling groups) |
+| Indexed `region[10]_zone[5]_entity[7]_stats` | **137 s** (1 hit; pre–span-walk sibling groups) |
 | `name%=/Entity_1/` cold / warm | **32.5 s** / **113 ms** (11 111 111 hits) |
 | Parent of descendant | **65.1 s** (66 296 160) |
-| `set` small text | **~120 s** (one-pass rewrite; was 137–212 s) |
-| `new_` nested insert | **~722 s** (one-pass; was 973 s promote+memmove) |
-| Post-write read / `delete` / `validate` | **~884 s** (n=1; cold tempfile faults) / **~432 s** / **~95 s** (ok) |
-| Peak RSS | **~24.6 GiB** (query pass); **~34 GiB** (write pass) |
-| After `lom_doc_free` | **~2 MB** |
+| Legacy writes (`ver=0.2.6-splice`) | set ~120 s / new_ ~722 s / delete ~432 s; peak write RSS ~34 GiB |
+| Broad-query peak RSS | **~24.6 GiB** |
 
-Gate samples 1 GB construct RSS and requires ≥12 GiB `MemAvailable`. Open tables use tempfile `mmap` + `MADV_DONTNEED`. Child axis without CSR uses tag-row sibling groups / per-parent `[n]`. Attr filters without an attr index parse open-tag bytes. Growth splices use one-pass rewrite (≥256 MB → tempfile under `LOM_OPEN_TMPDIR`); that cuts `new_` vs double memmove but leaves the working set colder for the next query/`delete`. Full 20 GB file rewrite (`LOM_20GB_SAVE=1`) was not run.
+Gate samples 1 GB construct RSS and requires ≥12 GiB `MemAvailable`. Open tables use tempfile `mmap` + page-aligned `MADV_DONTNEED`. Child axis without CSR uses **in-span** walks under each parent (not global tag-row scans). Growth `set` uses overlay + deferred byte bias; early `new_` **appends** open rows when a tail shift would exceed ~64 MB; `delete` tombstones without rewriting tag-rows. Full 20 GB file rewrite (`LOM_20GB_SAVE=1`) was not run.
 
 ### 5.5 Personal bake-off (not main table)
 
@@ -199,7 +204,7 @@ Apache License 2.0. Source: repository artifacts include `O.php`, `native/liblom
 
 ## 8. Conclusion
 
-LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields warm-query wins; **CSR + packed opens** cut RAM sharply; **skipping unused fmem bulk ingest** made 1 GB construct practical (~10 s vs ~7 min); **incremental splice** keeps writes usable at GB scale; PHP remains the full-language reference for smaller documents.
+LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields warm-query wins; **CSR + packed opens** cut RAM sharply; **skipping unused fmem bulk ingest** made 1 GB construct practical (~10 s vs ~7 min); **overlay + open append + tombstone delete** keep tiny edits at GB–20 GB scale in milliseconds with ~10 MB RSS; PHP remains the full-language reference for smaller documents.
 
 ## 9. Competing interests / conflict of interest
 

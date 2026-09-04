@@ -60,6 +60,12 @@ $O = new O(__DIR__ . '/test.xml');
 $enc = $O->enc('/');
 expect_true('enc(/) is #forwardslash#', $enc === '#forwardslash#');
 
+// Tagvalue must not match nested markup / structure
+expect_count('person structure </ blocked', 'person%=/<\\//', 0);
+expect_count('person structure <name blocked', 'person%=/<name/', 0);
+expect_count('person tagless text sally ok', 'person%=/sally/', 3);
+expect_count('name leaf still works', 'name%=/sally/', 3);
+
 // Escaped slash inside pattern
 expect_count('pattern with \\/', 'hobby%=/ski\\/ing/', 0); // no hobby contains ski/ing
 

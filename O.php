@@ -478,6 +478,9 @@ class O {
 		if(isset($this->selector_regex_compile_cache[$cache_key])) {
 			return $this->selector_regex_compile_cache[$cache_key];
 		}
+		if(!is_string($pattern) || strlen($pattern) > 512) {
+			O::fatal_error('regex pattern too long (max 512)');
+		}
 		if(!O::lom_regex_allowed_flags($flags)) {
 			O::fatal_error('unsupported regex flags (allowed: i m s u x): ' . $flags);
 		}
@@ -600,6 +603,11 @@ class O {
 		if($this->fcache_enabled) {
 			$this->fcache_misses++;
 		}
+		/* Cap ReDoS surface for untrusted selector patterns. */
+		$prev_bt = ini_get('pcre.backtrack_limit');
+		$prev_rc = ini_get('pcre.recursion_limit');
+		@ini_set('pcre.backtrack_limit', '100000');
+		@ini_set('pcre.recursion_limit', '10000');
 		$matches = array();
 		if($need_all) {
 			$ok = @preg_match_all($compiled, $text, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
@@ -608,6 +616,12 @@ class O {
 			if($ok) {
 				$matches = array($m);
 			}
+		}
+		if($prev_bt !== false) {
+			@ini_set('pcre.backtrack_limit', $prev_bt);
+		}
+		if($prev_rc !== false) {
+			@ini_set('pcre.recursion_limit', $prev_rc);
 		}
 		if($ok === false) {
 			$err = preg_last_error();
@@ -7763,7 +7777,8 @@ if(is_numeric($indices)) {
 		}
 		if(!isset($this->tag_end_offsets[$offset]) || !isset($this->node_end_offsets[$offset])) {
 			$expanded = O::expand(false, $offset);
-			return (isset($expanded[1][0])) ? (string)$expanded[1][0] : '';
+			$raw = (isset($expanded[1][0])) ? (string)$expanded[1][0] : '';
+			return O::tagless($raw);
 		}
 		if(O::tag_is_self_closing_at($this->code, $offset, $this->tag_end_offsets[$offset])) {
 			return '';
@@ -7775,7 +7790,17 @@ if(is_numeric($indices)) {
 		if($close_start < $inner_start) {
 			return '';
 		}
-		return substr($this->code, $inner_start, $close_start - $inner_start);
+		$raw = substr($this->code, $inner_start, $close_start - $inner_start);
+		/* Tagvalue compares must not see nested markup (structure ≠ value). */
+		return O::tagless($raw);
+	}
+
+	/**
+	 * Document-level regex on raw $this->code is disabled: patterns must not
+	 * match tag structure. Fast path uses per-candidate tagless text only.
+	 */
+	function try_document_level_regex_tagvalue($tagname, $op, $regex_id, $tagvalue_index = false) {
+		return false;
 	}
 
 	function attribute_value_at_offset($offset, $attribute_name) {
@@ -7859,64 +7884,6 @@ if(is_numeric($indices)) {
 			}
 		}
 		return false;
-	}
-
-	/**
-	 * Document-level regex for selective patterns: one preg_match_all on $this->code,
-	 * map hit offsets to tag opens, then apply the operator on inner text.
-	 * Returns offset list, or false to fall back to per-candidate filtering.
-	 */
-	function try_document_level_regex_tagvalue($tagname, $op, $regex_id, $tagvalue_index = false) {
-		if($tagname === false || $tagname === '' || $tagname === '*') {
-			return false;
-		}
-		if(!in_array($op, array('%=', '=', '^=', '$=', '~='), true)) {
-			return false;
-		}
-		if(!isset($this->selector_regex_table[$regex_id])) {
-			return false;
-		}
-		$candidates = O::get_tag_index_offsets($tagname);
-		$cand_n = sizeof($candidates);
-		if($cand_n < 256) {
-			return false;
-		}
-		$compiled = $this->selector_regex_table[$regex_id]['compiled'];
-		$matches = O::regex_match_array($this->code, $compiled, true);
-		$hit_n = sizeof($matches);
-		if($hit_n === 0) {
-			return array();
-		}
-		/* Not selective enough vs walking the tag index. */
-		if($hit_n > ($cand_n / 4) && $hit_n > 512) {
-			return false;
-		}
-		$seen = array();
-		$out = array();
-		foreach($matches as $m) {
-			$byte_off = $m[0][1];
-			$open = O::find_named_open_covering_offset($tagname, $byte_off);
-			if($open === false || isset($seen[$open])) {
-				continue;
-			}
-			$inner_start = isset($this->tag_end_offsets[$open]) ? ($this->tag_end_offsets[$open] + 1) : $open;
-			$inner_end = isset($this->node_end_offsets[$open]) ? $this->node_end_offsets[$open] : $byte_off;
-			/* Match must land in element text (or on the opening tag for attrs — skip those). */
-			if($byte_off < $inner_start || $byte_off > $inner_end) {
-				continue;
-			}
-			$tv = O::inner_text_from_offset($open);
-			if(!O::compare_regex_matches($tv, $op, $regex_id)) {
-				continue;
-			}
-			$seen[$open] = 1;
-			$out[] = $open;
-		}
-		sort($out, SORT_NUMERIC);
-		if($tagvalue_index !== false && $tagvalue_index !== null) {
-			$out = O::pick_offsets_by_index_spec($out, $tagvalue_index);
-		}
-		return $out;
 	}
 
 	function fast_apply_index_piece($candidates, $piece) {

@@ -174,7 +174,7 @@ lom_fstr *lom_fstr_build(
 		uint32_t oi = root_children[i];
 		const lom_open_row *row = &opens[oi];
 		int64_t a = row->open_off;
-		int64_t b = row->node_end_off + 1;
+		int64_t b = lom_open_node_end(NULL, row) + 1;
 		if(b < a) b = a;
 		if((size_t)b > code_len) b = (int64_t)code_len;
 

@@ -33,6 +33,11 @@ int main(void) {
 	fails += expect(d, "name%=/Entity_1/", 0);
 	fails += expect(d, "person@age%=/1[68]/", 2);
 	fails += expect(d, "person_name%=/sa/", 2);
+	/* Indexed ancestor must scope regex leaves (not every name in the doc). */
+	fails += expect(d, "person[1]_name%=/sa/", 1);
+	fails += expect(d, "person[2]_name%=/sa/", 0);
+	fails += expect(d, "person[1]@age", 1);
+	fails += expect(d, "*@age", 3);
 	lom_doc_free(d);
 
 	const char *fx =
@@ -42,6 +47,11 @@ int main(void) {
 	fails += expect(d, "name%=/Entity_1/", 1);
 	fails += expect(d, "name=Entity#underscore#10", 1);
 	fails += expect(d, "name=Entity_10", 0); /* raw _ splits the path */
+	/* Tagvalue vs structure: markup must not satisfy tagvalue regex. */
+	fails += expect(d, "e%=/<\\//", 0);
+	fails += expect(d, "e%=/<name/", 0);
+	fails += expect(d, "e%=/Entity/", 2); /* tagless descendant text OK */
+	fails += expect(d, "name%=/Entity/", 2);
 	lom_doc_free(d);
 	printf("%s (%d fails)\n", fails ? "SOME FAILED" : "all ok", fails);
 	return fails ? 1 : 0;

@@ -12,6 +12,7 @@ string path = args[0];
 string sel = args.Length > 1 ? args[1] : "person";
 Console.WriteLine("liblom " + LomDoc.Version);
 using var doc = new LomDoc(path);
+Console.WriteLine($"opens={doc.OpenCount} count({sel})={doc.Count(sel)}");
 var hits = doc.Get(sel);
 Console.WriteLine($"selector={sel} matches={hits.Count}");
 int show = Math.Min(hits.Count, 5);

@@ -1762,39 +1762,18 @@ class O {
 	}
 
 	//function add_to_context($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $offset_depths_of_selector_matches) {
-	function add_to_context($normalized_selector, $matching_array_context_array, $selector_matches_context_array) {
+	function add_to_context($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $prebuilt_lom = false) {
 		$profile_token = $this->profile_function_start('add_to_context');
-		//print('$normalized_selector, $matching_array_context_array, $selector_matches_context_array, $offset_depths_of_selector_matches in add_to_context: ');var_dump($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $offset_depths_of_selector_matches);
 		if($this->debug) {
-			//if($this->code[$matching_array_context_array[0][0]] !== '<') { // you can have text!
-			//	print('$this->code[$matching_array_context_array[0][1]], $matching_array_context_array: ');var_dump($this->code[$matching_array_context_array[0][1]], $matching_array_context_array);
-			//	O::information('matching array was misaligned with code');
-			//	return false;
-			//}
-			//if($this->code[$selector_matches_context_array[0][0]] !== '<') { // you can have text!
-			//	print('$this->code[$selector_matches_context_array[0][1]], $selector_matches_context_array: ');var_dump($this->code[$selector_matches_context_array[0][1]], $selector_matches_context_array);
-			//	O::information('selector was misaligned with code');
-			//	return false;
-			//}
-			// foreach($offset_depths_of_selector_matches as $offset_depths_of_selector_match) {
-			// 	foreach($offset_depths_of_selector_match as $offset => $depth) {
-			// 		if(!isset($this->offset_depths[$offset])) {
-			// 			print('$offset_depths_of_selector_matches, $this->offset_depths: ');var_dump($offset_depths_of_selector_matches, $this->offset_depths);
-			// 			O::information('$offset_depths_of_selector_matches was misaligned with $this->offset_depths');
-			// 			return false;
-			// 		}
-			// 	}
-			// }
 			if(sizeof($this->context) > 50) {
 				O::debug_log_event('context', 'context size warning', array('context_entries' => sizeof($this->context), 'selector' => $normalized_selector), 1);
 			}
 		}
-		// do not preserve duplicates, but if it's already there, then it ends up bumped to the bottom
-		//$new_context_array_entry = array($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $offset_depths_of_selector_matches);
 		$new_context_array_entry = array($normalized_selector, $matching_array_context_array, $selector_matches_context_array);
 		if(sizeof($this->context) === 0) {
 			$this->context = array($new_context_array_entry);
 			$this->invalidate_context_selector_index();
+			O::seed_exact_false_scope_lom_cache($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $prebuilt_lom);
 			$this->profile_function_stop('add_to_context', $profile_token);
 			return true;
 		}
@@ -1814,8 +1793,29 @@ class O {
 		$new_context_array[] = $new_context_array_entry;
 		$this->context = $new_context_array;
 		$this->invalidate_context_selector_index();
+		O::seed_exact_false_scope_lom_cache($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $prebuilt_lom);
 		$this->profile_function_stop('add_to_context', $profile_token);
 		return true;
+	}
+
+	private function seed_exact_false_scope_lom_cache($normalized_selector, $matching_array_context_array, $selector_matches_context_array, $prebuilt_lom) {
+		if($prebuilt_lom === false || !is_array($prebuilt_lom) || $matching_array_context_array !== false) {
+			return;
+		}
+		if(!is_array($selector_matches_context_array)) {
+			return;
+		}
+		$this->rebuild_context_selector_index();
+		if(!isset($this->context_exact_false_scope_index[$normalized_selector])) {
+			return;
+		}
+		$ci = $this->context_exact_false_scope_index[$normalized_selector];
+		$sig = $this->context_array_signature($selector_matches_context_array);
+		$this->context_exact_false_scope_lom_cache[$normalized_selector] = array(
+			'i' => $ci,
+			's' => $sig,
+			'v' => $prebuilt_lom,
+		);
 	}
 
 	private function rebuild_context_selector_index() {
@@ -3427,7 +3427,7 @@ class O {
 			$selector_matches[] = O::build_node_result_from_offset($offset, true, $parent_node_only);
 		}
 		if($add_to_context) {
-			O::add_to_context($normalized_selector, false, O::context_array($selector_matches));
+			O::add_to_context($normalized_selector, false, O::context_array($selector_matches), $selector_matches);
 		}
 		if($tagged_result) {
 			return $selector_matches;
@@ -3536,7 +3536,7 @@ class O {
 				$this->offsets_from_get[] = $offset;
 			}
 			if($add_to_context) {
-				O::add_to_context($normalized_selector, false, O::context_array($selector_matches));
+				O::add_to_context($normalized_selector, false, O::context_array($selector_matches), $selector_matches);
 			}
 			if($tagged_result) {
 				return $selector_matches;
@@ -3562,7 +3562,7 @@ class O {
 				$this->offsets_from_get[] = $offset;
 			}
 			if($add_to_context) {
-				O::add_to_context($normalized_selector, false, O::context_array($selector_matches));
+				O::add_to_context($normalized_selector, false, O::context_array($selector_matches), $selector_matches);
 			}
 			if($tagged_result) {
 				return $selector_matches;
@@ -3662,7 +3662,7 @@ class O {
 			$this->offsets_from_get[] = $offset;
 		}
 		if($add_to_context) {
-			O::add_to_context($normalized_selector, false, O::context_array($selector_matches));
+			O::add_to_context($normalized_selector, false, O::context_array($selector_matches), $selector_matches);
 		}
 		if($tagged_result) {
 			return $selector_matches;

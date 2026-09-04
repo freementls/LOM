@@ -8,6 +8,8 @@ Living Object Model — hierarchical XML document engine (PHP `O.php`) with a na
 
 Selectors use `_` / `__` for child / descendant. Comparison values may be PCRE literals: `hobby%=/s.*/i` (see `regex_selector_test.php`). Multi-language connectors: [`connectors/`](connectors/).
 
+**Research draft:** [`docs/paper/lom_living_object_model.md`](docs/paper/lom_living_object_model.md) · **Numbers:** [`docs/RESULTS.md`](docs/RESULTS.md) (native 1 GB construct ~10 s / ~5 GB peak RSS; PHP regex tagvalue fast path).
+
 ## Live demo
 
 **[https://freement.cloud/LOM/demo/](https://freement.cloud/LOM/demo/)** — edit the XML (same contents as `test.xml`), edit the LOM selector, and watch matches update. Writes (`set` / `new_` / `delete`) apply only when you press the button.
@@ -23,6 +25,8 @@ Source for that page: [`demo/`](demo/). Locally: `php -S localhost:8765` then ht
 | `native/` | C library (`liblom`), CLI (`lomc`), OData daemon (`lomd`) |
 | `powerapps/` | Entity config, OpenAPI custom connector, setup guide |
 | `connectors/` | C#, Python, TypeScript, Java, Go clients (ABI + OData) |
+| `docs/paper/` | Working research paper draft |
+| `docs/RESULTS.md` | Benchmark snapshot |
 | `LICENSE` | Apache-2.0 |
 
 ## Power Apps

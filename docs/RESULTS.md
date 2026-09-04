@@ -57,8 +57,14 @@ LD_LIBRARY_PATH=../../native/lib dotnet run --project Lom.Native.Demo -- ../../t
 | Query | Time (indexes warm) | Hits |
 |-------|---------------------|------|
 | `name^=/Entity_1/` (old select fallback) | ~480 ms | 3024 |
-| `name^=/Entity_1/` (indexed + doc-level) | **~28 ms** | 3024 |
+| `name^=/Entity_1/` (indexed + doc-level) | **~19–28 ms** cold / **~8 ms** warm | 3024 |
 | `note%=/note-0-0-0/` (doc-level rare) | **~5.5 ms** | 1 |
+
+Warm path seeds the exact-selector LOM cache when the indexed fast path runs (avoids rebuilding node strings from offset pairs).
+
+## 20 GB
+
+Not run here (~15 GiB free). Extrapolation from 1 GB: order ~100 GB RSS / few minutes construct — see paper §5.2b.
 
 `regex_selector_test.php`: 20/20.
 

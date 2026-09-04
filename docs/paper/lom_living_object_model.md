@@ -60,7 +60,7 @@ function get(selector, ignore_context=false):
 
 ### 3.3 Fractal (bidirectional) selection
 
-When the selector ends in a selective tag-value or attribute equality, prefer one document-level scan for that end, map hits to nodes via offset→open indexes, then verify ancestor chain—rather than only expanding every region.
+When the selector ends in a selective tag-value or attribute equality, prefer one document-level scan for that end, map hits to nodes via offset→open indexes, then verify ancestor chain—rather than only expanding every region. Regex values use the same shape: for a known leaf tag, a selective `/pattern/` may `preg_match_all` the document once and map match offsets to that tag’s opens (falling back to per-candidate inner-text filters when the pattern is not selective).
 
 ```
 function fractal_get(pieces):
@@ -141,15 +141,15 @@ Indexed warm similarly collapses with fcache (≈0.00 ms vs ≈4.4 ms). fmem
 
 ### 5.3 Regex (PHP, ~2.58 MB)
 
-Tagvalue regex selectors with a known tag name now use the **indexed direct-chain** fast path (same as `tag[n]`), including when the selector is classified as an “overlay” because of `^=` / `%=` / etc. Previously those fell through to full `select`.
+Tagvalue regex with a known tag name uses the **indexed direct-chain** fast path (also from the overlay/`^=` branch). When the pattern is selective, a **document-level** `preg_match_all` maps hit offsets onto tag opens instead of scanning every candidate’s inner text.
 
 | Query | After indexes | Notes |
 |-------|---------------|-------|
-| `name^=/Entity_1/` | **~41 ms** (3024 hits) | was ~480 ms via `select` |
-| `name%=/Entity_0/` | **~56 ms** | tag-index + match-array ops |
+| `name^=/Entity_1/` | **~28 ms** (3024 hits) | was ~480 ms via `select` |
+| `note%=/note-0-0-0/` | **~5.5 ms** (1 hit) | document-level map |
 | Operator suite | 20/20 | `regex_selector_test.php` |
 
-`%=` / `!=` / `^=` use cheaper `preg_match` (existence / first hit) before falling back to `preg_match_all` when needed.
+`%=` / `!=` / `^=` use cheaper `preg_match` where possible before `preg_match_all`.
 
 ### 5.4 Personal bake-off (not main table)
 

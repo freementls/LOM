@@ -3353,6 +3353,31 @@ class O {
 		$root_key = 'root';
 		foreach($chain as $chain_index => $piece) {
 			$next_offsets = array();
+			if(
+				$chain_index === 0 &&
+				sizeof($chain) === 1 &&
+				isset($piece['tagvalue']) &&
+				$piece['tagvalue'] !== false &&
+				($rid = O::lom_regex_token_id($piece['tagvalue'])) !== false &&
+				(!isset($piece['required_attributes']) || sizeof($piece['required_attributes']) === 0)
+			) {
+				$op = (isset($piece['tagvalue_op']) && $piece['tagvalue_op'] !== false && $piece['tagvalue_op'] !== '') ? $piece['tagvalue_op'] : '=';
+				$doc_hits = O::try_document_level_regex_tagvalue(
+					$piece['tagname'],
+					$op,
+					$rid,
+					isset($piece['tagvalue_index']) ? $piece['tagvalue_index'] : false
+				);
+				if($doc_hits !== false) {
+					/* Still honor tagname [n] if present. */
+					if($piece['tagname_index'] !== false && $piece['tagname_index'] !== null) {
+						$doc_hits = O::pick_offsets_by_index_spec($doc_hits, $piece['tagname_index']);
+					}
+					$next_offsets = $doc_hits;
+					$current_parents = $next_offsets;
+					break;
+				}
+			}
 			if($chain_index === 0 && ($piece['tagname_index'] === false || $piece['tagname_index'] === null)) {
 				if($piece['tagname'] === '*') {
 					$candidates = $this->opening_tag_offsets;
@@ -7806,6 +7831,92 @@ if(is_numeric($indices)) {
 			$op_index++;
 		}
 		return true;
+	}
+
+	function find_named_open_covering_offset($tagname, $byte_off) {
+		$offs = O::get_tag_index_offsets($tagname);
+		$n = sizeof($offs);
+		if($n === 0) {
+			return false;
+		}
+		$lo = 0;
+		$hi = $n;
+		while($lo < $hi) {
+			$mid = ($lo + $hi) >> 1;
+			if($offs[$mid] <= $byte_off) {
+				$lo = $mid + 1;
+			} else {
+				$hi = $mid;
+			}
+		}
+		for($i = $lo - 1; $i >= 0; $i--) {
+			$o = $offs[$i];
+			if(!isset($this->node_end_offsets[$o])) {
+				continue;
+			}
+			if($this->node_end_offsets[$o] >= $byte_off) {
+				return $o;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Document-level regex for selective patterns: one preg_match_all on $this->code,
+	 * map hit offsets to tag opens, then apply the operator on inner text.
+	 * Returns offset list, or false to fall back to per-candidate filtering.
+	 */
+	function try_document_level_regex_tagvalue($tagname, $op, $regex_id, $tagvalue_index = false) {
+		if($tagname === false || $tagname === '' || $tagname === '*') {
+			return false;
+		}
+		if(!in_array($op, array('%=', '=', '^=', '$=', '~='), true)) {
+			return false;
+		}
+		if(!isset($this->selector_regex_table[$regex_id])) {
+			return false;
+		}
+		$candidates = O::get_tag_index_offsets($tagname);
+		$cand_n = sizeof($candidates);
+		if($cand_n < 256) {
+			return false;
+		}
+		$compiled = $this->selector_regex_table[$regex_id]['compiled'];
+		$matches = O::regex_match_array($this->code, $compiled, true);
+		$hit_n = sizeof($matches);
+		if($hit_n === 0) {
+			return array();
+		}
+		/* Not selective enough vs walking the tag index. */
+		if($hit_n > ($cand_n / 4) && $hit_n > 512) {
+			return false;
+		}
+		$seen = array();
+		$out = array();
+		foreach($matches as $m) {
+			$byte_off = $m[0][1];
+			$open = O::find_named_open_covering_offset($tagname, $byte_off);
+			if($open === false || isset($seen[$open])) {
+				continue;
+			}
+			$inner_start = isset($this->tag_end_offsets[$open]) ? ($this->tag_end_offsets[$open] + 1) : $open;
+			$inner_end = isset($this->node_end_offsets[$open]) ? $this->node_end_offsets[$open] : $byte_off;
+			/* Match must land in element text (or on the opening tag for attrs — skip those). */
+			if($byte_off < $inner_start || $byte_off > $inner_end) {
+				continue;
+			}
+			$tv = O::inner_text_from_offset($open);
+			if(!O::compare_regex_matches($tv, $op, $regex_id)) {
+				continue;
+			}
+			$seen[$open] = 1;
+			$out[] = $open;
+		}
+		sort($out, SORT_NUMERIC);
+		if($tagvalue_index !== false && $tagvalue_index !== null) {
+			$out = O::pick_offsets_by_index_spec($out, $tagvalue_index);
+		}
+		return $out;
 	}
 
 	function fast_apply_index_piece($candidates, $piece) {

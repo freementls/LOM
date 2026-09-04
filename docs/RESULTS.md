@@ -43,8 +43,9 @@ Root cause: ingesting ~3.9M unique strings into a 2048-bucket fmem table was \(O
 
 | Query | Time (indexes warm) | Hits |
 |-------|---------------------|------|
-| `name^=/Entity_1/` (before: select fallback) | ~480 ms | 3024 |
-| `name^=/Entity_1/` (indexed fast path) | **~41 ms** | 3024 |
+| `name^=/Entity_1/` (old select fallback) | ~480 ms | 3024 |
+| `name^=/Entity_1/` (indexed + doc-level) | **~28 ms** | 3024 |
+| `note%=/note-0-0-0/` (doc-level rare) | **~5.5 ms** | 1 |
 
 `regex_selector_test.php`: 20/20.
 

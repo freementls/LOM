@@ -53,6 +53,7 @@ struct lom_doc {
 	int use_parallel;
 	lom_status status;
 	char error[256];
+	int aux_dirty; /* 1 => tag/CSR indexes stale; rebuild on next query */
 };
 
 static int env_flag_on(const char *name, int default_on) {
@@ -75,6 +76,7 @@ static void doc_init_accel(lom_doc *d) {
 	d->code_is_mmap = 0;
 	d->piece_count = 0;
 	memset(d->piece_dirty, 0, sizeof(d->piece_dirty));
+	d->aux_dirty = 0;
 	if(d->use_fmem) {
 		d->fmem = lom_fmem_create(2048);
 	}
@@ -339,8 +341,21 @@ static lom_status doc_reindex(lom_doc *d) {
 		if(d->fcache) lom_fcache_free(d->fcache);
 		d->fcache = lom_fcache_create(512);
 	}
+	d->aux_dirty = 0;
 	d->status = LOM_OK;
 	d->error[0] = 0;
+	return LOM_OK;
+}
+
+static lom_status doc_ensure_aux(lom_doc *d) {
+	if(!d->aux_dirty) return LOM_OK;
+	if(!doc_rebuild_aux(d)) {
+		d->status = LOM_ERR_NOMEM;
+		snprintf(d->error, sizeof(d->error), "rebuild aux failed");
+		return LOM_ERR_NOMEM;
+	}
+	doc_fmem_ingest_strings(d);
+	d->aux_dirty = 0;
 	return LOM_OK;
 }
 
@@ -806,6 +821,8 @@ static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_m
 lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out) {
 	if(!doc || !selector || !out) return LOM_ERR_ARG;
 	if(doc->status != LOM_OK) return doc->status;
+	lom_status est = doc_ensure_aux(doc);
+	if(est != LOM_OK) return est;
 
 	size_t key_len = strlen(selector);
 	if(doc->fcache && doc->use_fcache && lom_fcache_roi_ok(doc->fcache, 0.05, 32)) {
@@ -907,11 +924,245 @@ static int splice_is_structure_preserving(const lom_doc *d, size_t at, size_t re
 	return 1;
 }
 
+static bool scan_string_intern(lom_scan_result *r, const char *s, size_t n, uint32_t *out_id) {
+	for(size_t i = 0; i < r->string_count; i++) {
+		const char *e = lom_scan_string(r, (uint32_t)i);
+		if(strncmp(e, s, n) == 0 && e[n] == '\0') {
+			*out_id = (uint32_t)i;
+			return true;
+		}
+	}
+	if(!grow_cap((void **)&r->string_offs, sizeof(size_t), &r->string_cap, r->string_count + 1)) return false;
+	if(!grow_cap((void **)&r->string_blob, 1, &r->string_blob_cap, r->string_blob_len + n + 1)) return false;
+	size_t off = r->string_blob_len;
+	memcpy(r->string_blob + off, s, n);
+	r->string_blob[off + n] = 0;
+	r->string_blob_len = off + n + 1;
+	r->string_offs[r->string_count] = off;
+	*out_id = (uint32_t)r->string_count;
+	r->string_count++;
+	return true;
+}
+
+/* Complete-subtree remove: every open in [lo,hi) ends before hi; no open is cut mid-node. */
+static int splice_remove_is_complete(const lom_doc *d, int64_t lo, int64_t hi) {
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		const lom_open_row *row = &d->scan.opens[i];
+		if(row->open_off >= lo && row->open_off < hi) {
+			if(row->node_end_off >= hi) return 0;
+		} else if(row->open_off < lo) {
+			if(row->node_end_off >= lo && row->node_end_off < hi) return 0;
+			if(row->tag_end_off >= lo && row->tag_end_off < hi) return 0;
+		}
+	}
+	return 1;
+}
+
+static void remap_parent_after_remove(lom_scan_result *s, size_t rm_lo, size_t rm_hi) {
+	size_t n_rm = rm_hi - rm_lo;
+	if(n_rm == 0) return;
+	for(size_t i = 0; i < s->open_count; i++) {
+		int32_t p = s->opens[i].parent_idx;
+		if(p < 0) continue;
+		if((size_t)p >= rm_hi) s->opens[i].parent_idx = (int32_t)((size_t)p - n_rm);
+		else if((size_t)p >= rm_lo) s->opens[i].parent_idx = -1; /* should not happen for complete remove */
+	}
+}
+
+static void remap_parent_after_insert(lom_scan_result *s, size_t insert_at, size_t n_new) {
+	if(n_new == 0) return;
+	for(size_t i = 0; i < s->open_count; i++) {
+		int32_t p = s->opens[i].parent_idx;
+		if(p >= 0 && (size_t)p >= insert_at) s->opens[i].parent_idx = (int32_t)((size_t)p + n_new);
+	}
+}
+
+/* Markup splice: drop opens in the removed span, scan only the insert, merge rows, rebuild CSR. */
+static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remove_len,
+	const char *insert, size_t insert_len) {
+	int64_t lo = (int64_t)at;
+	int64_t hi = (int64_t)(at + remove_len);
+	if(remove_len && !splice_remove_is_complete(d, lo, hi)) return LOM_ERR_PARSE;
+
+	int32_t parent_of_frag = -1;
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		const lom_open_row *row = &d->scan.opens[i];
+		if(row->open_off < lo && row->node_end_off >= hi)
+			parent_of_frag = (int32_t)i; /* document order ⇒ deepest enclosing */
+	}
+
+	size_t rm_lo = 0, rm_hi = 0;
+	int found_rm = 0;
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		int64_t o = d->scan.opens[i].open_off;
+		if(o >= lo && o < hi) {
+			if(!found_rm) { rm_lo = i; found_rm = 1; }
+			rm_hi = i + 1;
+		}
+	}
+	size_t insert_at;
+	if(found_rm) {
+		insert_at = rm_lo;
+	} else {
+		insert_at = d->scan.open_count;
+		for(size_t i = 0; i < d->scan.open_count; i++) {
+			if(d->scan.opens[i].open_off >= lo) { insert_at = i; break; }
+		}
+		rm_lo = rm_hi = insert_at;
+	}
+	size_t n_rm = found_rm ? (rm_hi - rm_lo) : 0;
+
+	lom_scan_result frag;
+	lom_scan_result_init(&frag);
+	if(insert_len) {
+		lom_status st = lom_scan_indexes(insert, insert_len, &frag, true);
+		if(st != LOM_OK) {
+			lom_scan_result_free(&frag);
+			return st;
+		}
+	}
+
+	if(parent_of_frag >= 0 && found_rm && (size_t)parent_of_frag >= rm_lo && (size_t)parent_of_frag < rm_hi) {
+		lom_scan_result_free(&frag);
+		return LOM_ERR_PARSE;
+	}
+	if(parent_of_frag >= 0 && found_rm && (size_t)parent_of_frag >= rm_hi)
+		parent_of_frag -= (int32_t)n_rm;
+
+	/* Mutate document bytes */
+	size_t new_len = d->code_len - remove_len + insert_len;
+	if(new_len + 1 > d->code_cap) {
+		size_t ncap = d->code_cap ? d->code_cap : 64;
+		while(ncap < new_len + 1) ncap *= 2;
+		char *nb = realloc(d->code, ncap);
+		if(!nb) { lom_scan_result_free(&frag); return LOM_ERR_NOMEM; }
+		d->code = nb;
+		d->code_cap = ncap;
+	}
+	memmove(d->code + at + insert_len, d->code + at + remove_len, d->code_len - (at + remove_len));
+	if(insert_len) memcpy(d->code + at, insert, insert_len);
+	d->code_len = new_len;
+	d->code[d->code_len] = 0;
+
+	/* Drop removed opens */
+	if(n_rm) {
+		size_t tail = d->scan.open_count - rm_hi;
+		if(tail) memmove(d->scan.opens + rm_lo, d->scan.opens + rm_hi, tail * sizeof(lom_open_row));
+		d->scan.open_count -= n_rm;
+		remap_parent_after_remove(&d->scan, rm_lo, rm_hi);
+	}
+
+	/* Drop attrs whose open lived in the removed span (old coords) */
+	if(remove_len) {
+		size_t w = 0;
+		for(size_t i = 0; i < d->scan.attr_count; i++) {
+			int64_t ao = d->scan.attrs[i].open_off;
+			if(ao >= lo && ao < hi) continue;
+			d->scan.attrs[w++] = d->scan.attrs[i];
+		}
+		d->scan.attr_count = w;
+	}
+
+	int64_t delta = (int64_t)insert_len - (int64_t)remove_len;
+	shift_scan_offsets(&d->scan, (int64_t)at, delta);
+
+	/* Merge fragment opens */
+	size_t n_new = frag.open_count;
+	if(n_new) {
+		if(!grow_cap((void **)&d->scan.opens, sizeof(lom_open_row), &d->scan.open_cap, d->scan.open_count + n_new)) {
+			lom_scan_result_free(&frag);
+			return LOM_ERR_NOMEM;
+		}
+		remap_parent_after_insert(&d->scan, insert_at, n_new);
+		memmove(d->scan.opens + insert_at + n_new, d->scan.opens + insert_at,
+			(d->scan.open_count - insert_at) * sizeof(lom_open_row));
+		for(size_t i = 0; i < n_new; i++) {
+			lom_open_row row = frag.opens[i];
+			row.open_off += (int64_t)at;
+			row.tag_end_off += (int64_t)at;
+			row.node_end_off += (int64_t)at;
+			const char *nm = lom_scan_string(&frag, row.name_id);
+			uint32_t nid;
+			if(!scan_string_intern(&d->scan, nm, strlen(nm), &nid)) {
+				lom_scan_result_free(&frag);
+				return LOM_ERR_NOMEM;
+			}
+			row.name_id = nid;
+			if(row.parent_idx < 0) row.parent_idx = parent_of_frag;
+			else row.parent_idx = (int32_t)(insert_at + (size_t)row.parent_idx);
+			d->scan.opens[insert_at + i] = row;
+		}
+		d->scan.open_count += n_new;
+	}
+
+	if(frag.attr_count) {
+		if(!grow_cap((void **)&d->scan.attrs, sizeof(lom_attr_row), &d->scan.attr_cap, d->scan.attr_count + frag.attr_count)) {
+			lom_scan_result_free(&frag);
+			return LOM_ERR_NOMEM;
+		}
+		for(size_t i = 0; i < frag.attr_count; i++) {
+			lom_attr_row a = frag.attrs[i];
+			a.open_off += (int64_t)at;
+			const char *an = lom_scan_string(&frag, a.name_id);
+			const char *av = lom_scan_string(&frag, a.value_id);
+			uint32_t nid, vid;
+			if(!scan_string_intern(&d->scan, an, strlen(an), &nid) ||
+			   !scan_string_intern(&d->scan, av, strlen(av), &vid)) {
+				lom_scan_result_free(&frag);
+				return LOM_ERR_NOMEM;
+			}
+			a.name_id = nid;
+			a.value_id = vid;
+			d->scan.attrs[d->scan.attr_count++] = a;
+		}
+	}
+	lom_scan_result_free(&frag);
+
+	/* Defer CSR/tag-row rebuild until the next query — write path stays near memmove cost. */
+	d->aux_dirty = 1;
+	doc_rebuild_pieces(d);
+	if(d->use_fcache) {
+		if(d->fcache) lom_fcache_free(d->fcache);
+		d->fcache = lom_fcache_create(512);
+	}
+	d->status = LOM_OK;
+	d->error[0] = 0;
+	return LOM_OK;
+}
+
 static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const char *insert, size_t insert_len) {
 	if(!doc_ensure_writable(d)) return LOM_ERR_NOMEM;
 	if(at > d->code_len || remove_len > d->code_len - at) return LOM_ERR_ARG;
-	int incr = splice_is_structure_preserving(d, at, remove_len, insert, insert_len);
 	doc_mark_dirty_at(d, at);
+
+	if(splice_is_structure_preserving(d, at, remove_len, insert, insert_len)) {
+		size_t new_len = d->code_len - remove_len + insert_len;
+		if(new_len + 1 > d->code_cap) {
+			size_t ncap = d->code_cap ? d->code_cap : 64;
+			while(ncap < new_len + 1) ncap *= 2;
+			char *nb = realloc(d->code, ncap);
+			if(!nb) return LOM_ERR_NOMEM;
+			d->code = nb;
+			d->code_cap = ncap;
+		}
+		memmove(d->code + at + insert_len, d->code + at + remove_len, d->code_len - (at + remove_len));
+		if(insert_len) memcpy(d->code + at, insert, insert_len);
+		d->code_len = new_len;
+		d->code[d->code_len] = 0;
+		shift_scan_offsets(&d->scan, (int64_t)at, (int64_t)insert_len - (int64_t)remove_len);
+		doc_rebuild_pieces(d);
+		d->status = LOM_OK;
+		d->error[0] = 0;
+		return LOM_OK;
+	}
+
+	/* Local structure merge: rescan only the insert; drop complete opens in the remove span. */
+	if(!remove_len || splice_remove_is_complete(d, (int64_t)at, (int64_t)(at + remove_len))) {
+		lom_status st = doc_splice_local_structure(d, at, remove_len, insert, insert_len);
+		if(st == LOM_OK || st == LOM_ERR_NOMEM) return st;
+		/* LOM_ERR_PARSE ⇒ fall through to full reindex */
+	}
+
 	size_t new_len = d->code_len - remove_len + insert_len;
 	if(new_len + 1 > d->code_cap) {
 		size_t ncap = d->code_cap ? d->code_cap : 64;
@@ -925,16 +1176,6 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 	if(insert_len) memcpy(d->code + at, insert, insert_len);
 	d->code_len = new_len;
 	d->code[d->code_len] = 0;
-
-	if(incr) {
-		int64_t delta = (int64_t)insert_len - (int64_t)remove_len;
-		shift_scan_offsets(&d->scan, (int64_t)at, delta);
-		/* Indices/CSR unchanged; only byte offsets moved. Refresh piece map + fcache. */
-		doc_rebuild_pieces(d);
-		d->status = LOM_OK;
-		d->error[0] = 0;
-		return LOM_OK;
-	}
 	return doc_reindex(d);
 }
 
@@ -1029,6 +1270,8 @@ lom_status lom_doc_get_attr(const lom_doc *doc, int64_t open_off, const char *at
 lom_status lom_doc_child_text(const lom_doc *doc, int64_t open_off, const char *child_tag, char *buf, size_t buflen) {
 	if(!doc || !child_tag || !buf || buflen == 0) return LOM_ERR_ARG;
 	buf[0] = 0;
+	lom_status est = doc_ensure_aux((lom_doc *)doc);
+	if(est != LOM_OK) return est;
 	size_t pidx = find_open_index(doc, open_off);
 	if(pidx == (size_t)-1) return LOM_ERR_NOTFOUND;
 	const uint32_t *kids = NULL; size_t kn = 0;
@@ -1153,6 +1396,8 @@ lom_status lom_doc_set_inner_text_offset(lom_doc *doc, int64_t open_off, const c
 
 lom_status lom_doc_set_child_text_offset(lom_doc *doc, int64_t open_off, const char *child_tag, const char *text) {
 	if(!doc || !child_tag || !text) return LOM_ERR_ARG;
+	lom_status est = doc_ensure_aux(doc);
+	if(est != LOM_OK) return est;
 	size_t pidx = find_open_index(doc, open_off);
 	if(pidx == (size_t)-1) return LOM_ERR_NOTFOUND;
 	const uint32_t *kids = NULL; size_t kn = 0;

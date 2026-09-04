@@ -32,10 +32,13 @@ Depth-1 sibling ranges → per-piece scan → merge that **dedups only tag/attr 
 
 ## Writes (native)
 
-| Op | 100 MB | 1 GB |
-|----|--------|------|
-| `set` text | ~296 ms | ~2.5 s |
-| `new_` markup (local merge) | ~387 ms | ~3.4 s |
+| Op | 100 MB | 1 GB | 20 GB |
+|----|--------|------|-------|
+| `set` text | ~296 ms | ~2.5 s | **~137–212 s** |
+| `new_` markup (local merge) | ~387 ms | ~3.4 s | **~973 s** |
+| `delete` | — | — | **~287 s** |
+
+Same-size/shrink `set` on mmap can stay MAP_PRIVATE in-place (no full heap promote). Growth and `new_` still shift the contiguous tail.
 
 ## Queries (native)
 

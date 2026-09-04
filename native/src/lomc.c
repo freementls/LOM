@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
 		{"top-level repeated tag", "region", 0},
 		{"descendant chain", "region_zone_entity_stats", 0},
 		{"attribute existence", "entity@kind", 0},
-		{"attribute value subtag combo", "entity_meta_name=Entity_42", 0},
+		{"attribute value subtag combo", "entity_meta_name=Entity#underscore#42", 0},
 		{"indexed tagname selector", "region[10]_zone[5]_entity[7]_stats", 0},
 		{"parent reads", "region_zone_entity_stats", 1},
 	};

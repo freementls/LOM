@@ -10,7 +10,7 @@
 make -C native
 ```
 
-Native child selectors use **`_`** (`region_zone_entity`) for direct children and **`__`** for descendants. Tag names containing `_` must be encoded. `/` is reserved for regex values in the PHP API.
+Native child selectors use **`_`** (`region_zone_entity`) for direct children and **`__`** for descendants. Tag names or values containing `_` must use `#underscore#` (PHP `enc()` / `query_encode()`). `/` is reserved for regex values in the PHP API.
 
 ## Accelerators (fmem / fcache / pieces / fstr)
 

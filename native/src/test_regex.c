@@ -40,6 +40,8 @@ int main(void) {
 		"<e><name>Other</name></e></w>";
 	d = lom_doc_create(fx, strlen(fx));
 	fails += expect(d, "name%=/Entity_1/", 1);
+	fails += expect(d, "name=Entity#underscore#10", 1);
+	fails += expect(d, "name=Entity_10", 0); /* raw _ splits the path */
 	lom_doc_free(d);
 	printf("%s (%d fails)\n", fails ? "SOME FAILED" : "all ok", fails);
 	return fails ? 1 : 0;

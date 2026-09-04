@@ -13,7 +13,7 @@
 #include <sys/mman.h>
 
 const char *lom_version(void) {
-	return "0.2.4-opensmap";
+	return "0.2.5-enc";
 }
 
 void lom_scan_result_init(lom_scan_result *r) {

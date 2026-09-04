@@ -851,6 +851,22 @@ static bool parse_selector(const char *sel, sel_chain *out) {
 	if(!sel || !*sel) return false;
 	char rewritten[2048];
 	if(!extract_selector_regexes(sel, rewritten, sizeof(rewritten), out)) return false;
+	/* Match PHP: #underscore# (etc.) must survive '_' path splits. */
+	{
+		char tmp[2048];
+		size_t wi = 0;
+		for(size_t i = 0; rewritten[i] && wi + 1 < sizeof(tmp);) {
+			if(strncmp(rewritten + i, "#underscore#", 12) == 0) {
+				tmp[wi++] = '\x1E'; i += 12;
+			} else if(strncmp(rewritten + i, "#forwardslash#", 14) == 0) {
+				tmp[wi++] = '\x1F'; i += 14;
+			} else {
+				tmp[wi++] = rewritten[i++];
+			}
+		}
+		tmp[wi] = 0;
+		memcpy(rewritten, tmp, wi + 1);
+	}
 	const char *p = rewritten;
 	while(*p) {
 		while(*p == '_') p++;
@@ -860,7 +876,15 @@ static bool parse_selector(const char *sel, sel_chain *out) {
 		size_t n = (size_t)(p - start);
 		if(n == 0) continue;
 		if(out->count >= 32) return false;
-		if(!parse_piece(start, n, &out->pieces[out->count], out)) return false;
+		char piecebuf[512];
+		if(n >= sizeof(piecebuf)) return false;
+		memcpy(piecebuf, start, n);
+		piecebuf[n] = 0;
+		for(size_t i = 0; i < n; i++) {
+			if(piecebuf[i] == '\x1E') piecebuf[i] = '_';
+			else if(piecebuf[i] == '\x1F') piecebuf[i] = '/';
+		}
+		if(!parse_piece(piecebuf, n, &out->pieces[out->count], out)) return false;
 		out->count++;
 		if(*p == '_' && *(p + 1) == '_') p += 2;
 		else if(*p == '_') p++;
@@ -1833,7 +1857,11 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 
 	if(splice_is_structure_preserving(d, at, remove_len, insert, insert_len)) {
 		size_t new_len = d->code_len - remove_len + insert_len;
-		if(new_len + 1 > d->code_cap || d->code_is_mmap) {
+		/* Grow only when needed. Same-size/shrink on MAP_PRIVATE stays in-place
+		 * (avoids a full 20GB heap promote for tiny text edits). */
+		int need_heap = (!d->code_is_mmap && new_len + 1 > d->code_cap) ||
+			(d->code_is_mmap && new_len > d->code_len);
+		if(need_heap) {
 			size_t ncap = d->code_cap ? d->code_cap : 64;
 			while(ncap < new_len + 1) ncap *= 2;
 			if(!doc_code_reserve(d, ncap)) return LOM_ERR_NOMEM;
@@ -1841,7 +1869,7 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 		memmove(d->code + at + insert_len, d->code + at + remove_len, d->code_len - (at + remove_len));
 		if(insert_len) memcpy(d->code + at, insert, insert_len);
 		d->code_len = new_len;
-		d->code[d->code_len] = 0;
+		if(!d->code_is_mmap && d->code_len < d->code_cap) d->code[d->code_len] = 0;
 		shift_scan_offsets(&d->scan, (int64_t)at, (int64_t)insert_len - (int64_t)remove_len);
 		doc_rebuild_pieces(d);
 		doc_rebuild_fstr(d);

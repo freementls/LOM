@@ -66,7 +66,7 @@ Warm path seeds the exact-selector LOM cache when the indexed fast path runs (av
 
 Not run here (~15 GiB free). Extrapolation from 1 GB: order ~100 GB RSS / few minutes construct — see paper §5.2b.
 
-`regex_selector_test.php`: 20/20.
+`regex_selector_test.php`: 20/20. Native PCRE2: `make -C native test-regex` (text/attr ops + `_` inside patterns).
 
 ## Commands
 

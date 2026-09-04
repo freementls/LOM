@@ -16,6 +16,9 @@
 #include <malloc.h>
 #endif
 
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+
 #ifndef LOM_MAX_PIECES
 #define LOM_MAX_PIECES 64
 #endif
@@ -506,6 +509,24 @@ static int32_t find_name_id(const lom_doc *d, const char *name, size_t nlen) {
 	return -1;
 }
 
+enum {
+	LOM_ROP_NONE = 0,
+	LOM_ROP_EQ,
+	LOM_ROP_PCT,
+	LOM_ROP_CARET,
+	LOM_ROP_DOLLAR,
+	LOM_ROP_TILDE,
+	LOM_ROP_NE
+};
+
+typedef struct {
+	int rop;
+	char pattern[512];
+	size_t pattern_len;
+	char flags[8];
+	size_t flags_len;
+} sel_regex_slot;
+
 typedef struct {
 	char name[128];
 	size_t name_len;
@@ -519,15 +540,136 @@ typedef struct {
 	char text[256];
 	size_t text_len;
 	bool has_text;
+	int rop;
+	int regex_id; /* -1 none; else index into sel_chain.regexes */
+	bool has_regex;
 } sel_piece;
 
 typedef struct {
 	sel_piece pieces[32];
 	size_t count;
+	sel_regex_slot regexes[16];
+	size_t regex_count;
 } sel_chain;
 
-static bool parse_piece(const char *s, size_t n, sel_piece *p) {
+static bool append_ch(char *buf, size_t *len, size_t cap, char c) {
+	if(*len + 1 >= cap) return false;
+	buf[(*len)++] = c;
+	return true;
+}
+
+static bool parse_rop_at(const char *s, size_t *i, int *rop) {
+	if(s[*i] == '!' && s[*i + 1] == '=') { *rop = LOM_ROP_NE; *i += 2; return true; }
+	if(s[*i] == '%' && s[*i + 1] == '=') { *rop = LOM_ROP_PCT; *i += 2; return true; }
+	if(s[*i] == '^' && s[*i + 1] == '=') { *rop = LOM_ROP_CARET; *i += 2; return true; }
+	if(s[*i] == '$' && s[*i + 1] == '=') { *rop = LOM_ROP_DOLLAR; *i += 2; return true; }
+	if(s[*i] == '~' && s[*i + 1] == '=') { *rop = LOM_ROP_TILDE; *i += 2; return true; }
+	if(s[*i] == '=') { *rop = LOM_ROP_EQ; (*i)++; return true; }
+	return false;
+}
+
+/* Rewrite /pattern/flags after comparison ops into #lomregex#N# so '_' in patterns
+ * does not split child axes. */
+static bool extract_selector_regexes(const char *sel, char *out, size_t out_cap, sel_chain *chain) {
+	size_t oi = 0;
+	size_t i = 0;
+	chain->regex_count = 0;
+	while(sel[i]) {
+		size_t save = i;
+		int rop = LOM_ROP_NONE;
+		if(parse_rop_at(sel, &i, &rop) && sel[i] == '/') {
+			i++; /* past opening / */
+			sel_regex_slot *slot = &chain->regexes[chain->regex_count];
+			memset(slot, 0, sizeof(*slot));
+			slot->rop = rop;
+			while(sel[i]) {
+				if(sel[i] == '\\' && sel[i + 1]) {
+					if(sel[i + 1] == '/') {
+						if(!append_ch(slot->pattern, &slot->pattern_len, sizeof(slot->pattern), '/')) return false;
+						i += 2;
+						continue;
+					}
+					if(!append_ch(slot->pattern, &slot->pattern_len, sizeof(slot->pattern), '\\')) return false;
+					if(!append_ch(slot->pattern, &slot->pattern_len, sizeof(slot->pattern), sel[i + 1])) return false;
+					i += 2;
+					continue;
+				}
+				if(sel[i] == '/') break;
+				if(!append_ch(slot->pattern, &slot->pattern_len, sizeof(slot->pattern), sel[i])) return false;
+				i++;
+			}
+			if(sel[i] != '/') return false;
+			i++;
+			while(sel[i] == 'i' || sel[i] == 'm' || sel[i] == 's' || sel[i] == 'u' || sel[i] == 'x') {
+				if(!append_ch(slot->flags, &slot->flags_len, sizeof(slot->flags), sel[i])) return false;
+				i++;
+			}
+			if(chain->regex_count >= 16) return false;
+			char tok[32];
+			int tn = snprintf(tok, sizeof(tok), "#lomregex#%zu#", chain->regex_count);
+			if(tn < 0 || (size_t)tn >= sizeof(tok)) return false;
+			/* emit op + token (op already consumed from input; re-emit as = placeholder + id) */
+			const char *opsp = "=";
+			if(rop == LOM_ROP_NE) opsp = "!=";
+			else if(rop == LOM_ROP_PCT) opsp = "%=";
+			else if(rop == LOM_ROP_CARET) opsp = "^=";
+			else if(rop == LOM_ROP_DOLLAR) opsp = "$=";
+			else if(rop == LOM_ROP_TILDE) opsp = "~=";
+			for(const char *q = opsp; *q; q++) {
+				if(oi + 1 >= out_cap) return false;
+				out[oi++] = *q;
+			}
+			for(int k = 0; k < tn; k++) {
+				if(oi + 1 >= out_cap) return false;
+				out[oi++] = tok[k];
+			}
+			chain->regex_count++;
+			continue;
+		}
+		i = save;
+		if(oi + 1 >= out_cap) return false;
+		out[oi++] = sel[i++];
+	}
+	if(oi >= out_cap) return false;
+	out[oi] = 0;
+	return true;
+}
+
+static bool parse_index_at(const char *s, size_t n, size_t *i, int *out_idx) {
+	if(*i >= n || s[*i] != '[') return false;
+	size_t j = *i + 1;
+	int idx = 0;
+	if(j >= n || !isdigit((unsigned char)s[j])) return false;
+	while(j < n && isdigit((unsigned char)s[j])) {
+		idx = idx * 10 + (s[j] - '0');
+		j++;
+	}
+	if(j >= n || s[j] != ']') return false;
+	*i = j + 1;
+	*out_idx = idx;
+	return true;
+}
+
+static bool parse_lomregex_token(const char *s, size_t n, size_t *i, int *id) {
+	const char *prefix = "#lomregex#";
+	size_t plen = 10;
+	if(*i + plen > n || memcmp(s + *i, prefix, plen) != 0) return false;
+	size_t j = *i + plen;
+	int v = 0;
+	if(j >= n || !isdigit((unsigned char)s[j])) return false;
+	while(j < n && isdigit((unsigned char)s[j])) {
+		v = v * 10 + (s[j] - '0');
+		j++;
+	}
+	if(j >= n || s[j] != '#') return false;
+	*i = j + 1;
+	*id = v;
+	return true;
+}
+
+static bool parse_piece(const char *s, size_t n, sel_piece *p, const sel_chain *chain) {
 	memset(p, 0, sizeof(*p));
+	p->regex_id = -1;
 	size_t i = 0;
 	while(i < n && (isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '-' || s[i] == ':' || s[i] == '*')) {
 		if(p->name_len + 1 >= sizeof(p->name)) return false;
@@ -535,61 +677,78 @@ static bool parse_piece(const char *s, size_t n, sel_piece *p) {
 	}
 	if(p->name_len == 0) return false;
 	if(i < n && s[i] == '[') {
-		i++;
-		int idx = 0;
-		if(i >= n || !isdigit((unsigned char)s[i])) return false;
-		while(i < n && isdigit((unsigned char)s[i])) {
-			idx = idx * 10 + (s[i] - '0');
-			i++;
-		}
-		if(i >= n || s[i] != ']') return false;
-		i++;
-		p->index = idx;
+		if(!parse_index_at(s, n, &i, &p->index)) return false;
 	}
 	if(i < n && s[i] == '@') {
 		i++;
 		p->has_attr = true;
-		while(i < n && s[i] != '=' && (isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '-' || s[i] == ':')) {
+		while(i < n && s[i] != '=' && s[i] != '!' && s[i] != '%' && s[i] != '^' && s[i] != '$' && s[i] != '~' &&
+			(isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '-' || s[i] == ':')) {
 			if(p->attr_len + 1 >= sizeof(p->attr)) return false;
 			p->attr[p->attr_len++] = s[i++];
 		}
 		if(p->attr_len == 0) return false;
-		if(i < n && s[i] == '=') {
-			i++;
+		if(i < n) {
+			int rop = LOM_ROP_NONE;
+			if(!parse_rop_at(s, &i, &rop)) return false;
 			p->attr_eq = true;
-			while(i < n) {
-				if(p->attr_val_len + 1 >= sizeof(p->attr_val)) return false;
-				p->attr_val[p->attr_val_len++] = s[i++];
+			p->rop = rop;
+			int rid = -1;
+			if(parse_lomregex_token(s, n, &i, &rid)) {
+				if(rid < 0 || (size_t)rid >= chain->regex_count) return false;
+				p->has_regex = true;
+				p->regex_id = rid;
+			} else if(rop == LOM_ROP_EQ) {
+				while(i < n) {
+					if(p->attr_val_len + 1 >= sizeof(p->attr_val)) return false;
+					p->attr_val[p->attr_val_len++] = s[i++];
+				}
+			} else {
+				return false;
 			}
 		}
-	} else if(i < n && s[i] == '=') {
-		i++;
-		p->has_text = true;
-		while(i < n) {
-			if(p->text_len + 1 >= sizeof(p->text)) return false;
-			p->text[p->text_len++] = s[i++];
+	} else if(i < n) {
+		int rop = LOM_ROP_NONE;
+		if(!parse_rop_at(s, &i, &rop)) return false;
+		p->rop = rop;
+		int rid = -1;
+		if(parse_lomregex_token(s, n, &i, &rid)) {
+			if(rid < 0 || (size_t)rid >= chain->regex_count) return false;
+			p->has_regex = true;
+			p->regex_id = rid;
+		} else if(rop == LOM_ROP_EQ) {
+			p->has_text = true;
+			while(i < n) {
+				if(p->text_len + 1 >= sizeof(p->text)) return false;
+				p->text[p->text_len++] = s[i++];
+			}
+		} else {
+			return false;
 		}
+	}
+	if(i < n && s[i] == '[') {
+		if(!parse_index_at(s, n, &i, &p->index)) return false;
 	}
 	if(i != n) return false;
 	return true;
 }
 
 static bool parse_selector(const char *sel, sel_chain *out) {
-	/* Child axis is '_' / '__' (same as PHP). '/' is reserved for regex literals in PHP; native ignores regex. */
 	memset(out, 0, sizeof(*out));
 	if(!sel || !*sel) return false;
-	const char *p = sel;
+	char rewritten[2048];
+	if(!extract_selector_regexes(sel, rewritten, sizeof(rewritten), out)) return false;
+	const char *p = rewritten;
 	while(*p) {
-		while(*p == '_') p++; /* skip leading underscores (direct-scope marker) */
+		while(*p == '_') p++;
 		if(!*p) break;
 		const char *start = p;
 		while(*p && *p != '_') p++;
 		size_t n = (size_t)(p - start);
 		if(n == 0) continue;
 		if(out->count >= 32) return false;
-		if(!parse_piece(start, n, &out->pieces[out->count])) return false;
+		if(!parse_piece(start, n, &out->pieces[out->count], out)) return false;
 		out->count++;
-		/* '__' = descendant (same piece chain for native subset); '_' = child — both advance */
 		if(*p == '_' && *(p + 1) == '_') p += 2;
 		else if(*p == '_') p++;
 	}
@@ -618,6 +777,256 @@ static bool inner_text_eq(const lom_doc *d, size_t open_idx, const char *text, s
 	size_t len = (size_t)(close_lt - start);
 	if(len != tlen) return false;
 	return memcmp(d->code + start, text, tlen) == 0;
+}
+
+
+static bool inner_text_span(const lom_doc *d, size_t open_idx, const char **out, size_t *out_len) {
+	const lom_open_row *row = &d->scan.opens[open_idx];
+	if(row->self_closing) {
+		*out = "";
+		*out_len = 0;
+		return true;
+	}
+	int64_t start = row->tag_end_off + 1;
+	int64_t end = row->node_end_off;
+	int64_t close_lt = end;
+	while(close_lt > start && d->code[close_lt] != '<') close_lt--;
+	if(close_lt <= start || d->code[close_lt] != '<') {
+		*out = "";
+		*out_len = 0;
+		return true;
+	}
+	*out = d->code + start;
+	*out_len = (size_t)(close_lt - start);
+	return true;
+}
+
+static pcre2_code *compile_sel_regex(const sel_regex_slot *slot) {
+	uint32_t options = 0;
+	for(size_t i = 0; i < slot->flags_len; i++) {
+		char f = slot->flags[i];
+		if(f == 'i') options |= PCRE2_CASELESS;
+		else if(f == 'm') options |= PCRE2_MULTILINE;
+		else if(f == 's') options |= PCRE2_DOTALL;
+		else if(f == 'u') options |= PCRE2_UTF;
+		else if(f == 'x') options |= PCRE2_EXTENDED;
+	}
+	int errcode = 0;
+	PCRE2_SIZE erroff = 0;
+	return pcre2_compile((PCRE2_SPTR)slot->pattern, slot->pattern_len, options, &errcode, &erroff, NULL);
+}
+
+static bool regex_keeps(int rop, pcre2_code *re, pcre2_match_data *md, const char *text, size_t tlen) {
+	if(!re || !md) return false;
+	if(rop == LOM_ROP_PCT || rop == LOM_ROP_NE) {
+		int rc = pcre2_match(re, (PCRE2_SPTR)text, tlen, 0, 0, md, NULL);
+		bool hit = (rc >= 0);
+		return rop == LOM_ROP_NE ? !hit : hit;
+	}
+	PCRE2_SIZE off = 0;
+	while(off <= tlen) {
+		int rc = pcre2_match(re, (PCRE2_SPTR)text, tlen, off, 0, md, NULL);
+		if(rc < 0) break;
+		PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+		PCRE2_SIZE ms = ov[0], me = ov[1];
+		if(rop == LOM_ROP_EQ && ms == 0 && me == tlen) return true;
+		if(rop == LOM_ROP_CARET && ms == 0) return true;
+		if(rop == LOM_ROP_DOLLAR && me == tlen) return true;
+		if(rop == LOM_ROP_TILDE) {
+			bool left = (ms == 0) || isspace((unsigned char)text[ms - 1]);
+			bool right = (me == tlen) || isspace((unsigned char)text[me]);
+			if(left && right) return true;
+		}
+		if(me == ms) off = me + 1;
+		else off = me;
+		if(off == 0) break;
+	}
+	return false;
+}
+
+static bool row_attr_value(const lom_doc *d, int64_t open_off, const char *aname, size_t anlen, const char **val, size_t *vlen) {
+	for(size_t i = 0; i < d->scan.attr_count; i++) {
+		const lom_attr_row *a = &d->scan.attrs[i];
+		if(a->open_off != open_off) continue;
+		if(!name_eq(d, a->name_id, aname, anlen)) continue;
+		const char *s = lom_scan_string(&d->scan, a->value_id);
+		if(!s) return false;
+		*val = s;
+		*vlen = strlen(s);
+		return true;
+	}
+	return false;
+}
+
+static bool piece_matches_open(const lom_doc *d, size_t oi, const sel_piece *piece, const sel_chain *chain,
+	pcre2_code *re, pcre2_match_data *md) {
+	const lom_open_row *row = &d->scan.opens[oi];
+	if(piece->has_regex) {
+		if(piece->regex_id < 0 || (size_t)piece->regex_id >= chain->regex_count) return false;
+		const sel_regex_slot *slot = &chain->regexes[piece->regex_id];
+		int rop = piece->rop ? piece->rop : slot->rop;
+		if(piece->has_attr) {
+			const char *val = NULL; size_t vlen = 0;
+			if(!row_attr_value(d, row->open_off, piece->attr, piece->attr_len, &val, &vlen)) {
+				return rop == LOM_ROP_NE;
+			}
+			return regex_keeps(rop, re, md, val, vlen);
+		}
+		const char *text = NULL; size_t tlen = 0;
+		inner_text_span(d, oi, &text, &tlen);
+		return regex_keeps(rop, re, md, text, tlen);
+	}
+	if(piece->has_attr && !row_has_attr(d, row->open_off, piece)) return false;
+	if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) return false;
+	return true;
+}
+
+static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
+	lom_match_list_free(out);
+	lom_match_list_init(out);
+	const sel_piece *piece = &chain->pieces[chain->count - 1];
+	if(!piece->has_regex || piece->regex_id < 0) return LOM_ERR_PARSE;
+	const sel_regex_slot *slot = &chain->regexes[piece->regex_id];
+	pcre2_code *re = compile_sel_regex(slot);
+	if(!re) return LOM_ERR_PARSE;
+	pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+	if(!md) { pcre2_code_free(re); return LOM_ERR_NOMEM; }
+
+	int32_t nid = find_name_id(d, piece->name, piece->name_len);
+	if(nid < 0 && !(piece->name_len == 1 && piece->name[0] == '*')) {
+		pcre2_match_data_free(md);
+		pcre2_code_free(re);
+		return LOM_OK;
+	}
+
+	size_t k = 0;
+	uint32_t *rows = NULL;
+	if(piece->name_len == 1 && piece->name[0] == '*') {
+		k = d->scan.open_count;
+	} else {
+		rows = d->tag_rows[nid];
+		k = d->tag_row_counts[nid];
+	}
+
+	/* Document-level map when selective enough and leaf is text regex (not attr). */
+	if(!piece->has_attr && k >= 256 && d->code_len > 0) {
+		size_t hit_cap = 1024, hit_n = 0;
+		PCRE2_SIZE *hits = malloc(hit_cap * sizeof(PCRE2_SIZE));
+		if(!hits) { pcre2_match_data_free(md); pcre2_code_free(re); return LOM_ERR_NOMEM; }
+		PCRE2_SIZE off = 0;
+		while(off <= d->code_len) {
+			int rc = pcre2_match(re, (PCRE2_SPTR)d->code, d->code_len, off, 0, md, NULL);
+			if(rc < 0) break;
+			PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+			if(hit_n + 1 > hit_cap) {
+				hit_cap *= 2;
+				PCRE2_SIZE *nh = realloc(hits, hit_cap * sizeof(PCRE2_SIZE));
+				if(!nh) { free(hits); pcre2_match_data_free(md); pcre2_code_free(re); return LOM_ERR_NOMEM; }
+				hits = nh;
+			}
+			hits[hit_n++] = ov[0];
+			PCRE2_SIZE me = ov[1];
+			off = (me == ov[0]) ? me + 1 : me;
+			if(off == 0) break;
+			if(hit_n > (k / 4) && hit_n > 512) { hit_n = 0; break; /* not selective */ }
+		}
+		if(hit_n > 0) {
+			uint8_t *seen = calloc(d->scan.open_count ? d->scan.open_count : 1, 1);
+			if(!seen) { free(hits); pcre2_match_data_free(md); pcre2_code_free(re); return LOM_ERR_NOMEM; }
+			for(size_t h = 0; h < hit_n; h++) {
+				int64_t pos = (int64_t)hits[h];
+				/* rightmost open of this name covering pos */
+				size_t best = (size_t)-1;
+				if(rows) {
+					size_t lo = 0, hi = k;
+					while(lo < hi) {
+						size_t mid = (lo + hi) / 2;
+						if(d->scan.opens[rows[mid]].open_off <= pos) lo = mid + 1;
+						else hi = mid;
+					}
+					for(ssize_t i = (ssize_t)lo - 1; i >= 0; i--) {
+						size_t oi = rows[i];
+						const lom_open_row *row = &d->scan.opens[oi];
+						if(row->open_off > pos) continue;
+						if(row->node_end_off < pos) continue;
+						best = oi;
+						break;
+					}
+				}
+				if(best == (size_t)-1 || seen[best]) continue;
+				if(!piece_matches_open(d, best, piece, chain, re, md)) continue;
+				seen[best] = 1;
+				const lom_open_row *row = &d->scan.opens[best];
+				if(!match_push(out, row->open_off, row->node_end_off)) {
+					free(seen); free(hits); pcre2_match_data_free(md); pcre2_code_free(re);
+					return LOM_ERR_NOMEM;
+				}
+			}
+			free(seen);
+			free(hits);
+			/* apply [n] */
+			if(piece->index > 0 && out->count > 0) {
+				size_t pick = (size_t)piece->index - 1;
+				if(pick >= out->count) {
+					lom_match_list_free(out);
+					lom_match_list_init(out);
+				} else {
+					lom_match keep = out->items[pick];
+					lom_match_list_free(out);
+					lom_match_list_init(out);
+					match_push(out, keep.offset, keep.end_off);
+				}
+			}
+			pcre2_match_data_free(md);
+			pcre2_code_free(re);
+			return LOM_OK;
+		}
+		free(hits);
+		/* fall through to per-candidate */
+	}
+
+	for(size_t i = 0; i < k; i++) {
+		size_t oi = rows ? rows[i] : i;
+		if(!piece_matches_open(d, oi, piece, chain, re, md)) continue;
+		if(chain->count >= 2) {
+			int64_t cur = d->scan.opens[oi].open_off;
+			bool ok = true;
+			for(ssize_t pi = (ssize_t)chain->count - 2; pi >= 0; pi--) {
+				size_t cidx = find_open_index(d, cur);
+				if(cidx == (size_t)-1) { ok = false; break; }
+				int32_t pidx32 = d->scan.opens[cidx].parent_idx;
+				if(pidx32 < 0) { ok = false; break; }
+				size_t pidx = (size_t)pidx32;
+				const sel_piece *pp = &chain->pieces[pi];
+				if(!name_eq(d, d->scan.opens[pidx].name_id, pp->name, pp->name_len)) { ok = false; break; }
+				if(pp->has_attr && !row_has_attr(d, d->scan.opens[pidx].open_off, pp)) { ok = false; break; }
+				if(pp->has_text && !inner_text_eq(d, pidx, pp->text, pp->text_len)) { ok = false; break; }
+				cur = d->scan.opens[pidx].open_off;
+			}
+			if(!ok) continue;
+		}
+		const lom_open_row *row = &d->scan.opens[oi];
+		if(!match_push(out, row->open_off, row->node_end_off)) {
+			pcre2_match_data_free(md);
+			pcre2_code_free(re);
+			return LOM_ERR_NOMEM;
+		}
+	}
+	if(piece->index > 0 && out->count > 0) {
+		size_t pick = (size_t)piece->index - 1;
+		if(pick >= out->count) {
+			lom_match_list_free(out);
+			lom_match_list_init(out);
+		} else {
+			lom_match keep = out->items[pick];
+			lom_match_list_free(out);
+			lom_match_list_init(out);
+			match_push(out, keep.offset, keep.end_off);
+		}
+	}
+	pcre2_match_data_free(md);
+	pcre2_code_free(re);
+	return LOM_OK;
 }
 
 static void collect_named_children(const lom_doc *d, const uint32_t *kids, size_t kn, const sel_piece *piece, size_t **out, size_t *out_n, size_t *out_cap) {
@@ -791,6 +1200,10 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_match_list *out) {
 	sel_chain chain;
 	if(!parse_selector(selector, &chain)) return LOM_ERR_PARSE;
+
+	if(chain.count >= 1 && chain.pieces[chain.count - 1].has_regex) {
+		return query_regex_leaf(doc, &chain, out);
+	}
 
 	if(chain.count == 1 && chain.pieces[0].has_attr && !chain.pieces[0].has_text) {
 		lom_match_list_free(out);

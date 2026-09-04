@@ -95,6 +95,7 @@ After any comparison operator, `/pattern/flags` is a regex value (slash is not a
 
 - **fmem:** optional L1 intern API retained; bulk ingest on construct was disabled after it proved harmful on high-cardinality docs (unique attr values) while queries use `string_blob` / name ids.
 - **fcache:** memo selector→match-list (native) and regex match arrays (PHP); cleared on invalidate / reindex.
+- **Native regex:** `liblom` compiles `/pattern/flags` with PCRE2 after comparison ops (same operator table as PHP). Patterns are extracted before `_` axis splits so underscores inside patterns stay intact. Selective document-level mapping is used when the leaf tag index is large enough.
 - **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice.
 - **parallel (`LOM_PARALLEL`):** default off. Shared-atomic CSR count workers were tried and **slowed** 100 MB–1 GB construct (cache-line contention; fill must stay ordered for `[n]`). Left as a hook for future piece-local scan merge, not a claimed win.
 

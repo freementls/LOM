@@ -8,7 +8,7 @@ LOM is usable from other languages without rewriting [`O.php`](../O.php). Two co
 2. **HTTP / OData** — [`lomd`](../native/src/lomd.c) + [`powerapps/openapi.json`](../powerapps/openapi.json)  
    API key header `X-Api-Key`, `$filter` / `$top` / `$skip`. Any language with an HTTP client can connect.
 
-Selector strings are UTF-8. Child axis is `_` / `__`. Regex values (`hobby%=/s.*/i`) are implemented in the PHP engine; native `liblom` currently supports a selector subset (tag chains, `@attr`, `=text`).
+Selector strings are UTF-8. Child axis is `_` / `__`. Regex values (`hobby%=/s.*/i`) work in PHP and in native `liblom` (PCRE2; same operator table: `=` `%=` `^=` `$=` `~=` `!=`).
 
 License: **Apache-2.0** — you may publish connectors without asking.
 

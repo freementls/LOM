@@ -90,9 +90,10 @@ LOM_API void lom_match_list_init(lom_match_list *m);
 LOM_API void lom_match_list_free(lom_match_list *m);
 
 /* Selector subset: tag chains with optional [n], tag@attr, tag@attr=val,
-   and tag chains ending in =text (last tag's inner text). Use '_' between
-   child steps ('__' for descendant). Tag names containing '_' must be
-   encoded by the caller. '/' is reserved for regex values in the PHP API. */
+   tag chains ending in =text, and comparison ops with /pattern/flags
+   (PCRE2; '=' means full-span match). Use '_' between child steps
+   ('__' for descendant). Tag names containing '_' must be encoded by
+   the caller. '/' after a comparison op starts a regex literal. */
 LOM_API lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out);
 LOM_API lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list *out);
 LOM_API lom_status lom_doc_node_slice(const lom_doc *doc, int64_t open_off, const char **ptr, size_t *len);

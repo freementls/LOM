@@ -2,16 +2,20 @@ CC ?= gcc
 CFLAGS ?= -O2 -g -fPIC -Wall -Wextra -std=c11 -D_GNU_SOURCE
 CPPFLAGS += -Iinclude
 LDFLAGS_SO = -shared
-LDLIBS = -lm -lpthread
+LDLIBS = -lm -lpthread -lpcre2-8
 
 LIB = lib/liblom.so
 LOMC = bin/lomc
 LOMD = bin/lomd
 OBJS = src/lom_scan.o src/lom_doc.o src/lom_fmem.o src/lom_fcache.o
 
-.PHONY: all clean test-scan php-ext test-fmem
+.PHONY: all clean test-scan php-ext test-fmem test-regex
 
 all: $(LIB) $(LOMC) $(LOMD)
+
+test-regex: $(LIB)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o bin/test_regex src/test_regex.c -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom $(LDLIBS)
+	./bin/test_regex
 
 test-fmem: $(LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o bin/test_fmem_fcache src/test_fmem_fcache.c -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom $(LDLIBS)

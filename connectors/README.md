@@ -19,8 +19,8 @@ License: **Apache-2.0** — you may publish connectors without asking.
 | **C# / .NET** | [`csharp/`](csharp/) | P/Invoke `Lom.Native` + `HttpClient` `Lom.OData` (first-class) |
 | **Python** | [`python/`](python/) | `ctypes` + `httpx`/`urllib` |
 | **TypeScript** | [`typescript/`](typescript/) | fetch client for OpenAPI |
-| **Java** | [`java/`](java/) | Panama/`jna` stub + OpenAPI-shaped client |
-| **Go** | [`go/`](go/) | `cgo` stub + `net/http` |
+| **Java** | [`java/`](java/) | JNA `LomNative.get` + `LomODataClient` |
+| **Go** | [`go/`](go/) | cgo `lom.OpenFile` / `Get` + `ODataClient` |
 
 PHP and C remain the cores. Additional languages only need the ABI or OpenAPI file.
 
@@ -33,4 +33,15 @@ cd connectors/csharp && dotnet run --project Lom.Native.Demo -- ../../test.xml '
 # OData (against lomd):
 ./native/bin/lomd --file powerapps/demo.xml --entities powerapps/entities.conf --port 8080 --api-key 'dev'
 cd connectors/csharp && dotnet run --project Lom.OData.Demo -- http://127.0.0.1:8080 dev
+```
+
+## Go / Python / Java (in-process Get)
+
+```bash
+make -C native
+# Go
+cd connectors/go && CGO_ENABLED=1 go test ./lom -count=1
+# Python
+python3 -c "from python.lom import LomNative; ..."  # see connectors/python/lom.py
+# Java: add jna on classpath, jna.library.path=native/lib, call lom.LomNative
 ```

@@ -157,7 +157,7 @@ Tagvalue regex with a known tag name uses the **indexed direct-chain** fast path
 
 | Query | After indexes | Notes |
 |-------|---------------|-------|
-| `name^=/Entity_1/` | **~28 ms** (3024 hits) | was ~480 ms via `select` |
+| `name^=/Entity_1/` | **~19–28 ms** cold / **~8 ms** warm (3024 hits) | was ~480 ms via `select` |
 | `note%=/note-0-0-0/` | **~5.5 ms** (1 hit) | document-level map |
 | Operator suite | 20/20 | `regex_selector_test.php` |
 

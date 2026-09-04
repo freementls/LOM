@@ -201,6 +201,10 @@ Apache License 2.0. Source: repository artifacts include `O.php`, `native/liblom
 
 LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields warm-query wins; **CSR + packed opens** cut RAM sharply; **skipping unused fmem bulk ingest** made 1 GB construct practical (~10 s vs ~7 min); **incremental splice** keeps writes usable at GB scale; PHP remains the full-language reference for smaller documents.
 
+## 9. Competing interests / conflict of interest
+
+The author declares that there are no conflicts of interest. No competing financial interests or personal relationships influenced the work reported in this paper. No resources, funding, facilities, data, or personnel of any other organization were used in the creation of this tool or in the preparation of this manuscript; the work was developed independently on personally available hardware and software.
+
 ## References (selected)
 
 1. J. Zhang et al., VTD-XML / non-extractive parsing — https://www.xml.com/pub/a/2004/05/19/parsing.html ; https://vtd-xml.sourceforge.io/

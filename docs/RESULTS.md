@@ -39,9 +39,14 @@ Root cause: ingesting ~3.9M unique strings into a 2048-bucket fmem table was \(O
 | 100 MB | ~3 ms | ~2.9 s |
 | 1 GB | ~55 ms | **~27 s** (was ~430 s) |
 
-## Ablations (~2.58 MB)
+## Regex (PHP, ~2.58 MB)
 
-- Descendant warm: **0.03 ms** with fcache vs **~3.7 ms** with `LOM_FCACHE=0`.
+| Query | Time (indexes warm) | Hits |
+|-------|---------------------|------|
+| `name^=/Entity_1/` (before: select fallback) | ~480 ms | 3024 |
+| `name^=/Entity_1/` (indexed fast path) | **~41 ms** | 3024 |
+
+`regex_selector_test.php`: 20/20.
 
 ## Commands
 

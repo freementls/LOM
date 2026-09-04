@@ -657,14 +657,32 @@ class O {
 		$compiled = $entry['compiled'];
 		$text = (string)$text;
 		$text_len = strlen($text);
-		$need_all = !in_array($op, array('%=', '!='), true);
-		$matches = O::regex_match_array($text, $compiled, $need_all);
 		if($op === '!=') {
+			$matches = O::regex_match_array($text, $compiled, false);
 			return sizeof($matches) === 0;
 		}
 		if($op === '%=') {
+			$matches = O::regex_match_array($text, $compiled, false);
 			return sizeof($matches) > 0;
 		}
+		/* ^= : prefer a single match; only scan all if the first hit is not at offset 0. */
+		if($op === '^=') {
+			$matches = O::regex_match_array($text, $compiled, false);
+			if(sizeof($matches) === 0) {
+				return false;
+			}
+			if($matches[0][0][1] === 0) {
+				return true;
+			}
+			$matches = O::regex_match_array($text, $compiled, true);
+			foreach($matches as $m) {
+				if($m[0][1] === 0) {
+					return true;
+				}
+			}
+			return false;
+		}
+		$matches = O::regex_match_array($text, $compiled, true);
 		if(sizeof($matches) === 0) {
 			return false;
 		}
@@ -675,11 +693,6 @@ class O {
 			switch($op) {
 				case '=':
 					if($off === 0 && $mlen === $text_len) {
-						return true;
-					}
-					break;
-				case '^=':
-					if($off === 0) {
 						return true;
 					}
 					break;
@@ -699,8 +712,6 @@ class O {
 				case '<':
 				case '>=':
 				case '<=':
-					// Regex RHS encodes allowed numeric forms (e.g. *@age>=/1[6-9]|[2-9]\d+/).
-					// Keep the node when a numeric portion matches the pattern.
 					$num_str = (isset($m[1]) && is_array($m[1])) ? $m[1][0] : $full;
 					if(is_numeric($num_str)) {
 						return true;
@@ -3261,6 +3272,7 @@ class O {
 		$scopes = $this->selector_scope_sets[0];
 		$chain = array();
 		$has_index_or_wildcard = false;
+		$has_leaf_tagvalue = false;
 		foreach($pieces as $piece_index => $piece) {
 			if($piece === '') {
 				$fast_indexed_chain_cache[$normalized_selector] = false;
@@ -3299,6 +3311,14 @@ class O {
 			if($attributes_index !== false && $attributes_index !== null) {
 				$has_index_or_wildcard = true;
 			}
+			if($tagvalue !== false) {
+				$has_leaf_tagvalue = true;
+			}
+			/* Non-leaf pieces keep structure-only so parent walk stays O(hits). */
+			if($piece_index < sizeof($pieces) - 1 && $tagvalue !== false) {
+				$fast_indexed_chain_cache[$normalized_selector] = false;
+				return false;
+			}
 			$chain[] = array(
 				'tagname' => $tagname,
 				'index' => $tagname_index,
@@ -3311,7 +3331,7 @@ class O {
 				'attributes_index' => $attributes_index,
 			);
 		}
-		if(!$has_index_or_wildcard) {
+		if(!$has_index_or_wildcard && !$has_leaf_tagvalue) {
 			$fast_indexed_chain_cache[$normalized_selector] = false;
 			return false;
 		}
@@ -3324,7 +3344,11 @@ class O {
 		if($chain === false) {
 			return false;
 		}
-		O::ensure_parent_children_index();
+		if(sizeof($chain) > 1) {
+			O::ensure_parent_children_index();
+		} else {
+			O::ensure_parent_indexes();
+		}
 		$current_parents = array();
 		$root_key = 'root';
 		foreach($chain as $chain_index => $piece) {
@@ -3337,6 +3361,7 @@ class O {
 				}
 				$next_offsets = O::fast_apply_index_piece($candidates, $piece);
 			} elseif($chain_index === 0) {
+				O::ensure_parent_children_index();
 				foreach($this->parent_children_index as $parent_key => $children) {
 					if(sizeof($children) === 0) {
 						continue;
@@ -3367,15 +3392,18 @@ class O {
 		}
 		$this->offsets_from_get = $current_parents;
 		if(sizeof($current_parents) === 0) {
+			if($add_to_context) {
+				O::add_to_context($normalized_selector, false, array());
+			}
 			return array();
 		}
 		$selector_matches = array();
 		foreach($current_parents as $offset) {
 			$selector_matches[] = O::build_node_result_from_offset($offset, true, $parent_node_only);
 		}
-		// Intentionally skip context insertion here: this path is for
-		// indexed/wildcard direct chains and can otherwise flood context
-		// entries in mixed workloads, tripping debug guardrails in test.php.
+		if($add_to_context) {
+			O::add_to_context($normalized_selector, false, O::context_array($selector_matches));
+		}
 		if($tagged_result) {
 			return $selector_matches;
 		}
@@ -4360,6 +4388,15 @@ class O {
 									$this->profile_add_time('get_fastpaths_total', O::getmicrotime() - $get_t_fastpaths_total);
 								}
 								return $fast_overlay_attribute_selector_matches;
+							}
+							/* Tagvalue comparisons (incl. /regex/) use the indexed chain; do not
+							 * fall straight to select just because overlay/comparison ops are present. */
+							$fast_indexed_selector_matches = O::fast_get_indexed_or_wildcard_direct_chain($normalized_selector, $add_to_context, $ignore_context, $parent_node_only, $tagged_result);
+							if($fast_indexed_selector_matches !== false) {
+								if($get_t_fastpaths_total !== false) {
+									$this->profile_add_time('get_fastpaths_total', O::getmicrotime() - $get_t_fastpaths_total);
+								}
+								return $fast_indexed_selector_matches;
 							}
 						} else {
 							$fast_attribute_selector_matches = O::fast_get_simple_attribute_selector($normalized_selector, $add_to_context, $ignore_context, $parent_node_only, $tagged_result);

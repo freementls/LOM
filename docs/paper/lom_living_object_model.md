@@ -141,7 +141,15 @@ Indexed warm similarly collapses with fcache (≈0.00 ms vs ≈4.4 ms). fmem
 
 ### 5.3 Regex (PHP, ~2.58 MB)
 
-Representative cold times: rare `note%=/note-0-0-0/` ~45 ms; common `note%=/note-/` ~113 ms; `name^=/Entity_/` ~218 ms. Warm times stay similar for regex-heavy paths when match arrays differ by text content (fcache keys include text). Operator suite: 20/20 in `regex_selector_test.php`.
+Tagvalue regex selectors with a known tag name now use the **indexed direct-chain** fast path (same as `tag[n]`), including when the selector is classified as an “overlay” because of `^=` / `%=` / etc. Previously those fell through to full `select`.
+
+| Query | After indexes | Notes |
+|-------|---------------|-------|
+| `name^=/Entity_1/` | **~41 ms** (3024 hits) | was ~480 ms via `select` |
+| `name%=/Entity_0/` | **~56 ms** | tag-index + match-array ops |
+| Operator suite | 20/20 | `regex_selector_test.php` |
+
+`%=` / `!=` / `^=` use cheaper `preg_match` (existence / first hit) before falling back to `preg_match_all` when needed.
 
 ### 5.4 Personal bake-off (not main table)
 

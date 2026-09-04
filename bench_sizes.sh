@@ -31,9 +31,11 @@ make -C "$ROOT/native" -j4 >/dev/null
 run_size 1MB
 run_size 100MB
 run_size 1GB
+# 20GB is memory-gated and measured separately (no extrapolation).
 if [[ "${LOM_ALLOW_HUGE:-0}" == "1" ]]; then
-  run_size 20GB
+  echo "Delegating 20GB to bench_20gb.sh (RSS/MemAvailable gate)." | tee -a "$REPORT"
+  "$ROOT/bench_20gb.sh" | tee -a "$REPORT" || true
 else
-  echo "Skipping 20GB (set LOM_ALLOW_HUGE=1 to enable)." | tee -a "$REPORT"
+  echo "Skipping 20GB (run ./bench_20gb.sh when RAM allows)." | tee -a "$REPORT"
 fi
 echo "Wrote $REPORT"

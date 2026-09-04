@@ -11,8 +11,9 @@ Full narrative: [`docs/paper/lom_living_object_model.md`](docs/paper/lom_living_
 | Before CSR (per-node children mallocs) | 100 MB | 4.4M | **~1424 MB** load | ~1 GB stuck |
 | After CSR + scan trim + view-fmem | 100 MB | 4.4M | **~385 MB** load | **~2 MB** |
 | lomc full run | 100 MB | 4.4M | **~528 MB** peak | — |
-| After CSR | 1 GB | 44.8M | **~3905 MB** load | **~2 MB** |
-| lomc full run | 1 GB | 44.8M | **~5.0 GB** peak | — |
+| After CSR (heap opens) | 1 GB | 44.8M | **~3905 MB** load | **~2 MB** |
+| File-backed opens, no attrs, no CSR | 1 GB | 44.8M | **~180 MB** construct | **~2 MB** |
+| lomc full run (legacy heap+attrs) | 1 GB | 44.8M | **~5.0 GB** peak | — |
 
 PHP 100 MB (`memory_limit=512M`): construct lazy **~134 MB**; `region` via slim index **~402 MB**.
 
@@ -70,11 +71,19 @@ LD_LIBRARY_PATH=../../native/lib dotnet run --project Lom.Native.Demo -- ../../t
 
 Warm path seeds the exact-selector LOM cache when the indexed fast path runs (avoids rebuilding node strings from offset pairs).
 
-## 20 GB
+## 20 GB (measured)
 
-Not run here (~15 GiB free). Extrapolation from 1 GB: order ~100 GB RSS / few minutes construct — see paper §5.2b.
+| Metric | Value |
+|--------|-------|
+| Opens | 881 738 929 |
+| Construct | **762 s**; RSS after index **~6 MB** |
+| `region` cold / warm | **49.2 s** / **26 ms** (1.66 M hits) |
+| Descendant cold | **62.7 s** (66.3 M hits) |
+| Peak RSS | **~24.6 GiB**; after free **~2 MB** |
 
-`regex_selector_test.php`: 20/20. Native PCRE2: `make -C native test-regex` (text/attr ops + `_` inside patterns).
+Path: file-backed opens (`/var/tmp`), attrs off, no CSR; `./bench_20gb.sh`. Log: `.bench_out/bench_20gb.txt`.
+
+`regex_selector_test.php`: 20/20. Native PCRE2: `make -C native test-regex`.
 
 ## Commands
 
@@ -82,4 +91,5 @@ Not run here (~15 GiB free). Extrapolation from 1 GB: order ~100 GB RSS / 
 ./bench_ablation.sh
 ./native/bin/lomc .bench_out/fixture_100MB.xml
 ./native/bin/lomc .bench_out/fixture_1GB.xml
+./bench_20gb.sh
 ```

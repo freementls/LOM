@@ -2,25 +2,47 @@
 #include "lom_fss.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 const char *lom_version(void) {
-	return "0.2.3-pscan";
+	return "0.2.4-opensmap";
 }
 
 void lom_scan_result_init(lom_scan_result *r) {
 	memset(r, 0, sizeof(*r));
 	r->status = LOM_OK;
+	r->opens_fd = -1;
+}
+
+static void opens_release(lom_scan_result *r) {
+	if(!r) return;
+	if(r->opens_is_mmap && r->opens) {
+		munmap(r->opens, r->opens_map_bytes ? r->opens_map_bytes : r->open_cap * sizeof(lom_open_row));
+	} else {
+		free(r->opens);
+	}
+	if(r->opens_fd >= 0) {
+		close(r->opens_fd);
+	}
+	r->opens = NULL;
+	r->open_count = 0;
+	r->open_cap = 0;
+	r->opens_fd = -1;
+	r->opens_map_bytes = 0;
+	r->opens_is_mmap = 0;
 }
 
 void lom_scan_result_free(lom_scan_result *r) {
 	if(!r) return;
-	free(r->opens);
+	opens_release(r);
 	free(r->attrs);
 	free(r->string_blob);
 	free(r->string_offs);
@@ -41,6 +63,91 @@ static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need) {
 	*ptr = p;
 	*cap = ncap;
 	return true;
+}
+
+/* Prefer file-backed opens once the document is large enough that a heap
+ * open table would dominate RSS. LOM_OPEN_MMAP=0 disables; =1 forces. */
+static int opens_mmap_wanted(size_t code_span) {
+	const char *v = getenv("LOM_OPEN_MMAP");
+	if(v && v[0]) {
+		if(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N')
+			return 0;
+		return 1;
+	}
+	return code_span >= (size_t)512 * 1024 * 1024;
+}
+
+static bool opens_ensure(lom_scan_result *r, size_t need, size_t code_span_hint) {
+	if(need <= r->open_cap) return true;
+	size_t ncap = r->open_cap ? r->open_cap : 64;
+	while(ncap < need) ncap *= 2;
+	size_t nbytes = ncap * sizeof(lom_open_row);
+
+	if(r->opens_is_mmap || (!r->opens && opens_mmap_wanted(code_span_hint))) {
+		if(!r->opens_is_mmap) {
+			char tmpl[512];
+			const char *dir = getenv("LOM_OPEN_TMPDIR");
+			if(!dir || !dir[0]) dir = getenv("TMPDIR");
+			/* /tmp is often small tmpfs — prefer /var/tmp for multi-GB open tables. */
+			if(!dir || !dir[0] || strcmp(dir, "/tmp") == 0) dir = "/var/tmp";
+			snprintf(tmpl, sizeof(tmpl), "%s/lom_opens_XXXXXX", dir);
+			int fd = mkstemp(tmpl);
+			if(fd < 0) {
+				snprintf(tmpl, sizeof(tmpl), "/tmp/lom_opens_XXXXXX");
+				fd = mkstemp(tmpl);
+			}
+			if(fd < 0) return false;
+			unlink(tmpl);
+			if(ftruncate(fd, (off_t)nbytes) != 0) {
+				close(fd);
+				return false;
+			}
+			void *p = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			if(p == MAP_FAILED) {
+				close(fd);
+				return false;
+			}
+			r->opens = p;
+			r->opens_fd = fd;
+			r->opens_map_bytes = nbytes;
+			r->opens_is_mmap = 1;
+			r->open_cap = ncap;
+			return true;
+		}
+		if(ftruncate(r->opens_fd, (off_t)nbytes) != 0) return false;
+#ifdef MREMAP_MAYMOVE
+		void *np = mremap(r->opens, r->opens_map_bytes, nbytes, MREMAP_MAYMOVE);
+		if(np == MAP_FAILED) return false;
+#else
+		void *np = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, r->opens_fd, 0);
+		if(np == MAP_FAILED) return false;
+		munmap(r->opens, r->opens_map_bytes);
+#endif
+		r->opens = np;
+		r->opens_map_bytes = nbytes;
+		r->open_cap = ncap;
+		return true;
+	}
+
+	lom_open_row *p = realloc(r->opens, nbytes);
+	if(!p) return false;
+	r->opens = p;
+	r->open_cap = ncap;
+	return true;
+}
+
+static void opens_dontneed_prefix(lom_scan_result *r, size_t live_lo) {
+	if(!r || !r->opens_is_mmap || !r->opens || live_lo < 4096) return;
+	size_t bytes = (live_lo * sizeof(lom_open_row)) & ~(size_t)4095;
+	if(bytes < 4096) return;
+	(void)madvise(r->opens, bytes, MADV_DONTNEED);
+}
+
+static void code_dontneed_prefix(const char *code, size_t code_is_mmap, size_t live_lo) {
+	if(!code || !code_is_mmap || live_lo < (size_t)1024 * 1024) return;
+	size_t bytes = live_lo & ~(size_t)((1u << 20) - 1); /* 1MiB align */
+	if(bytes < (size_t)1024 * 1024) return;
+	(void)madvise((void *)(uintptr_t)code, bytes, MADV_DONTNEED);
 }
 
 typedef struct {
@@ -283,13 +390,13 @@ static lom_status scan_bytes(
 
 	size_t span = (hi > lo) ? (hi - lo) : 0;
 	size_t est_opens = span / 24 + 64;
-	if(est_opens > 0 && !grow_cap((void **)&out->opens, sizeof(lom_open_row), &out->open_cap, out->open_count + est_opens)) {
+	if(est_opens > 0 && !opens_ensure(out, out->open_count + est_opens, span)) {
 		intern_free(&intern);
 		out->status = LOM_ERR_NOMEM;
 		return LOM_ERR_NOMEM;
 	}
-	size_t est_attrs = est_opens / 2 + 64;
-	if(!grow_cap((void **)&out->attrs, sizeof(lom_attr_row), &out->attr_cap, out->attr_count + est_attrs)) {
+	size_t est_attrs = capture_attributes ? (est_opens / 2 + 64) : 0;
+	if(est_attrs && !grow_cap((void **)&out->attrs, sizeof(lom_attr_row), &out->attr_cap, out->attr_count + est_attrs)) {
 		intern_free(&intern);
 		out->status = LOM_ERR_NOMEM;
 		return LOM_ERR_NOMEM;
@@ -299,6 +406,10 @@ static lom_status scan_bytes(
 	size_t *ostack = NULL;
 	size_t ostack_n = 0, ostack_cap = 0;
 	size_t offset = lo;
+	size_t last_open_advise = 0;
+	size_t last_code_advise = lo;
+	/* Hint: caller may pass mmap'd code; DONTNEED is safe on file-backed maps. */
+	int code_may_dontneed = (span >= (size_t)64 * 1024 * 1024);
 
 	while(offset < hi) {
 		const char *p = (const char *)memchr(code + offset, '<', hi - offset);
@@ -358,7 +469,7 @@ static lom_status scan_bytes(
 			continue;
 		}
 
-		if(!grow_cap((void **)&out->opens, sizeof(lom_open_row), &out->open_cap, out->open_count + 1)) {
+		if(!opens_ensure(out, out->open_count + 1, span)) {
 			intern_free(&intern);
 			free(ostack);
 			out->status = LOM_ERR_NOMEM;
@@ -408,11 +519,34 @@ static lom_status scan_bytes(
 			ostack[ostack_n++] = oi;
 		}
 		offset = tag_end + 1;
+
+		/* Drop completed open-table / document prefixes to keep RSS low on huge files. */
+		if(out->opens_is_mmap && out->open_count - last_open_advise > 65536) {
+			size_t live = out->open_count;
+			for(size_t s = 0; s < ostack_n; s++) {
+				if(ostack[s] < live) live = ostack[s];
+			}
+			if(live > last_open_advise + 4096) {
+				opens_dontneed_prefix(out, live);
+				last_open_advise = live;
+			}
+		}
+		if(code_may_dontneed && offset - last_code_advise > (size_t)8 * 1024 * 1024) {
+			code_dontneed_prefix(code, 1, offset > (size_t)2 * 1024 * 1024 ? offset - (size_t)2 * 1024 * 1024 : 0);
+			last_code_advise = offset;
+		}
 	}
 
 	while(ostack_n > 0) {
 		size_t oi = ostack[--ostack_n];
 		out->opens[oi].node_end_off = (int64_t)(hi ? hi - 1 : 0);
+	}
+
+	if(out->opens_is_mmap && out->open_count > 0) {
+		opens_dontneed_prefix(out, out->open_count);
+	}
+	if(code_may_dontneed && hi > lo) {
+		code_dontneed_prefix(code, 1, hi);
 	}
 
 	intern_free(&intern);
@@ -423,8 +557,26 @@ static lom_status scan_bytes(
 
 static void scan_trim(lom_scan_result *out) {
 	if(out->open_count && out->open_cap > out->open_count) {
-		lom_open_row *slim = realloc(out->opens, out->open_count * sizeof(lom_open_row));
-		if(slim) { out->opens = slim; out->open_cap = out->open_count; }
+		if(out->opens_is_mmap) {
+			size_t nbytes = out->open_count * sizeof(lom_open_row);
+			if(nbytes == 0) nbytes = sizeof(lom_open_row);
+			if(ftruncate(out->opens_fd, (off_t)nbytes) == 0) {
+#ifdef MREMAP_MAYMOVE
+				void *np = mremap(out->opens, out->opens_map_bytes, nbytes, MREMAP_MAYMOVE);
+				if(np != MAP_FAILED) {
+					out->opens = np;
+					out->opens_map_bytes = nbytes;
+					out->open_cap = out->open_count;
+				}
+#else
+				out->opens_map_bytes = nbytes;
+				out->open_cap = out->open_count;
+#endif
+			}
+		} else {
+			lom_open_row *slim = realloc(out->opens, out->open_count * sizeof(lom_open_row));
+			if(slim) { out->opens = slim; out->open_cap = out->open_count; }
+		}
 	}
 	if(out->attr_count && out->attr_cap > out->attr_count) {
 		lom_attr_row *slim = realloc(out->attrs, out->attr_count * sizeof(lom_attr_row));
@@ -589,7 +741,7 @@ static bool merge_piece(lom_scan_result *dst, lom_scan_result *src, int32_t root
 	}
 
 	size_t open_base = dst->open_count;
-	if(!grow_cap((void **)&dst->opens, sizeof(lom_open_row), &dst->open_cap, open_base + src->open_count)) {
+	if(!opens_ensure(dst, open_base + src->open_count, 0)) {
 		free(idmap); return false;
 	}
 	for(size_t i = 0; i < src->open_count; i++) {
@@ -760,7 +912,7 @@ static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_resu
 		root.name_id = rid;
 		root.parent_idx = -1;
 		root.node_end_off = (int64_t)root_end;
-		if(!grow_cap((void **)&out->opens, sizeof(lom_open_row), &out->open_cap, 1)) {
+		if(!opens_ensure(out, 1, 0)) {
 			lom_scan_result_free(&pref); intern_free(&intern);
 			for(size_t i = 0; i < jobs; i++) lom_scan_result_free(&js[i].local);
 			free(js); free(th); return LOM_ERR_NOMEM;

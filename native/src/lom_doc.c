@@ -114,6 +114,8 @@ static void doc_rebuild_fstr(lom_doc *d) {
 		d->fstr = NULL;
 	}
 	if(!d->use_fstr || !d->code || d->code_len < 4096) return;
+	/* Signatures walk every byte and store per-span blooms — skip on huge docs. */
+	if(d->code_len >= (size_t)256 * 1024 * 1024) return;
 	d->fstr = lom_fstr_build(
 		d->code, d->code_len,
 		d->scan.opens, d->scan.open_count,
@@ -163,6 +165,24 @@ static void doc_fmem_ingest_strings(lom_doc *d) {
 }
 
 static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need);
+
+/* Splice mutates the open table with realloc/memmove — copy mmap'd opens to heap first. */
+static bool doc_opens_to_heap(lom_doc *d) {
+	if(!d->scan.opens_is_mmap) return true;
+	size_t n = d->scan.open_count;
+	size_t bytes = (n ? n : 1) * sizeof(lom_open_row);
+	lom_open_row *p = malloc(bytes);
+	if(!p) return false;
+	if(n) memcpy(p, d->scan.opens, n * sizeof(lom_open_row));
+	munmap(d->scan.opens, d->scan.opens_map_bytes ? d->scan.opens_map_bytes : bytes);
+	if(d->scan.opens_fd >= 0) close(d->scan.opens_fd);
+	d->scan.opens = p;
+	d->scan.open_cap = n ? n : 1;
+	d->scan.opens_fd = -1;
+	d->scan.opens_map_bytes = 0;
+	d->scan.opens_is_mmap = 0;
+	return true;
+}
 
 void lom_match_list_init(lom_match_list *m) {
 	memset(m, 0, sizeof(*m));
@@ -235,18 +255,27 @@ static size_t find_open_index(const lom_doc *d, int64_t open_off) {
 	return (size_t)-1;
 }
 
+static void aux_opens_dontneed(lom_doc *d, size_t upto) {
+	if(!d->scan.opens_is_mmap || !d->scan.opens || upto < 8192) return;
+	size_t bytes = (upto * sizeof(lom_open_row)) & ~(size_t)4095;
+	if(bytes >= 4096) (void)madvise(d->scan.opens, bytes, MADV_DONTNEED);
+}
+
 static bool doc_rebuild_aux(lom_doc *d) {
 	doc_clear_aux(d);
 	size_t n = d->scan.open_count;
 	size_t nstr = d->scan.string_count;
 	if(n > UINT32_MAX) return false;
 	d->aux_open_count = n;
+	/* Full CSR is ~8 bytes/open; on huge docs prefer tag-row + parent filter. */
+	int build_csr = env_flag_on("LOM_CSR", n < (size_t)100000000);
 
 	/* Only index name_ids that appear on opens — not every interned attr value. */
 	uint32_t max_tag_nid = 0;
 	for(size_t i = 0; i < n; i++) {
 		uint32_t nid = d->scan.opens[i].name_id;
 		if(nid > max_tag_nid) max_tag_nid = nid;
+		if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
 	}
 	size_t tag_slots = (size_t)max_tag_nid + 1;
 	if(tag_slots > nstr) tag_slots = nstr;
@@ -258,6 +287,7 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	for(size_t i = 0; i < n; i++) {
 		uint32_t nid = d->scan.opens[i].name_id;
 		if(nid < tag_slots) d->tag_row_counts[nid]++;
+		if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
 	}
 	for(size_t nid = 0; nid < tag_slots; nid++) {
 		if(d->tag_row_counts[nid] == 0) continue;
@@ -269,6 +299,7 @@ static bool doc_rebuild_aux(lom_doc *d) {
 		uint32_t nid = d->scan.opens[i].name_id;
 		if(nid >= tag_slots) continue;
 		d->tag_rows[nid][d->tag_row_counts[nid]++] = (uint32_t)i;
+		if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
 	}
 
 	/* LOM_PARALLEL is honored in lom_scan_indexes (piece-local sibling scans +
@@ -277,41 +308,55 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	 * host (range-find + merge tax) — left opt-in for further tuning. */
 	(void)d->use_parallel;
 
-	uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));
-	if(!counts) return false;
 	size_t root_n = 0;
 	for(size_t i = 0; i < n; i++) {
 		if(d->scan.opens[i].parent_idx < 0) root_n++;
-		else {
-			int32_t pi = d->scan.opens[i].parent_idx;
-			if(pi >= 0 && (size_t)pi < n) counts[(size_t)pi]++;
-		}
+		if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
 	}
-	d->child_start = malloc((n + 1) * sizeof(uint32_t));
-	if(!d->child_start) { free(counts); return false; }
-	uint32_t run = 0;
-	for(size_t i = 0; i < n; i++) {
-		d->child_start[i] = run;
-		run += counts[i];
-		counts[i] = 0;
-	}
-	d->child_start[n] = run;
-	d->child_at = run ? malloc(run * sizeof(uint32_t)) : NULL;
-	if(run && !d->child_at) { free(counts); return false; }
 	d->root_children = root_n ? malloc(root_n * sizeof(uint32_t)) : NULL;
-	if(root_n && !d->root_children) { free(counts); return false; }
+	if(root_n && !d->root_children) return false;
 	d->root_child_count = 0;
 	for(size_t i = 0; i < n; i++) {
-		int32_t parent = d->scan.opens[i].parent_idx;
-		if(parent < 0) {
+		if(d->scan.opens[i].parent_idx < 0)
 			d->root_children[d->root_child_count++] = (uint32_t)i;
-			continue;
-		}
-		if((size_t)parent >= n) continue;
-		uint32_t slot = d->child_start[(size_t)parent] + counts[(size_t)parent]++;
-		d->child_at[slot] = (uint32_t)i;
+		if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
 	}
-	free(counts);
+
+	if(build_csr) {
+		uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));
+		if(!counts) return false;
+		for(size_t i = 0; i < n; i++) {
+			int32_t pi = d->scan.opens[i].parent_idx;
+			if(pi >= 0 && (size_t)pi < n) counts[(size_t)pi]++;
+			if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
+		}
+		d->child_start = malloc((n + 1) * sizeof(uint32_t));
+		if(!d->child_start) { free(counts); return false; }
+		uint32_t run = 0;
+		for(size_t i = 0; i < n; i++) {
+			d->child_start[i] = run;
+			run += counts[i];
+			counts[i] = 0;
+		}
+		d->child_start[n] = run;
+		d->child_at = run ? malloc(run * sizeof(uint32_t)) : NULL;
+		if(run && !d->child_at) { free(counts); return false; }
+		for(size_t i = 0; i < n; i++) {
+			int32_t parent = d->scan.opens[i].parent_idx;
+			if(parent < 0) continue;
+			if((size_t)parent >= n) continue;
+			uint32_t slot = d->child_start[(size_t)parent] + counts[(size_t)parent]++;
+			d->child_at[slot] = (uint32_t)i;
+			if((i & 65535u) == 65535u) aux_opens_dontneed(d, i > 8192 ? i - 8192 : 0);
+		}
+		free(counts);
+	}
+
+	/* Drop open-table pages after indexes are built — queries fault what they need. */
+	if(d->scan.opens_is_mmap && d->scan.opens && d->scan.open_count) {
+		size_t bytes = d->scan.open_count * sizeof(lom_open_row);
+		(void)madvise(d->scan.opens, bytes, MADV_DONTNEED);
+	}
 
 	uint32_t max_attr_nid = 0;
 	for(size_t i = 0; i < d->scan.attr_count; i++) {
@@ -365,7 +410,8 @@ static bool doc_ensure_writable(lom_doc *d) {
 }
 
 static lom_status doc_reindex(lom_doc *d) {
-	lom_status st = lom_scan_indexes(d->code, d->code_len, &d->scan, true);
+	int capture_attrs = env_flag_on("LOM_ATTRS", d->code_len < (size_t)512 * 1024 * 1024);
+	lom_status st = lom_scan_indexes(d->code, d->code_len, &d->scan, capture_attrs != 0);
 	if(st != LOM_OK) {
 		d->status = st;
 		snprintf(d->error, sizeof(d->error), "%s", d->scan.error);
@@ -1108,10 +1154,23 @@ static void collect_named_children(const lom_doc *d, const uint32_t *kids, size_
 }
 
 static void doc_child_range(const lom_doc *d, size_t oi, const uint32_t **kids, size_t *kn) {
+	if(!d->child_start || !d->child_at) {
+		*kids = NULL;
+		*kn = 0;
+		return;
+	}
 	uint32_t a = d->child_start[oi];
 	uint32_t b = d->child_start[oi + 1];
-	*kids = d->child_at ? d->child_at + a : NULL;
+	*kids = d->child_at + a;
 	*kn = (size_t)(b - a);
+}
+
+/* When CSR is absent (huge docs), expand children via tag-row ∩ parent filter. */
+static int parent_in_set(const size_t *cur, size_t cur_n, int32_t parent) {
+	if(parent < 0) return 0;
+	size_t p = (size_t)parent;
+	for(size_t i = 0; i < cur_n; i++) if(cur[i] == p) return 1;
+	return 0;
 }
 
 static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
@@ -1174,25 +1233,74 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 				}
 			}
 		} else {
-			for(size_t ci = 0; ci < cur_n; ci++) {
-				size_t parent_i = cur[ci];
-				size_t tmp_n = 0, tmp_cap = 0; size_t *tmp = NULL;
-				const uint32_t *kids = NULL; size_t kn = 0;
-				doc_child_range(d, parent_i, &kids, &kn);
-				collect_named_children(d, kids, kn, piece, &tmp, &tmp_n, &tmp_cap);
-				if(piece->index > 0) {
-					size_t pick = (size_t)piece->index - 1;
-					if(pick < tmp_n) {
-						grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
-						nxt[nxt_n++] = tmp[pick];
+			if(d->child_at && d->child_start) {
+				for(size_t ci = 0; ci < cur_n; ci++) {
+					size_t parent_i = cur[ci];
+					size_t tmp_n = 0, tmp_cap = 0; size_t *tmp = NULL;
+					const uint32_t *kids = NULL; size_t kn = 0;
+					doc_child_range(d, parent_i, &kids, &kn);
+					collect_named_children(d, kids, kn, piece, &tmp, &tmp_n, &tmp_cap);
+					if(piece->index > 0) {
+						size_t pick = (size_t)piece->index - 1;
+						if(pick < tmp_n) {
+							grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
+							nxt[nxt_n++] = tmp[pick];
+						}
+					} else {
+						for(size_t t = 0; t < tmp_n; t++) {
+							grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
+							nxt[nxt_n++] = tmp[t];
+						}
 					}
-				} else {
-					for(size_t t = 0; t < tmp_n; t++) {
+					free(tmp);
+				}
+			} else {
+				/* No CSR: filter tag rows by parent ∈ cur. */
+				int32_t nid = find_name_id(d, piece->name, piece->name_len);
+				if(nid >= 0 || (piece->name_len == 1 && piece->name[0] == '*')) {
+					size_t rc; uint32_t *rows = NULL;
+					if(piece->name_len == 1 && piece->name[0] == '*') {
+						rc = d->scan.open_count;
+					} else {
+						rows = d->tag_rows[nid];
+						rc = d->tag_row_counts[nid];
+					}
+					uint8_t *bits = NULL;
+					if(cur_n > 64 && d->scan.open_count > 0) {
+						size_t nb = (d->scan.open_count + 7) / 8;
+						bits = calloc(nb, 1);
+						if(bits) {
+							for(size_t ci = 0; ci < cur_n; ci++) {
+								size_t p = cur[ci];
+								if(p < d->scan.open_count) bits[p >> 3] |= (uint8_t)(1u << (p & 7));
+							}
+						}
+					}
+					for(size_t i = 0; i < rc; i++) {
+						size_t oi = rows ? rows[i] : i;
+						int32_t p = d->scan.opens[oi].parent_idx;
+						if(p < 0) continue;
+						if(bits) {
+							size_t pu = (size_t)p;
+							if(pu >= d->scan.open_count || !(bits[pu >> 3] & (1u << (pu & 7)))) continue;
+						} else if(!parent_in_set(cur, cur_n, p)) {
+							continue;
+						}
+						if(piece->has_attr && !row_has_attr(d, d->scan.opens[oi].open_off, piece)) continue;
+						if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
 						grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
-						nxt[nxt_n++] = tmp[t];
+						nxt[nxt_n++] = oi;
+					}
+					free(bits);
+					if(piece->index > 0 && nxt_n > 0) {
+						size_t pick = (size_t)piece->index - 1;
+						if(pick < nxt_n) {
+							size_t keep = nxt[pick];
+							nxt_n = 1;
+							nxt[0] = keep;
+						} else nxt_n = 0;
 					}
 				}
-				free(tmp);
 			}
 		}
 		free(cur);
@@ -1467,6 +1575,7 @@ static void remap_parent_after_insert(lom_scan_result *s, size_t insert_at, size
 /* Markup splice: drop opens in the removed span, scan only the insert, merge rows, rebuild CSR. */
 static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remove_len,
 	const char *insert, size_t insert_len) {
+	if(!doc_opens_to_heap(d)) return LOM_ERR_NOMEM;
 	int64_t lo = (int64_t)at;
 	int64_t hi = (int64_t)(at + remove_len);
 	if(remove_len && !splice_remove_is_complete(d, lo, hi)) return LOM_ERR_PARSE;

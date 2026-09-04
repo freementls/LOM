@@ -42,6 +42,10 @@ typedef struct lom_scan_result {
 	lom_open_row *opens;
 	size_t open_count;
 	size_t open_cap;
+	/* File-backed opens (large docs): pages can be dropped via MADV_DONTNEED. */
+	int opens_fd; /* -1 = heap */
+	size_t opens_map_bytes;
+	int opens_is_mmap;
 
 	lom_attr_row *attrs;
 	size_t attr_count;

@@ -91,11 +91,12 @@ After any comparison operator, `/pattern/flags` is a regex value (slash is not a
 | `!=` | empty |
 | numeric | captured group or match parses and compares |
 
-### 3.5 fmem / fcache / pieces
+### 3.5 fmem / fcache / pieces / fstr
 
 - **fmem:** optional L1 intern API retained; bulk ingest on construct was disabled after it proved harmful on high-cardinality docs (unique attr values) while queries use `string_blob` / name ids.
 - **fcache:** memo selector→match-list (native) and regex match arrays (PHP); cleared on invalidate / reindex.
 - **Native regex:** `liblom` compiles `/pattern/flags` with PCRE2 after comparison ops (same operator table as PHP). Patterns are extracted before `_` axis splits so underscores inside patterns stay intact. Selective document-level mapping is used when the leaf tag index is large enough.
+- **fstr (fractal string):** multi-scale view of \(C\) as a tree of spans (document → root children → tag-aligned blocks). Each node stores a 256-bit byte-presence mask and a 3-gram bloom. Cold `find` / regex-with-literal-probe walks only candidate spans (`LOM_FSTR`, default on for docs ≥4 KiB). Complements fractal *selection* (selective leaf first) with fractal *content geometry*.
 - **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice.
 - **parallel (`LOM_PARALLEL`):** default off. Piece-local sibling scan merges with name-only dedup (attr values appended). Correct vs serial; ~parity at 100 MB on this host; still slower at 1 GB — auto-serial outside 4 MB–256 MB. Shared-mutex intern and full-string rehash merges were worse. Not a claimed win.
 

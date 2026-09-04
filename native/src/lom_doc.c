@@ -47,11 +47,13 @@ struct lom_doc {
 	/* Accelerators */
 	lom_fmem *fmem;
 	lom_fcache *fcache;
+	lom_fstr *fstr;
 	size_t piece_starts[LOM_MAX_PIECES];
 	size_t piece_count;
 	uint8_t piece_dirty[LOM_MAX_PIECES];
 	int use_fmem;
 	int use_fcache;
+	int use_fstr;
 	int use_pieces;
 	int use_parallel;
 	lom_status status;
@@ -72,12 +74,15 @@ static int env_flag_on(const char *name, int default_on) {
 static void doc_init_accel(lom_doc *d) {
 	d->use_fmem = env_flag_on("LOM_FMEM", 1);
 	d->use_fcache = env_flag_on("LOM_FCACHE", 1);
+	/* Fractal string signatures for cold substring/regex prune; default on. */
+	d->use_fstr = env_flag_on("LOM_FSTR", 1);
 	d->use_pieces = env_flag_on("LOM_PIECES", 1);
 	/* Parallel tag-row build duplicates per-thread buffers; default off for RAM. */
 	d->use_parallel = env_flag_on("LOM_PARALLEL", 0);
 	d->mmap_fd = -1;
 	d->code_is_mmap = 0;
 	d->piece_count = 0;
+	d->fstr = NULL;
 	memset(d->piece_dirty, 0, sizeof(d->piece_dirty));
 	d->aux_dirty = 0;
 	if(d->use_fmem) {
@@ -97,6 +102,25 @@ static void doc_free_accel(lom_doc *d) {
 		lom_fcache_free(d->fcache);
 		d->fcache = NULL;
 	}
+	if(d->fstr) {
+		lom_fstr_free(d->fstr);
+		d->fstr = NULL;
+	}
+}
+
+static void doc_rebuild_fstr(lom_doc *d) {
+	if(d->fstr) {
+		lom_fstr_free(d->fstr);
+		d->fstr = NULL;
+	}
+	if(!d->use_fstr || !d->code || d->code_len < 4096) return;
+	d->fstr = lom_fstr_build(
+		d->code, d->code_len,
+		d->scan.opens, d->scan.open_count,
+		d->root_children, d->root_child_count,
+		d->child_at, d->child_start,
+		0
+	);
 }
 
 static void doc_rebuild_pieces(lom_doc *d) {
@@ -353,6 +377,7 @@ static lom_status doc_reindex(lom_doc *d) {
 		return LOM_ERR_NOMEM;
 	}
 	doc_rebuild_pieces(d);
+	doc_rebuild_fstr(d);
 	doc_fmem_ingest_strings(d);
 	if(d->use_fcache) {
 		if(d->fcache) lom_fcache_free(d->fcache);
@@ -372,6 +397,7 @@ static lom_status doc_ensure_aux(lom_doc *d) {
 		return LOM_ERR_NOMEM;
 	}
 	doc_fmem_ingest_strings(d);
+	doc_rebuild_fstr(d);
 	d->aux_dirty = 0;
 	return LOM_OK;
 }
@@ -914,22 +940,56 @@ static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match
 		size_t hit_cap = 1024, hit_n = 0;
 		PCRE2_SIZE *hits = malloc(hit_cap * sizeof(PCRE2_SIZE));
 		if(!hits) { pcre2_match_data_free(md); pcre2_code_free(re); return LOM_ERR_NOMEM; }
-		PCRE2_SIZE off = 0;
-		while(off <= d->code_len) {
-			int rc = pcre2_match(re, (PCRE2_SPTR)d->code, d->code_len, off, 0, md, NULL);
-			if(rc < 0) break;
-			PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
-			if(hit_n + 1 > hit_cap) {
-				hit_cap *= 2;
-				PCRE2_SIZE *nh = realloc(hits, hit_cap * sizeof(PCRE2_SIZE));
-				if(!nh) { free(hits); pcre2_match_data_free(md); pcre2_code_free(re); return LOM_ERR_NOMEM; }
-				hits = nh;
+		/* Cold prune: fractal string + literal probe → scan candidate spans only. */
+		uint8_t probe[128];
+		size_t probe_n = lom_fstr_regex_probe(slot->pattern, slot->pattern_len, probe, sizeof(probe));
+		int64_t span_lo[256], span_hi[256];
+		size_t nspans = 0;
+		if(d->fstr && probe_n >= 3) {
+			nspans = lom_fstr_candidate_spans(d->fstr, probe, probe_n, span_lo, span_hi, 256);
+			if(nspans == 0) {
+				free(hits);
+				pcre2_match_data_free(md);
+				pcre2_code_free(re);
+				return LOM_OK; /* probe impossible in doc */
 			}
-			hits[hit_n++] = ov[0];
-			PCRE2_SIZE me = ov[1];
-			off = (me == ov[0]) ? me + 1 : me;
-			if(off == 0) break;
-			if(hit_n > (k / 4) && hit_n > 512) { hit_n = 0; break; /* not selective */ }
+		}
+		if(nspans == 0 || nspans >= 256) {
+			span_lo[0] = 0;
+			span_hi[0] = (int64_t)d->code_len;
+			nspans = 1;
+		}
+		int abort_selective = 0;
+		for(size_t si = 0; si < nspans && !abort_selective; si++) {
+			if(span_lo[si] < 0 || span_hi[si] <= span_lo[si]) continue;
+			size_t slo = (size_t)span_lo[si];
+			size_t shi = (size_t)span_hi[si];
+			if(shi > d->code_len) shi = d->code_len;
+			if(slo >= shi) continue;
+			size_t pad = probe_n > 1 ? probe_n - 1 : 0;
+			size_t sa = slo > pad ? slo - pad : 0;
+			PCRE2_SIZE off = (PCRE2_SIZE)sa;
+			PCRE2_SIZE lim = (PCRE2_SIZE)shi;
+			while(off <= lim) {
+				int rc = pcre2_match(re, (PCRE2_SPTR)d->code, lim, off, 0, md, NULL);
+				if(rc < 0) break;
+				PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+				if(hit_n + 1 > hit_cap) {
+					hit_cap *= 2;
+					PCRE2_SIZE *nh = realloc(hits, hit_cap * sizeof(PCRE2_SIZE));
+					if(!nh) { free(hits); pcre2_match_data_free(md); pcre2_code_free(re); return LOM_ERR_NOMEM; }
+					hits = nh;
+				}
+				hits[hit_n++] = ov[0];
+				PCRE2_SIZE me = ov[1];
+				off = (me == ov[0]) ? me + 1 : me;
+				if(off == 0) break;
+				if(hit_n > (k / 4) && hit_n > 512) {
+					hit_n = 0;
+					abort_selective = 1;
+					break;
+				}
+			}
 		}
 		if(hit_n > 0) {
 			uint8_t *seen = calloc(d->scan.open_count ? d->scan.open_count : 1, 1);
@@ -1587,6 +1647,7 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 		d->code[d->code_len] = 0;
 		shift_scan_offsets(&d->scan, (int64_t)at, (int64_t)insert_len - (int64_t)remove_len);
 		doc_rebuild_pieces(d);
+		doc_rebuild_fstr(d);
 		d->status = LOM_OK;
 		d->error[0] = 0;
 		return LOM_OK;

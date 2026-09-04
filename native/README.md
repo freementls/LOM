@@ -12,7 +12,7 @@ make -C native
 
 Native child selectors use **`_`** (`region_zone_entity`) for direct children and **`__`** for descendants. Tag names containing `_` must be encoded. `/` is reserved for regex values in the PHP API.
 
-## Accelerators (fmem / fcache / pieces)
+## Accelerators (fmem / fcache / pieces / fstr)
 
 `lom_doc_create_file` prefers **mmap**. Aux indexes use **CSR children** + exact-sized `uint32` tag/attr rows (large RAM win). Env toggles:
 
@@ -21,6 +21,7 @@ Native child selectors use **`_`** (`region_zone_entity`) for direct children an
 | `LOM_FMEM=0` | on | Disable string table (views into `string_blob`, no duplicate copies) |
 | `LOM_FCACHE=0` | on | Disable selector result memo |
 | `LOM_PIECES=0` | on | Disable tag-aligned piece split |
+| `LOM_FSTR=0` | on (≥4 KiB docs) | Disable fractal-string signatures (cold substring/regex prune) |
 | `LOM_PARALLEL=1` | **off** | Piece-local sibling scan; name-only merge. ~parity at 100 MB here; auto-serial outside 4 MB–256 MB. |
 
 Ablations: `../bench_ablation.sh [fixture]`.

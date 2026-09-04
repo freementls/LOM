@@ -7,15 +7,19 @@ LDLIBS = -lm -lpthread -lpcre2-8 -ldl
 LIB = lib/liblom.so
 LOMC = bin/lomc
 LOMD = bin/lomd
-OBJS = src/lom_scan.o src/lom_doc.o src/lom_fmem.o src/lom_fcache.o
+OBJS = src/lom_scan.o src/lom_doc.o src/lom_fmem.o src/lom_fcache.o src/lom_fstr.o
 
-.PHONY: all clean test-scan php-ext test-fmem test-regex
+.PHONY: all clean test-scan php-ext test-fmem test-regex test-fstr
 
 all: $(LIB) $(LOMC) $(LOMD)
 
 test-regex: $(LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o bin/test_regex src/test_regex.c -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom $(LDLIBS)
 	./bin/test_regex
+
+test-fstr: $(LIB)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o bin/test_fstr src/test_fstr.c -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom $(LDLIBS)
+	./bin/test_fstr
 
 test-fmem: $(LIB)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o bin/test_fmem_fcache src/test_fmem_fcache.c -Llib -Wl,-rpath,'$$ORIGIN/../lib' -llom $(LDLIBS)
@@ -47,6 +51,7 @@ src/%.o: src/%.c
 src/lom_scan.o src/lom_doc.o: include/lom.h
 src/lom_fmem.o: include/lom_fmem.h
 src/lom_fcache.o: include/lom_fcache.h
+src/lom_fstr.o: include/lom_fstr.h
 
 clean:
 	rm -f src/*.o $(LIB) $(LOMC) $(LOMD)

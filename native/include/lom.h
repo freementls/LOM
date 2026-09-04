@@ -114,9 +114,10 @@ LOM_API lom_status lom_doc_set_child_text_offset(lom_doc *doc, int64_t open_off,
 
 LOM_API const char *lom_version(void);
 
-/* Optional accelerators — see lom_fmem.h / lom_fcache.h */
+/* Optional accelerators — see lom_fmem.h / lom_fcache.h / lom_fstr.h */
 #include "lom_fmem.h"
 #include "lom_fcache.h"
+#include "lom_fstr.h"
 
 #ifdef __cplusplus
 }

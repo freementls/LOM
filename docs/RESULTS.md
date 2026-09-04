@@ -47,6 +47,10 @@ Depth-1 sibling ranges → per-piece scan → merge that **dedups only tag/attr 
 
 `LOM_PARALLEL=1` atomic CSR workers: slower (contention). Piece-local scan (name-only merge): correct; ~parity at 100 MB; slower at 1 GB — see § above. Default off.
 
+## Fractal string (`lom_fstr`, `LOM_FSTR`)
+
+Hierarchical spans (document → root children → tag-aligned blocks) with per-node byte-presence + 3-gram bloom signatures. Cold exact find / regex-with-literal-probe prune impossible subtrees before `memmem`/PCRE. Built on construct for docs ≥4 KiB (default on; `LOM_FSTR=0` to disable). Helps selective cold scans; not a substitute for tag/CSR indexes.
+
 ## C# connectors
 
 `connectors/csharp/Lom.Native` now exposes `Get`; demos:

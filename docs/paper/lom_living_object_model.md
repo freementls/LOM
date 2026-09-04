@@ -97,7 +97,7 @@ After any comparison operator, `/pattern/flags` is a regex value (slash is not a
 - **fcache:** memo selector→match-list (native) and regex match arrays (PHP); cleared on invalidate / reindex.
 - **Native regex:** `liblom` compiles `/pattern/flags` with PCRE2 after comparison ops (same operator table as PHP). Patterns are extracted before `_` axis splits so underscores inside patterns stay intact. Selective document-level mapping is used when the leaf tag index is large enough.
 - **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice.
-- **parallel (`LOM_PARALLEL`):** default off. Shared-atomic CSR count workers were tried and **slowed** 100 MB–1 GB construct (cache-line contention; fill must stay ordered for `[n]`). Left as a hook for future piece-local scan merge, not a claimed win.
+- **parallel (`LOM_PARALLEL`):** default off. (1) Shared-atomic CSR count workers slowed construct (cache-line contention). (2) Piece-local sibling scan + local intern merge is **correct** vs serial on fixtures but has not beaten serial wall time here (extra range passes + string remapping; mutex-shared intern contended worse). Auto-serial at ≥256 MB. Not a claimed win.
 
 ## 4. Complexity (expected)
 

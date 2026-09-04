@@ -25,6 +25,10 @@ PHP 100 MB (`memory_limit=512M`): construct lazy **~134 MB**; `region` via s
 
 Root cause: ingesting ~3.9M unique strings into a 2048-bucket fmem table was \(O(n^2)\); query paths never read fmem. Aux tag/attr indexes now size by max *name* id, not full string table.
 
+### `LOM_PARALLEL` piece-local scan (opt-in, not a win yet)
+
+Depth-1 sibling ranges → per-piece `scan_bytes` → string-table merge. Open counts / `region` / descendant matches match serial on test + 1 MB + 100 MB. On this host construct is **not** faster (100 MB ~0.9–1.1 s serial vs ~1.1–1.8 s parallel; ≥256 MB auto-falls back to serial). Shared-mutex intern was worse (lock contention). Still default **off**.
+
 ## Writes (native)
 
 | Op | 100 MB | 1 GB |

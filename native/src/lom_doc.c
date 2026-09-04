@@ -247,9 +247,10 @@ static bool doc_rebuild_aux(lom_doc *d) {
 		d->tag_rows[nid][d->tag_row_counts[nid]++] = (uint32_t)i;
 	}
 
-	/* LOM_PARALLEL atomic shared-count workers were measured slower on 100MB–1GB
-	 * (cache-line contention). Fill must stay ordered for sibling [n]. Reserved for
-	 * future piece-local scan merge. */
+	/* LOM_PARALLEL is honored in lom_scan_indexes (piece-local sibling scans +
+	 * string-table merge). Shared-atomic CSR fill was tried earlier and lost;
+	 * piece-local scan is correct but has not beaten serial construct on this
+	 * host (range-find + merge tax) — left opt-in for further tuning. */
 	(void)d->use_parallel;
 
 	uint32_t *counts = calloc(n ? n : 1, sizeof(uint32_t));

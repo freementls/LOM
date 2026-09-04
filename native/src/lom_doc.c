@@ -129,15 +129,10 @@ static void doc_mark_dirty_at(lom_doc *d, size_t offset) {
 }
 
 static void doc_fmem_ingest_strings(lom_doc *d) {
-	/* Scan already interns into string_blob. Copying into fmem doubled RAM for no hit
-	 * benefit. Use zero-copy views so identical lookups share blob pointers without malloc. */
-	if(!d->fmem || !d->use_fmem) return;
-	if(!lom_fmem_roi_ok(d->fmem, 0.05, 64)) return;
-	for(size_t i = 0; i < d->scan.string_count; i++) {
-		const char *s = lom_scan_string(&d->scan, (uint32_t)i);
-		size_t n = strlen(s);
-		if(n >= 8) (void)lom_fmem_intern_view(d->fmem, s, n);
-	}
+	/* Query paths use scan name_ids / string_blob, not fmem lookups. Bulk-ingesting
+	 * millions of unique attr values into a small hash table was O(n²) and dominated
+	 * 1GB construct (~minutes). Keep fmem available for explicit callers; skip ingest. */
+	(void)d;
 }
 
 static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need);
@@ -219,17 +214,26 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	size_t nstr = d->scan.string_count;
 	if(n > UINT32_MAX) return false;
 	d->aux_open_count = n;
-	d->tag_row_slots = nstr;
-	d->tag_rows = calloc(nstr ? nstr : 1, sizeof(uint32_t *));
-	d->tag_row_counts = calloc(nstr ? nstr : 1, sizeof(uint32_t));
+
+	/* Only index name_ids that appear on opens — not every interned attr value. */
+	uint32_t max_tag_nid = 0;
+	for(size_t i = 0; i < n; i++) {
+		uint32_t nid = d->scan.opens[i].name_id;
+		if(nid > max_tag_nid) max_tag_nid = nid;
+	}
+	size_t tag_slots = (size_t)max_tag_nid + 1;
+	if(tag_slots > nstr) tag_slots = nstr;
+	d->tag_row_slots = tag_slots;
+	d->tag_rows = calloc(tag_slots ? tag_slots : 1, sizeof(uint32_t *));
+	d->tag_row_counts = calloc(tag_slots ? tag_slots : 1, sizeof(uint32_t));
 	if(!d->tag_rows || !d->tag_row_counts) return false;
 
 	/* Count tag rows, then allocate exact uint32 vectors (no doubling waste). */
 	for(size_t i = 0; i < n; i++) {
 		uint32_t nid = d->scan.opens[i].name_id;
-		if(nid < nstr) d->tag_row_counts[nid]++;
+		if(nid < tag_slots) d->tag_row_counts[nid]++;
 	}
-	for(size_t nid = 0; nid < nstr; nid++) {
+	for(size_t nid = 0; nid < tag_slots; nid++) {
 		if(d->tag_row_counts[nid] == 0) continue;
 		d->tag_rows[nid] = malloc(d->tag_row_counts[nid] * sizeof(uint32_t));
 		if(!d->tag_rows[nid]) return false;
@@ -237,7 +241,7 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	}
 	for(size_t i = 0; i < n; i++) {
 		uint32_t nid = d->scan.opens[i].name_id;
-		if(nid >= nstr) continue;
+		if(nid >= tag_slots) continue;
 		d->tag_rows[nid][d->tag_row_counts[nid]++] = (uint32_t)i;
 	}
 
@@ -281,16 +285,23 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	}
 	free(counts);
 
-	/* Attr opens: count then exact pack. */
-	d->attr_slots = nstr;
-	d->attr_opens = calloc(nstr ? nstr : 1, sizeof(uint32_t *));
-	d->attr_open_counts = calloc(nstr ? nstr : 1, sizeof(uint32_t));
+	/* Attr opens: size by max attr *name* id only (values dominate string_count). */
+	uint32_t max_attr_nid = 0;
+	for(size_t i = 0; i < d->scan.attr_count; i++) {
+		uint32_t anid = d->scan.attrs[i].name_id;
+		if(anid > max_attr_nid) max_attr_nid = anid;
+	}
+	size_t attr_slots = d->scan.attr_count ? ((size_t)max_attr_nid + 1) : 0;
+	if(attr_slots > nstr) attr_slots = nstr;
+	d->attr_slots = attr_slots;
+	d->attr_opens = calloc(attr_slots ? attr_slots : 1, sizeof(uint32_t *));
+	d->attr_open_counts = calloc(attr_slots ? attr_slots : 1, sizeof(uint32_t));
 	if(!d->attr_opens || !d->attr_open_counts) return false;
 	for(size_t i = 0; i < d->scan.attr_count; i++) {
 		uint32_t anid = d->scan.attrs[i].name_id;
-		if(anid < nstr) d->attr_open_counts[anid]++;
+		if(anid < attr_slots) d->attr_open_counts[anid]++;
 	}
-	for(size_t nid = 0; nid < nstr; nid++) {
+	for(size_t nid = 0; nid < attr_slots; nid++) {
 		if(d->attr_open_counts[nid] == 0) continue;
 		d->attr_opens[nid] = malloc(d->attr_open_counts[nid] * sizeof(uint32_t));
 		if(!d->attr_opens[nid]) return false;
@@ -298,9 +309,12 @@ static bool doc_rebuild_aux(lom_doc *d) {
 	}
 	for(size_t i = 0; i < d->scan.attr_count; i++) {
 		uint32_t anid = d->scan.attrs[i].name_id;
-		if(anid >= nstr) continue;
-		size_t oi = find_open_index(d, d->scan.attrs[i].open_off);
-		if(oi == (size_t)-1) continue;
+		if(anid >= attr_slots) continue;
+		size_t oi = (size_t)d->scan.attrs[i].open_idx;
+		if(oi >= n || d->scan.opens[oi].open_off != d->scan.attrs[i].open_off) {
+			oi = find_open_index(d, d->scan.attrs[i].open_off);
+			if(oi == (size_t)-1) continue;
+		}
 		d->attr_opens[anid][d->attr_open_counts[anid]++] = (uint32_t)oi;
 	}
 	return true;
@@ -1050,6 +1064,10 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 		if(tail) memmove(d->scan.opens + rm_lo, d->scan.opens + rm_hi, tail * sizeof(lom_open_row));
 		d->scan.open_count -= n_rm;
 		remap_parent_after_remove(&d->scan, rm_lo, rm_hi);
+		for(size_t i = 0; i < d->scan.attr_count; i++) {
+			uint32_t oi = d->scan.attrs[i].open_idx;
+			if(oi >= (uint32_t)rm_hi) d->scan.attrs[i].open_idx = oi - (uint32_t)n_rm;
+		}
 	}
 
 	/* Drop attrs whose open lived in the removed span (old coords) */
@@ -1074,6 +1092,10 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 			return LOM_ERR_NOMEM;
 		}
 		remap_parent_after_insert(&d->scan, insert_at, n_new);
+		for(size_t i = 0; i < d->scan.attr_count; i++) {
+			if(d->scan.attrs[i].open_idx >= (uint32_t)insert_at)
+				d->scan.attrs[i].open_idx += (uint32_t)n_new;
+		}
 		memmove(d->scan.opens + insert_at + n_new, d->scan.opens + insert_at,
 			(d->scan.open_count - insert_at) * sizeof(lom_open_row));
 		for(size_t i = 0; i < n_new; i++) {
@@ -1103,6 +1125,7 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 		for(size_t i = 0; i < frag.attr_count; i++) {
 			lom_attr_row a = frag.attrs[i];
 			a.open_off += (int64_t)at;
+			a.open_idx = (uint32_t)(insert_at + (size_t)a.open_idx);
 			const char *an = lom_scan_string(&frag, a.name_id);
 			const char *av = lom_scan_string(&frag, a.value_id);
 			uint32_t nid, vid;

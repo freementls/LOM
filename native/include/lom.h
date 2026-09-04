@@ -33,6 +33,7 @@ typedef struct lom_open_row {
 
 typedef struct lom_attr_row {
 	int64_t open_off;
+	uint32_t open_idx; /* index into opens[] at scan time */
 	uint32_t name_id;
 	uint32_t value_id;
 } lom_attr_row;

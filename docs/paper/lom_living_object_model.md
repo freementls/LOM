@@ -86,9 +86,9 @@ After any comparison operator, `/pattern/flags` is a regex value (slash is not a
 
 ### 3.5 fmem / fcache / pieces
 
-- **fmem:** L1 intern of repeated strings; ROI gate disables when hit rate stays poor.
+- **fmem:** optional L1 intern API retained; bulk ingest on construct was disabled after it proved harmful on high-cardinality docs (unique attr values) while queries use `string_blob` / name ids.
 - **fcache:** memo selector→match-list (native) and regex match arrays (PHP); cleared on invalidate / reindex.
-- **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice; parallel workers accumulate per-name tag rows then merge.
+- **pieces:** tag-aligned boundaries (`<` only); dirty mark on splice; parallel workers reserved (`LOM_PARALLEL`, default off for RAM).
 
 ## 4. Complexity (expected)
 
@@ -127,19 +127,17 @@ Indexed warm similarly collapses with fcache (≈0.00 ms vs ≈4.4 ms). fmem
 
 | Size | Bytes | Opens | Construct (ms) | Descendant cold (ms) | Descendant warm (ms) | set text (ms) | new_ (ms) |
 |------|-------|-------|----------------|----------------------|----------------------|---------------|-----------|
-| ~2.58 MB | 2.58e6 | 1.1e5 | ~29 | ~2.8 | ~0.03 | **~6** | **~7** |
-| 100 MB | 1.05e8 | 4.4e6 | **~3500** | ~180 | ~3 | **~275** | **~377** |
-| 1 GB | 1.07e9 | 44.8M | **~415000** | ~1450 | **~41** | **~1964** | **~2506** |
+| ~2.58 MB | 2.58e6 | 1.1e5 | ~30 | ~3 | ~0.03 | ~6 | ~7 |
+| 100 MB | 1.05e8 | 4.4e6 | **~1100** | ~180 | ~3 | ~296 | ~387 |
+| 1 GB | 1.07e9 | 44.8M | **~10500** | ~1650 | **~55** | ~2548 | ~3439 |
 
-**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes + view-fmem → ~385 MB load / ~2 MB after free. Peak during a full `lomc` 100 MB run ~528 MB. 1 GB load ~3.9 GB RSS; full `lomc` peak ~5.0 GB (earlier per-node child mallocs swapped toward ~14 GB and were aborted).
+**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes → ~385 MB load / ~2 MB after free. Peak `lomc` 100 MB ~528 MB; 1 GB peak ~5.0 GB.
 
-**Writes.** Structure-preserving `set` (no `<`) shifts offsets only. Markup `new_` merges open rows from a fragment scan and **defers CSR rebuild** to the next query (post-write get on 100 MB ~505 ms includes that rebuild). Mid-node cuts still full-reindex.
+**Construct.** An earlier bulk **fmem ingest** of every interned string into a fixed 2048-bucket table made 1 GB construct ~415 s (superlinear). Queries never consulted fmem; ingest is skipped. Tag/attr aux vectors are sized by max *name* id rather than the full string table (attr values dominate `string_count`). Scan alone was already ~6 s on 1 GB; full construct is now ~10.5 s.
 
-**Construct.** 1 GB construct (~7 min) is superlinear vs 100 MB (~3.5 s); treat as a capacity/throughput limit to improve (intern, allocator, piece-parallel scan), not as a claim of linear GB/s indexing.
+**Writes.** Structure-preserving `set` shifts offsets only. Markup `new_` merges open rows from a fragment scan and defers CSR rebuild to the next query.
 
-Parent uniqueness was \(O(k^2)\) and dominated early 100 MB runs (~28 s); hash-set uniqueness brings parent to sub-second for millions of matches.
-
-**PHP:** 1 MB and 2.58 MB complete under default memory. **100 MB PHP** slim path (`memory_limit=512M`): construct ~134 MB; `region` via slim tag index ~402 MB. Heavy parent indexes opt-in via `LOM_PHP_HEAVY_INDEX=1`. **1 GB PHP** cannot load via a single `file_get_contents` under a 1 G limit. Large-file story is **`liblom` + mmap + CSR**, not one PHP string.
+**PHP:** slim large-doc path under 512 M; prefer `liblom` above ~100 MB.
 
 ### 5.3 Regex (PHP, ~2.58 MB)
 
@@ -151,7 +149,7 @@ Same file, count all `name` nodes: LOM get ~451 ms vs DOM XPath ~19 ms vs XM
 
 ## 6. Threats to validity
 
-Single machine; synthetic fixture (regular region/zone/entity); native selector subset ≠ full PHP LOM; mid-node splices still full-reindex; 1 GB construct is currently superlinear; PHP depth maps blow memory on large files without slim/liblom paths; bake-offs are unfair as primary evidence.
+Single machine; synthetic fixture (regular region/zone/entity); native selector subset ≠ full PHP LOM; mid-node splices still full-reindex; PHP depth maps blow memory on large files without slim/liblom paths; bake-offs are unfair as primary evidence.
 
 ## 7. Availability
 
@@ -159,7 +157,7 @@ Apache License 2.0. Repository includes `O.php`, `native/liblom`, `lomc`, `lomd`
 
 ## 8. Conclusion
 
-LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields warm-query wins; **CSR + packed opens (`parent_idx`)** cut 100 MB RSS by ~3–4× vs per-node child lists; **incremental splice** (offset shift + local open merge + lazy CSR) makes text/`new_` writes practical through 1 GB; **mmap native** is what makes 100 MB–1 GB load at all; PHP remains the full-language reference for smaller documents.
+LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache** yields warm-query wins; **CSR + packed opens** cut RAM sharply; **skipping unused fmem bulk ingest** made 1 GB construct practical (~10 s vs ~7 min); **incremental splice** keeps writes usable at GB scale; PHP remains the full-language reference for smaller documents.
 
 ## References (selected)
 

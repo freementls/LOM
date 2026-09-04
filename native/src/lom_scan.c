@@ -6,7 +6,7 @@
 #include <string.h>
 
 const char *lom_version(void) {
-	return "0.2.0-full";
+	return "0.2.1-full";
 }
 
 void lom_scan_result_init(lom_scan_result *r) {
@@ -188,6 +188,7 @@ static bool scan_attrs_in_tag(
 	lom_intern *intern,
 	const char *code,
 	size_t open_off,
+	uint32_t open_idx,
 	size_t tag_end,
 	size_t after_name
 ) {
@@ -237,6 +238,7 @@ static bool scan_attrs_in_tag(
 			return false;
 		}
 		r->attrs[r->attr_count].open_off = (int64_t)open_off;
+		r->attrs[r->attr_count].open_idx = open_idx;
 		r->attrs[r->attr_count].name_id = nid;
 		r->attrs[r->attr_count].value_id = vid;
 		r->attr_count++;
@@ -258,6 +260,20 @@ lom_status lom_scan_indexes(
 	if(!intern_init(&intern, 1024)) {
 		out->status = LOM_ERR_NOMEM;
 		snprintf(out->error, sizeof(out->error), "intern alloc failed");
+		return LOM_ERR_NOMEM;
+	}
+
+	/* Pre-size opens from density (~1 open / 24 bytes on fixtures) to cut realloc copies. */
+	size_t est_opens = code_len / 24 + 64;
+	if(est_opens > 0 && !grow_cap((void **)&out->opens, sizeof(lom_open_row), &out->open_cap, est_opens)) {
+		intern_free(&intern);
+		out->status = LOM_ERR_NOMEM;
+		return LOM_ERR_NOMEM;
+	}
+	size_t est_attrs = est_opens / 2 + 64;
+	if(!grow_cap((void **)&out->attrs, sizeof(lom_attr_row), &out->attr_cap, est_attrs)) {
+		intern_free(&intern);
+		out->status = LOM_ERR_NOMEM;
 		return LOM_ERR_NOMEM;
 	}
 
@@ -358,7 +374,7 @@ lom_status lom_scan_indexes(
 			}
 			row->name_id = nid;
 			if(capture_attributes) {
-				if(!scan_attrs_in_tag(out, &intern, code, offset, tag_end, name_start + name_len)) {
+				if(!scan_attrs_in_tag(out, &intern, code, offset, (uint32_t)oi, tag_end, name_start + name_len)) {
 					intern_free(&intern);
 					free(ostack);
 					out->status = LOM_ERR_NOMEM;

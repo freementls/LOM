@@ -177,13 +177,13 @@ Gated runs on this host (`./bench_20gb.sh` + write continuation; file-backed ope
 | Indexed `region[10]_zone[5]_entity[7]_stats` | **137 s** (1 hit; no-CSR sibling groups) |
 | `name%=/Entity_1/` cold / warm | **32.5 s** / **113 ms** (11 111 111 hits) |
 | Parent of descendant | **65.1 s** (66 296 160) |
-| `set` small text | **137–212 s** (st=0; promotes mmap→heap + memmove) |
-| `new_` nested insert | **973 s** (st=0) |
+| `set` small text | **137–212 s** (pre–one-pass rewrite; see note) |
+| `new_` nested insert | **973 s** (pre–one-pass; was promote+memmove) |
 | Post-write read / `delete` / `validate` | **247 s** (n=1) / **287 s** / **89 s** (ok) |
 | Peak RSS | **~24.6 GiB** (query pass); **~34.3 GiB** (write pass) |
 | After `lom_doc_free` | **~2 MB** |
 
-Gate samples 1 GB construct RSS and requires ≥12 GiB `MemAvailable`. Open tables use tempfile `mmap` + `MADV_DONTNEED`. Child axis without CSR uses tag-row sibling groups / per-parent `[n]`. Attr filters without an attr index parse open-tag bytes. Full 20 GB file rewrite (`LOM_20GB_SAVE=1`) was not run.
+Gate samples 1 GB construct RSS and requires ≥12 GiB `MemAvailable`. Open tables use tempfile `mmap` + `MADV_DONTNEED`. Child axis without CSR uses tag-row sibling groups / per-parent `[n]`. Attr filters without an attr index parse open-tag bytes. Growth splices use one-pass rewrite (≥256 MB → tempfile under `LOM_OPEN_TMPDIR`). Full 20 GB file rewrite (`LOM_20GB_SAVE=1`) was not run.
 
 ### 5.5 Personal bake-off (not main table)
 

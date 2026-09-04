@@ -34,11 +34,11 @@ Depth-1 sibling ranges → per-piece scan → merge that **dedups only tag/attr 
 
 | Op | 100 MB | 1 GB | 20 GB |
 |----|--------|------|-------|
-| `set` text | ~296 ms | ~2.5 s | **~137–212 s** |
-| `new_` markup (local merge) | ~387 ms | ~3.4 s | **~973 s** |
-| `delete` | — | — | **~287 s** |
+| `set` text | ~1.2 s | ~4.0 s | **~137–212 s** (pre–one-pass) |
+| `new_` markup (local merge) | ~367 ms | ~4.6 s | **~973 s** (pre–one-pass) |
+| `delete` | ~0.4 s | ~3.7 s | **~287 s** |
 
-Same-size/shrink `set` on mmap can stay MAP_PRIVATE in-place (no full heap promote). Growth and `new_` still shift the contiguous tail.
+Same-size/shrink `set` on mmap stays MAP_PRIVATE in-place. Growth / `new_` use a **one-pass** prefix|insert|suffix rewrite (heap below 256 MB; tempfile mmap under `LOM_OPEN_TMPDIR` / `/var/tmp` above) instead of full promote + second `memmove`. 20 GB write times above are pre-rewrite; re-run `./bench_20gb.sh` to refresh.
 
 ## Queries (native)
 

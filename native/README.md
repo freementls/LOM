@@ -22,7 +22,7 @@ Native child selectors use **`_`** (`region_zone_entity`) for direct children an
 | `LOM_FCACHE=0` | on | Disable selector result memo |
 | `LOM_PIECES=0` | on | Disable tag-aligned piece split |
 | `LOM_FSTR=0` | on (≥4 KiB, off ≥256 MB) | Disable fractal-string signatures (cold substring/regex prune) |
-| `LOM_OPEN_MMAP=0` | on ≥512 MB | Heap open table instead of file-backed mmap + DONTNEED |
+| `LOM_OPEN_TMPDIR` | `/var/tmp` | Dir for open-table + large code-rewrite tempfiles (avoid `/tmp` tmpfs) |
 | `LOM_ATTRS=1` | off ≥512 MB | Force attribute capture on huge docs |
 | `LOM_CSR=0` | on (&lt;100 M opens) | Skip CSR; child axis uses tag-row ∩ parent |
 | `LOM_PARALLEL=1` | **off** | Piece-local sibling scan; name-only merge. ~parity at 100 MB here; auto-serial outside 4 MB–256 MB. |

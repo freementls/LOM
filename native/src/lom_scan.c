@@ -13,7 +13,7 @@
 #include <sys/mman.h>
 
 const char *lom_version(void) {
-	return "0.2.5-enc";
+	return "0.2.6-splice";
 }
 
 void lom_scan_result_init(lom_scan_result *r) {

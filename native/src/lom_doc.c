@@ -394,7 +394,7 @@ static bool doc_rebuild_aux(lom_doc *d) {
 
 static bool doc_ensure_writable(lom_doc *d) {
 	if(!d->code_is_mmap) return true;
-	/* MAP_PRIVATE COW — avoids an immediate 20GB malloc; splice grows via doc_code_reserve. */
+	/* MAP_PRIVATE COW — avoids an immediate 20GB malloc; growth uses one-pass rewrite. */
 	if(d->mmap_fd >= 0) {
 		void *p = mmap(NULL, d->code_len ? d->code_len : 1,
 			PROT_READ | PROT_WRITE, MAP_PRIVATE, d->mmap_fd, 0);
@@ -420,33 +420,137 @@ static bool doc_ensure_writable(lom_doc *d) {
 	return true;
 }
 
-/* Grow/promote document bytes; converts mmap/COW into a heap buffer when needed. */
-static bool doc_code_reserve(lom_doc *d, size_t need) {
-	if(!d->code_is_mmap && need <= d->code_cap) return true;
-	/* Drop faulted open-table pages so a huge code promote can fit in RAM. */
-	if(d->scan.opens_is_mmap && d->scan.opens && d->scan.open_count) {
-		size_t ob = d->scan.open_count * sizeof(lom_open_row);
-		(void)madvise(d->scan.opens, ob, MADV_DONTNEED);
-	}
-	char *nb = malloc(need);
-	if(!nb) return false;
-	size_t ncopy = d->code_len;
-	if(ncopy + 1 > need) ncopy = need ? need - 1 : 0;
-	if(ncopy) memcpy(nb, d->code, ncopy);
-	if(need > ncopy) nb[ncopy] = 0;
+#ifndef LOM_CODE_FILE_THRESHOLD
+/* Tempfile mmap for multi-GB rewrites; mid-size growth stays a one-pass heap copy. */
+#define LOM_CODE_FILE_THRESHOLD ((size_t)256 * 1024 * 1024)
+#endif
+
+static const char *doc_code_tmpdir(void) {
+	const char *dir = getenv("LOM_OPEN_TMPDIR");
+	/* /tmp is often small tmpfs — prefer /var/tmp for multi-GB rewrites. */
+	if(!dir || !dir[0] || strcmp(dir, "/tmp") == 0) return "/var/tmp";
+	return dir;
+}
+
+static size_t doc_code_map_bytes(const lom_doc *d) {
+	if(!d->code) return 0;
 	if(d->code_is_mmap) {
-		munmap(d->code, d->code_cap ? d->code_cap : (d->code_len ? d->code_len : 1));
-		if(d->mmap_fd >= 0) {
-			close(d->mmap_fd);
-			d->mmap_fd = -1;
-		}
+		if(d->code_cap) return d->code_cap;
+		return d->code_len ? d->code_len : 1;
+	}
+	return d->code_cap;
+}
+
+static void doc_code_release(lom_doc *d) {
+	if(!d->code) return;
+	if(d->code_is_mmap) {
+		munmap(d->code, doc_code_map_bytes(d));
+		if(d->mmap_fd >= 0) close(d->mmap_fd);
+		d->mmap_fd = -1;
 		d->code_is_mmap = 0;
 	} else {
 		free(d->code);
 	}
+	d->code = NULL;
+	d->code_cap = 0;
+}
+
+/* Copy src→dst in chunks; optionally drop already-copied source pages (mmap). */
+static void copy_bytes_chunked(char *dst, const char *src, size_t n, int src_is_mmap) {
+	const size_t CH = (size_t)8 * 1024 * 1024;
+	size_t off = 0;
+	while(off < n) {
+		size_t m = n - off;
+		if(m > CH) m = CH;
+		memcpy(dst + off, src + off, m);
+		off += m;
+		if(src_is_mmap && off >= CH) {
+			size_t drop = (off - (off % 4096));
+			if(drop >= CH)
+				(void)madvise((void *)src, drop - (CH / 2), MADV_DONTNEED);
+		}
+	}
+}
+
+/* One-pass prefix|insert|suffix into a new buffer (tempfile mmap when large).
+ * Avoids the old growth path of full promote memcpy + second full memmove. */
+static bool doc_code_rewrite_splice(lom_doc *d, size_t at, size_t remove_len,
+	const char *insert, size_t insert_len) {
+	size_t new_len = d->code_len - remove_len + insert_len;
+	size_t need = new_len + 1;
+	int prefer_file = new_len >= LOM_CODE_FILE_THRESHOLD;
+
+	if(d->scan.opens_is_mmap && d->scan.opens && d->scan.open_count) {
+		size_t ob = d->scan.open_count * sizeof(lom_open_row);
+		(void)madvise(d->scan.opens, ob, MADV_DONTNEED);
+	}
+
+	char *nb = NULL;
+	int nfd = -1;
+	int is_mmap = 0;
+
+	if(prefer_file) {
+		char tmpl[512];
+		snprintf(tmpl, sizeof(tmpl), "%s/lom_codeXXXXXX", doc_code_tmpdir());
+		nfd = mkstemp(tmpl);
+		if(nfd < 0) {
+			snprintf(tmpl, sizeof(tmpl), "/var/tmp/lom_codeXXXXXX");
+			nfd = mkstemp(tmpl);
+		}
+		if(nfd >= 0) {
+			unlink(tmpl);
+			if(ftruncate(nfd, (off_t)need) == 0) {
+				void *p = mmap(NULL, need, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
+				if(p != MAP_FAILED) {
+					nb = (char *)p;
+					is_mmap = 1;
+				}
+			}
+			if(!nb) {
+				close(nfd);
+				nfd = -1;
+			}
+		}
+	}
+	if(!nb) {
+		nb = malloc(need);
+		if(!nb) return false;
+	}
+
+	int src_mmap = d->code_is_mmap;
+	if(at) copy_bytes_chunked(nb, d->code, at, src_mmap);
+	if(insert_len) memcpy(nb + at, insert, insert_len);
+	size_t tail = d->code_len - at - remove_len;
+	if(tail) copy_bytes_chunked(nb + at + insert_len, d->code + at + remove_len, tail, src_mmap);
+	nb[new_len] = 0;
+
+	doc_code_release(d);
 	d->code = nb;
+	d->code_len = new_len;
 	d->code_cap = need;
+	d->code_is_mmap = is_mmap;
+	d->mmap_fd = nfd;
 	return true;
+}
+
+/* Apply splice to document bytes: in-place when capacity allows, else one-pass rewrite. */
+static bool doc_code_splice_bytes(lom_doc *d, size_t at, size_t remove_len,
+	const char *insert, size_t insert_len) {
+	size_t new_len = d->code_len - remove_len + insert_len;
+	int can_inplace = 0;
+	if(!d->code_is_mmap && new_len + 1 <= d->code_cap) can_inplace = 1;
+	/* Same-size/shrink on MAP_PRIVATE stays in the existing mapping. */
+	if(d->code_is_mmap && new_len <= d->code_len) can_inplace = 1;
+
+	if(can_inplace) {
+		memmove(d->code + at + insert_len, d->code + at + remove_len,
+			d->code_len - (at + remove_len));
+		if(insert_len) memcpy(d->code + at, insert, insert_len);
+		d->code_len = new_len;
+		if(!d->code_is_mmap && d->code_len < d->code_cap) d->code[d->code_len] = 0;
+		return true;
+	}
+	return doc_code_rewrite_splice(d, at, remove_len, insert, insert_len);
 }
 
 static lom_status doc_reindex(lom_doc *d) {
@@ -559,12 +663,7 @@ void lom_doc_free(lom_doc *doc) {
 	doc_clear_aux(doc);
 	lom_scan_result_free(&doc->scan);
 	doc_free_accel(doc);
-	if(doc->code_is_mmap) {
-		if(doc->code && doc->code_len) munmap(doc->code, doc->code_len);
-		if(doc->mmap_fd >= 0) close(doc->mmap_fd);
-	} else {
-		free(doc->code);
-	}
+	doc_code_release(doc);
 	free(doc);
 #if defined(__GLIBC__)
 	malloc_trim(0);
@@ -1743,17 +1842,11 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 	if(parent_of_frag >= 0 && found_rm && (size_t)parent_of_frag >= rm_hi)
 		parent_of_frag -= (int32_t)n_rm;
 
-	/* Mutate document bytes */
-	size_t new_len = d->code_len - remove_len + insert_len;
-	if(new_len + 1 > d->code_cap || d->code_is_mmap) {
-		size_t ncap = d->code_cap ? d->code_cap : 64;
-		while(ncap < new_len + 1) ncap *= 2;
-		if(!doc_code_reserve(d, ncap)) { lom_scan_result_free(&frag); return LOM_ERR_NOMEM; }
+	/* Mutate document bytes (one-pass rewrite on growth; in-place on shrink/capacity). */
+	if(!doc_code_splice_bytes(d, at, remove_len, insert, insert_len)) {
+		lom_scan_result_free(&frag);
+		return LOM_ERR_NOMEM;
 	}
-	memmove(d->code + at + insert_len, d->code + at + remove_len, d->code_len - (at + remove_len));
-	if(insert_len) memcpy(d->code + at, insert, insert_len);
-	d->code_len = new_len;
-	d->code[d->code_len] = 0;
 
 	/* Drop removed opens */
 	if(n_rm) {
@@ -1856,20 +1949,7 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 	doc_mark_dirty_at(d, at);
 
 	if(splice_is_structure_preserving(d, at, remove_len, insert, insert_len)) {
-		size_t new_len = d->code_len - remove_len + insert_len;
-		/* Grow only when needed. Same-size/shrink on MAP_PRIVATE stays in-place
-		 * (avoids a full 20GB heap promote for tiny text edits). */
-		int need_heap = (!d->code_is_mmap && new_len + 1 > d->code_cap) ||
-			(d->code_is_mmap && new_len > d->code_len);
-		if(need_heap) {
-			size_t ncap = d->code_cap ? d->code_cap : 64;
-			while(ncap < new_len + 1) ncap *= 2;
-			if(!doc_code_reserve(d, ncap)) return LOM_ERR_NOMEM;
-		}
-		memmove(d->code + at + insert_len, d->code + at + remove_len, d->code_len - (at + remove_len));
-		if(insert_len) memcpy(d->code + at, insert, insert_len);
-		d->code_len = new_len;
-		if(!d->code_is_mmap && d->code_len < d->code_cap) d->code[d->code_len] = 0;
+		if(!doc_code_splice_bytes(d, at, remove_len, insert, insert_len)) return LOM_ERR_NOMEM;
 		shift_scan_offsets(&d->scan, (int64_t)at, (int64_t)insert_len - (int64_t)remove_len);
 		doc_rebuild_pieces(d);
 		doc_rebuild_fstr(d);
@@ -1885,16 +1965,7 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 		/* LOM_ERR_PARSE ⇒ fall through to full reindex */
 	}
 
-	size_t new_len = d->code_len - remove_len + insert_len;
-	if(new_len + 1 > d->code_cap || d->code_is_mmap) {
-		size_t ncap = d->code_cap ? d->code_cap : 64;
-		while(ncap < new_len + 1) ncap *= 2;
-		if(!doc_code_reserve(d, ncap)) return LOM_ERR_NOMEM;
-	}
-	memmove(d->code + at + insert_len, d->code + at + remove_len, d->code_len - (at + remove_len));
-	if(insert_len) memcpy(d->code + at, insert, insert_len);
-	d->code_len = new_len;
-	d->code[d->code_len] = 0;
+	if(!doc_code_splice_bytes(d, at, remove_len, insert, insert_len)) return LOM_ERR_NOMEM;
 	return doc_reindex(d);
 }
 

@@ -76,10 +76,14 @@ Warm path seeds the exact-selector LOM cache when the indexed fast path runs (av
 | Metric | Value |
 |--------|-------|
 | Opens | 881 738 929 |
-| Construct | **762 s**; RSS after index **~6 MB** |
-| `region` cold / warm | **49.2 s** / **26 ms** (1.66 M hits) |
-| Descendant cold | **62.7 s** (66.3 M hits) |
-| Peak RSS | **~24.6 GiB**; after free **~2 MB** |
+| Construct | **~12.4 min**; RSS after index **~6 MB** |
+| `region` cold / warm | **47.7 s** / **32 ms** (1.66 M hits) |
+| Descendant cold / warm | **63.1 s** / **0.88 s** (66.3 M hits) |
+| `entity@kind` cold / warm | **113 s** / **0.81 s** |
+| Regex `name%=/Entity_1/` | **32.5 s** / **113 ms** (11.1 M hits) |
+| Indexed path | **137 s** (1 hit) |
+| `set` / `new_` / `delete` / `validate` | **~137–212 s** / **973 s** / **287 s** / **89 s** |
+| Peak RSS | **~24.6 GiB** queries; **~34.3 GiB** writes; after free **~2 MB** |
 
 Path: file-backed opens (`/var/tmp`), attrs off, no CSR; `./bench_20gb.sh`. Log: `.bench_out/bench_20gb.txt`.
 

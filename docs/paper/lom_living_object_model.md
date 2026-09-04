@@ -140,8 +140,9 @@ Indexed warm similarly collapses with fcache (≈0.00 ms vs ≈4.4 ms). fmem
 | ~2.58 MB | 2.58e6 | 1.1e5 | ~30 | ~3 | ~0.03 | ~6 | ~7 |
 | 100 MB | 1.05e8 | 4.4e6 | **~1100** | ~180 | ~3 | ~296 | ~387 |
 | 1 GB | 1.07e9 | 44.8M | **~10500** | ~1650 | **~55** | ~2548 | ~3439 |
+| 20 GB | 2.15e10 | 882M | **~740000** | **~63100** | **~880** | **~137000–212000** | **~973000** |
 
-**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes → ~385 MB load / ~2 MB after free. Peak `lomc` 100 MB ~528 MB. At 1 GB, heap opens+attrs ~3.9 GB load; file-backed opens + no attrs + no CSR → **~180 MB** construct RSS. **20 GB measured:** construct leaves ~6 MB resident; query peak ~24.6 GiB; free → ~2 MB (§5.4).
+**RAM.** Pre-CSR 100 MB RSS ~1424 MB with ~1 GB stuck after free; CSR + exact-sized indexes → ~385 MB load / ~2 MB after free. Peak `lomc` 100 MB ~528 MB. At 1 GB, heap opens+attrs ~3.9 GB load; file-backed opens + no attrs + no CSR → **~180 MB** construct RSS. **20 GB measured:** construct leaves ~6 MB resident; query peak ~24.6 GiB; write peak ~34.3 GiB; free → ~2 MB (§5.4).
 
 **Construct.** An earlier bulk **fmem ingest** of every interned string into a fixed 2048-bucket table made 1 GB construct ~415 s (superlinear). Queries never consulted fmem; ingest is skipped. Tag/attr aux vectors are sized by max *name* id rather than the full string table (attr values dominate `string_count`). Scan alone was already ~6 s on 1 GB; full construct is now ~10.5 s.
 
@@ -163,18 +164,26 @@ Tagvalue regex with a known tag name uses the **indexed direct-chain** fast path
 
 ### 5.4 20 GB (measured)
 
-Gated run on this host (`./bench_20gb.sh`, file-backed opens on `/var/tmp`, attrs off, CSR omitted above ~100 M opens):
+Gated runs on this host (`./bench_20gb.sh` + write continuation; file-backed opens on `/var/tmp`, attrs off, CSR omitted above ~100 M opens):
 
 | Metric | Value |
 |--------|-------|
 | Bytes / opens | 21 474 844 641 / **881 738 929** |
-| Construct | **762 s** (~12.7 min); RSS after index **~6 MB** (open pages dropped) |
-| `region` cold / warm | **49.2 s** / **26 ms** (1 657 404 hits) |
-| `region_zone_entity_stats` cold | **62.7 s** (66 296 160 hits) |
-| Peak RSS (`maxrss`) | **~24.6 GiB** (faulted open rows + tag indexes during queries) |
+| Construct | **~742–734 s**; RSS after index **~6 MB** |
+| `region` cold / warm | **47.7 s** / **32 ms** (1 657 404 hits) |
+| Descendant cold / warm | **63.1 s** / **0.88 s** (66 296 160 hits) |
+| `entity@kind` cold / warm | **113 s** / **0.81 s** (66 296 160; open-tag parse, no attr index) |
+| `name=/^Entity_42$/` | **68.7 s** (1 hit) |
+| Indexed `region[10]_zone[5]_entity[7]_stats` | **137 s** (1 hit; no-CSR sibling groups) |
+| `name%=/Entity_1/` cold / warm | **32.5 s** / **113 ms** (11 111 111 hits) |
+| Parent of descendant | **65.1 s** (66 296 160) |
+| `set` small text | **137–212 s** (st=0; promotes mmap→heap + memmove) |
+| `new_` nested insert | **973 s** (st=0) |
+| Post-write read / `delete` / `validate` | **247 s** (n=1) / **287 s** / **89 s** (ok) |
+| Peak RSS | **~24.6 GiB** (query pass); **~34.3 GiB** (write pass) |
 | After `lom_doc_free` | **~2 MB** |
 
-Gate samples 1 GB construct RSS and requires ≥12 GiB `MemAvailable`. Open tables use tempfile `mmap` + `MADV_DONTNEED` (default dir `/var/tmp`, not small `/tmp` tmpfs). Child axis without CSR uses tag-row ∩ parent bitset.
+Gate samples 1 GB construct RSS and requires ≥12 GiB `MemAvailable`. Open tables use tempfile `mmap` + `MADV_DONTNEED`. Child axis without CSR uses tag-row sibling groups / per-parent `[n]`. Attr filters without an attr index parse open-tag bytes. Full 20 GB file rewrite (`LOM_20GB_SAVE=1`) was not run.
 
 ### 5.5 Personal bake-off (not main table)
 

@@ -4,12 +4,13 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
 
 const char *lom_version(void) {
-	return "0.2.2-pscan";
+	return "0.2.3-pscan";
 }
 
 void lom_scan_result_init(lom_scan_result *r) {
@@ -547,24 +548,53 @@ static void *scan_job_main(void *arg) {
 	return NULL;
 }
 
+/* Dedup only tag/attr *names* (tiny); append attr values (partition-local, no rehash). */
 static bool merge_piece(lom_scan_result *dst, lom_scan_result *src, int32_t root_parent, lom_intern *intern) {
 	if(src->status != LOM_OK) return false;
-	uint32_t *idmap = calloc(src->string_count ? src->string_count : 1, sizeof(uint32_t));
+	size_t nstr = src->string_count ? src->string_count : 1;
+	uint32_t *idmap = malloc(nstr * sizeof(uint32_t));
 	if(!idmap) return false;
-	for(size_t i = 0; i < src->string_count; i++) {
-		const char *s = lom_scan_string(src, (uint32_t)i);
+	for(size_t i = 0; i < nstr; i++) idmap[i] = UINT32_MAX;
+	idmap[0] = 0;
+
+	for(size_t i = 0; i < src->open_count; i++) {
+		uint32_t lid = src->opens[i].name_id;
+		if(lid >= nstr) { free(idmap); return false; }
+		if(idmap[lid] != UINT32_MAX) continue;
+		const char *s = lom_scan_string(src, lid);
 		size_t n = strlen(s);
 		uint32_t gid;
-		if(i == 0 && n == 0) { idmap[i] = 0; continue; }
 		if(!intern_get(intern, dst, s, n, &gid)) { free(idmap); return false; }
-		idmap[i] = gid;
+		idmap[lid] = gid;
 	}
+	for(size_t i = 0; i < src->attr_count; i++) {
+		uint32_t lid = src->attrs[i].name_id;
+		if(lid >= nstr) { free(idmap); return false; }
+		if(idmap[lid] != UINT32_MAX) continue;
+		const char *s = lom_scan_string(src, lid);
+		size_t n = strlen(s);
+		uint32_t gid;
+		if(!intern_get(intern, dst, s, n, &gid)) { free(idmap); return false; }
+		idmap[lid] = gid;
+	}
+	for(size_t i = 0; i < src->attr_count; i++) {
+		uint32_t lid = src->attrs[i].value_id;
+		if(lid >= nstr) { free(idmap); return false; }
+		if(idmap[lid] != UINT32_MAX) continue;
+		const char *s = lom_scan_string(src, lid);
+		size_t n = strlen(s);
+		uint32_t gid;
+		if(!string_push(dst, s, n, &gid)) { free(idmap); return false; }
+		idmap[lid] = gid;
+	}
+
 	size_t open_base = dst->open_count;
 	if(!grow_cap((void **)&dst->opens, sizeof(lom_open_row), &dst->open_cap, open_base + src->open_count)) {
 		free(idmap); return false;
 	}
 	for(size_t i = 0; i < src->open_count; i++) {
 		lom_open_row row = src->opens[i];
+		if(idmap[row.name_id] == UINT32_MAX) { free(idmap); return false; }
 		row.name_id = idmap[row.name_id];
 		if(row.parent_idx < 0) row.parent_idx = root_parent;
 		else row.parent_idx = (int32_t)((size_t)row.parent_idx + open_base);
@@ -575,6 +605,7 @@ static bool merge_piece(lom_scan_result *dst, lom_scan_result *src, int32_t root
 	}
 	for(size_t i = 0; i < src->attr_count; i++) {
 		lom_attr_row a = src->attrs[i];
+		if(idmap[a.name_id] == UINT32_MAX || idmap[a.value_id] == UINT32_MAX) { free(idmap); return false; }
 		a.name_id = idmap[a.name_id];
 		a.value_id = idmap[a.value_id];
 		a.open_idx = (uint32_t)((size_t)a.open_idx + open_base);
@@ -585,36 +616,54 @@ static bool merge_piece(lom_scan_result *dst, lom_scan_result *src, int32_t root
 	return true;
 }
 
+static lom_byte_range *collect_ranges(const char *code, size_t code_len, int *inject_root, size_t *out_n, size_t *root_end) {
+	*inject_root = 0;
+	*out_n = 0;
+	/* Prefer one fill pass: estimate capacity from size, collect depth-1 (single-root docs). */
+	size_t cap = code_len / 8192 + 256;
+	if(cap < 64) cap = 64;
+	lom_byte_range *ranges = malloc(cap * sizeof(lom_byte_range));
+	if(!ranges) return NULL;
+
+	size_t n1 = find_sibling_ranges(code, code_len, 1, ranges, cap, root_end);
+	while(n1 >= cap) {
+		cap = n1 + 1024;
+		lom_byte_range *nr = realloc(ranges, cap * sizeof(lom_byte_range));
+		if(!nr) { free(ranges); return NULL; }
+		ranges = nr;
+		n1 = find_sibling_ranges(code, code_len, 1, ranges, cap, root_end);
+	}
+	if(n1 >= 2) {
+		*inject_root = 1;
+		*out_n = n1;
+		return ranges;
+	}
+
+	size_t n0 = find_sibling_ranges(code, code_len, 0, ranges, cap, root_end);
+	while(n0 >= cap) {
+		cap = n0 + 1024;
+		lom_byte_range *nr = realloc(ranges, cap * sizeof(lom_byte_range));
+		if(!nr) { free(ranges); return NULL; }
+		ranges = nr;
+		n0 = find_sibling_ranges(code, code_len, 0, ranges, cap, root_end);
+	}
+	*out_n = n0;
+	return ranges;
+}
+
 static lom_status scan_parallel(const char *code, size_t code_len, lom_scan_result *out, bool capture_attributes) {
-	enum { MAX_JOBS = 4 };
-	/* Piece-local + string merge helps mid-size; at ~1GB merge tax dominates — stay serial. */
-	if(code_len >= (256u << 20)) {
+	enum { MAX_JOBS = 8 };
+	/* Name-only dedup merge reaches ~parity at ~100MB; at ≥256MB still loses to serial. */
+	if(code_len < (4u << 20) || code_len >= (256u << 20)) {
 		lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);
 		if(st == LOM_OK) scan_trim(out);
 		return st;
 	}
 	size_t root_end = code_len ? code_len - 1 : 0;
-	size_t n0 = find_sibling_ranges(code, code_len, 0, NULL, 0, &root_end);
-	int want_depth = 0;
-	int32_t inject_root = 0;
-	size_t n = n0;
-	if(n0 == 1) {
-		size_t n1 = find_sibling_ranges(code, code_len, 1, NULL, 0, &root_end);
-		if(n1 >= 2) { n = n1; want_depth = 1; inject_root = 1; }
-	}
-	if(n < 2 || code_len < (4u << 20)) {
-		lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);
-		if(st == LOM_OK) scan_trim(out);
-		return st;
-	}
-
-	lom_byte_range *ranges = calloc(n, sizeof(lom_byte_range));
-	if(!ranges) {
-		lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);
-		if(st == LOM_OK) scan_trim(out);
-		return st;
-	}
-	if(find_sibling_ranges(code, code_len, want_depth, ranges, n, &root_end) != n) {
+	int inject_root = 0;
+	size_t n = 0;
+	lom_byte_range *ranges = collect_ranges(code, code_len, &inject_root, &n, &root_end);
+	if(!ranges || n < 2) {
 		free(ranges);
 		lom_status st = scan_bytes(code, 0, code_len, out, capture_attributes, true);
 		if(st == LOM_OK) scan_trim(out);

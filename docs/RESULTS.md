@@ -25,9 +25,9 @@ PHP 100 MB (`memory_limit=512M`): construct lazy **~134 MB**; `region` via s
 
 Root cause: ingesting ~3.9M unique strings into a 2048-bucket fmem table was \(O(n^2)\); query paths never read fmem. Aux tag/attr indexes now size by max *name* id, not full string table.
 
-### `LOM_PARALLEL` piece-local scan (opt-in, not a win yet)
+### `LOM_PARALLEL` piece-local scan (opt-in)
 
-Depth-1 sibling ranges → per-piece `scan_bytes` → string-table merge. Open counts / `region` / descendant matches match serial on test + 1 MB + 100 MB. On this host construct is **not** faster (100 MB ~0.9–1.1 s serial vs ~1.1–1.8 s parallel; ≥256 MB auto-falls back to serial). Shared-mutex intern was worse (lock contention). Still default **off**.
+Depth-1 sibling ranges → per-piece scan → merge that **dedups only tag/attr names** and appends attr values. Open counts match serial. On this host: **~parity at 100 MB** (noise), still **slower at 1 GB** (extra range pass + merge); auto-serial below 4 MB and at ≥256 MB. Default **off**.
 
 ## Writes (native)
 
@@ -43,9 +43,9 @@ Depth-1 sibling ranges → per-piece `scan_bytes` → string-table merge. Open c
 | 100 MB | ~3 ms | ~2.9 s |
 | 1 GB | ~55 ms | **~27 s** (was ~430 s) |
 
-## Parallel ablation (honest miss)
+## Parallel ablation (honest)
 
-`LOM_PARALLEL=1` atomic shared-count CSR workers: **slower** than serial on 100 MB and 1 GB (contention). Default remains off. Piece-local parallel *scan* is still future work.
+`LOM_PARALLEL=1` atomic CSR workers: slower (contention). Piece-local scan (name-only merge): correct; ~parity at 100 MB; slower at 1 GB — see § above. Default off.
 
 ## C# connectors
 

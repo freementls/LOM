@@ -21,7 +21,7 @@ Native child selectors use **`_`** (`region_zone_entity`) for direct children an
 | `LOM_FMEM=0` | on | Disable string table (views into `string_blob`, no duplicate copies) |
 | `LOM_FCACHE=0` | on | Disable selector result memo |
 | `LOM_PIECES=0` | on | Disable tag-aligned piece split |
-| `LOM_PARALLEL=1` | **off** | Piece-local sibling scan + merge (opt-in). Correct on fixtures; has **not** beaten serial construct here (range-find + string-merge tax). Auto-falls back to serial at ≥256 MB. |
+| `LOM_PARALLEL=1` | **off** | Piece-local sibling scan; name-only merge. ~parity at 100 MB here; auto-serial outside 4 MB–256 MB. |
 
 Ablations: `../bench_ablation.sh [fixture]`.
 

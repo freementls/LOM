@@ -519,8 +519,13 @@
 			});
 	}
 
+	var frameTimer = null;
 	function runFrame() {
-		iframe.src = 'run.php?app=' + encodeURIComponent(currentSlug) + '&t=' + Date.now();
+		clearTimeout(frameTimer);
+		frameTimer = setTimeout(function () {
+			if (!currentSlug) return;
+			iframe.src = 'run.php?app=' + encodeURIComponent(currentSlug) + '&t=' + Date.now();
+		}, 120);
 	}
 
 	function loadApp(slug, opts) {
@@ -551,18 +556,35 @@
 		flushSave(function () { loadApp(slug); });
 	}
 
-	function saveSource(thenReload) {
+	var saveCtrl = null;
+	function isNetworkNoise(msg) {
+		return /failed to fetch|networkerror|load failed|aborted a request|the operation was aborted|^abort/i.test(String(msg || ''));
+	}
+
+	function saveSource(thenReload, isRetry) {
 		var my = ++saveSeq;
 		var slug = currentSlug;
 		if (!slug) return Promise.resolve();
 		var source = editor.value;
 		setStatus('is-wait', 'Saving…');
+		if (saveCtrl) saveCtrl.abort();
+		saveCtrl = new AbortController();
 		return fetch('save.php', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ app: slug, source: source })
+			body: JSON.stringify({ app: slug, source: source }),
+			signal: saveCtrl.signal
 		})
-			.then(function (res) { return res.json(); })
+			.then(function (res) {
+				return res.text().then(function (text) {
+					var data;
+					try { data = JSON.parse(text); } catch (e) {
+						throw new Error(res.ok ? 'Save returned invalid JSON.' : 'Save failed (' + res.status + ').');
+					}
+					if (!res.ok && !data.ok) throw new Error(data.error || 'Save failed (' + res.status + ').');
+					return data;
+				});
+			})
 			.then(function (data) {
 				if (my !== saveSeq) return data;
 				if (!data.ok) {
@@ -581,7 +603,11 @@
 			})
 			.catch(function (err) {
 				if (my !== saveSeq) return;
-				setStatus('is-err', err.message || 'Save failed.');
+				if (err && err.name === 'AbortError') return;
+				if (!isRetry && isNetworkNoise(err && err.message)) {
+					return saveSource(thenReload, true);
+				}
+				setStatus('is-err', (err && err.message) || 'Save failed.');
 			});
 	}
 
@@ -909,6 +935,7 @@
 		if (e.data.app && e.data.app !== currentSlug) return;
 		if (e.data.type === 'lab-js-error') {
 			var jsMsg = e.data.message || 'JavaScript error';
+			if (isNetworkNoise(jsMsg)) return;
 			var jsLine = parseInt(e.data.line, 10) || 0;
 			if (jsLine && !/\bon line \d+\b/i.test(jsMsg)) jsMsg += ' on line ' + jsLine;
 			setStatus('is-err', jsMsg);
@@ -921,12 +948,14 @@
 	});
 
 	window.addEventListener('error', function (e) {
-		if (!e.message) return;
+		if (!e.message || isNetworkNoise(e.message)) return;
 		setStatus('is-err', e.message);
 	});
 	window.addEventListener('unhandledrejection', function (e) {
 		var reason = e.reason;
-		setStatus('is-err', (reason && reason.message) ? reason.message : String(reason || 'Unhandled promise rejection'));
+		var msg = (reason && reason.message) ? reason.message : String(reason || '');
+		if (!msg || isNetworkNoise(msg) || (reason && reason.name === 'AbortError')) return;
+		setStatus('is-err', msg);
 	});
 
 	window.addEventListener('hashchange', function () {

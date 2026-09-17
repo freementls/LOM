@@ -89,6 +89,6 @@ if($source === false) {
 			</div>
 		</form>
 	</dialog>
-	<script src="assets/lab.js?v=15"></script>
+	<script src="assets/lab.js?v=16"></script>
 </body>
 </html>

@@ -51,7 +51,9 @@ try {
 	exit;
 }
 $html = ob_get_clean();
-$inject = '<script>window.LAB_APP=' . json_encode($slug) . ';</script>';
+$inject = '<script>window.LAB_APP=' . json_encode($slug) . ';'
+	. '(function(){function r(m,l,c){if(parent===window)return;parent.postMessage({type:"lab-js-error",app:window.LAB_APP,message:String(m||""),line:l||0,col:c||0},location.origin);}window.onerror=function(m,s,l,c,e){r((e&&e.message)||m,l,c);};window.addEventListener("unhandledrejection",function(ev){var x=ev.reason;r((x&&x.message)||x,0,0);});})();'
+	. '</script>';
 if(preg_match('/<head[^>]*>/i', $html)) {
 	$html = preg_replace('/<head[^>]*>/i', '$0' . $inject, $html, 1);
 } else {

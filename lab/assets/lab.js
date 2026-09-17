@@ -293,6 +293,11 @@
 		return parseInt(m[1], 10) || 0;
 	}
 
+	function parseUndefinedName(msg) {
+		var m = String(msg || '').match(/['"]?([A-Za-z_$][\w$]*)['"]? is not defined/);
+		return m ? m[1] : '';
+	}
+
 	function parseErrorToken(msg) {
 		msg = String(msg || '');
 		var m = msg.match(/unexpected token "([^"]+)"/i)
@@ -900,10 +905,28 @@
 
 	window.addEventListener('message', function (e) {
 		if (e.origin !== location.origin) return;
-		if (!e.data || e.data.type !== 'lab-source') return;
+		if (!e.data || !e.data.type) return;
 		if (e.data.app && e.data.app !== currentSlug) return;
+		if (e.data.type === 'lab-js-error') {
+			var jsMsg = e.data.message || 'JavaScript error';
+			var jsLine = parseInt(e.data.line, 10) || 0;
+			if (jsLine && !/\bon line \d+\b/i.test(jsMsg)) jsMsg += ' on line ' + jsLine;
+			setStatus('is-err', jsMsg);
+			setErrorLine(jsLine || parseErrorLine(jsMsg), parseErrorToken(jsMsg) || parseUndefinedName(jsMsg));
+			return;
+		}
+		if (e.data.type !== 'lab-source') return;
 		patchXmlVar(e.data.var, e.data.xml);
 		setStatus('', '$' + e.data.var + ' updated');
+	});
+
+	window.addEventListener('error', function (e) {
+		if (!e.message) return;
+		setStatus('is-err', e.message);
+	});
+	window.addEventListener('unhandledrejection', function (e) {
+		var reason = e.reason;
+		setStatus('is-err', (reason && reason.message) ? reason.message : String(reason || 'Unhandled promise rejection'));
 	});
 
 	window.addEventListener('hashchange', function () {

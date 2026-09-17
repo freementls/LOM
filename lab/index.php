@@ -10,6 +10,11 @@ $source = $initial !== '' ? lab_read_source($initial) : '';
 if($source === false) {
 	$source = '';
 }
+$labScript = isset($_SERVER['SCRIPT_NAME']) ? str_replace('\\', '/', $_SERVER['SCRIPT_NAME']) : '/lab/index.php';
+$labBase = preg_replace('#/index\\.php$#i', '/', $labScript);
+if(substr($labBase, -1) !== '/') {
+	$labBase = rtrim(dirname($labBase), '/') . '/';
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -24,7 +29,7 @@ if($source === false) {
 	<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Syne:wght@600;700;800&display=swap" rel="stylesheet"/>
 	<link rel="stylesheet" href="assets/lab.css?v=12"/>
 </head>
-<body data-app="<?php echo htmlspecialchars($initial); ?>">
+<body data-app="<?php echo htmlspecialchars($initial); ?>" data-lab="<?php echo htmlspecialchars($labBase); ?>">
 	<a class="skip" href="#code">Skip to code</a>
 	<header class="rail">
 		<nav class="pills" id="pills" aria-label="Apps">
@@ -89,6 +94,6 @@ if($source === false) {
 			</div>
 		</form>
 	</dialog>
-	<script src="assets/lab.js?v=16"></script>
+	<script src="assets/lab.js?v=17"></script>
 </body>
 </html>

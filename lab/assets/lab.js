@@ -16,7 +16,26 @@
 	var applyingXml = false;
 	var saveTimer = null;
 	var saveSeq = 0;
+	var saveInFlight = null;
+	var saveAgain = false;
+	var saveAgainReload = false;
+	var saveTries = 0;
 	var shipped = { hello: true, approval: true };
+
+	function labRoot() {
+		var fromBody = document.body.getAttribute('data-lab');
+		if (fromBody) return fromBody.replace(/\/?$/, '/');
+		var path = location.pathname;
+		if (/\/lab\/index\.php$/i.test(path)) return path.replace(/\/index\.php$/i, '/');
+		if (/\/lab$/.test(path)) return path + '/';
+		return path.replace(/[^/]*$/, '');
+	}
+
+	function labUrl(file, query) {
+		var url = labRoot() + String(file || '').replace(/^\//, '');
+		if (query) url += (query.charAt(0) === '?' ? query : '?' + query);
+		return url;
+	}
 
 	var PHP_KW = /^(and|or|xor|as|break|case|catch|class|const|continue|declare|default|do|else|elseif|endfor|endforeach|endif|endswitch|endwhile|extends|final|finally|for|foreach|function|global|if|include|include_once|instanceof|insteadof|interface|namespace|new|private|protected|public|require|require_once|return|static|switch|throw|trait|try|use|var|while|yield|true|false|null|array|echo|print|isset|unset|empty)$/;
 	var JS_KW = /^(break|case|catch|class|const|continue|debugger|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|return|super|switch|this|throw|try|typeof|var|void|while|with|yield|true|false|null|undefined|async|await)$/;
@@ -496,7 +515,7 @@
 	function deleteApp(slug) {
 		clearTimeout(saveTimer);
 		setStatus('is-wait', 'Deleting…');
-		fetch('save.php', {
+		fetch(labUrl('save.php'), {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ app: slug, delete: true })
@@ -524,13 +543,13 @@
 		clearTimeout(frameTimer);
 		frameTimer = setTimeout(function () {
 			if (!currentSlug) return;
-			iframe.src = 'run.php?app=' + encodeURIComponent(currentSlug) + '&t=' + Date.now();
+			iframe.src = labUrl('run.php', 'app=' + encodeURIComponent(currentSlug) + '&t=' + Date.now());
 		}, 120);
 	}
 
 	function loadApp(slug, opts) {
 		opts = opts || {};
-		return fetch('save.php?app=' + encodeURIComponent(slug))
+		return fetch(labUrl('save.php', 'app=' + encodeURIComponent(slug)))
 			.then(function (res) { return res.json(); })
 			.then(function (data) {
 				if (!data.ok) throw new Error(data.error || 'Could not load app.');
@@ -556,24 +575,26 @@
 		flushSave(function () { loadApp(slug); });
 	}
 
-	var saveCtrl = null;
 	function isNetworkNoise(msg) {
 		return /failed to fetch|networkerror|load failed|aborted a request|the operation was aborted|^abort/i.test(String(msg || ''));
 	}
 
-	function saveSource(thenReload, isRetry) {
-		var my = ++saveSeq;
+	function saveSource(thenReload) {
 		var slug = currentSlug;
 		if (!slug) return Promise.resolve();
+		if (saveInFlight) {
+			saveAgain = true;
+			saveAgainReload = saveAgainReload || !!thenReload;
+			return saveInFlight;
+		}
+		var my = ++saveSeq;
 		var source = editor.value;
 		setStatus('is-wait', 'Saving…');
-		if (saveCtrl) saveCtrl.abort();
-		saveCtrl = new AbortController();
-		return fetch('save.php', {
+		saveInFlight = fetch(labUrl('save.php'), {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ app: slug, source: source }),
-			signal: saveCtrl.signal
+			credentials: 'same-origin'
 		})
 			.then(function (res) {
 				return res.text().then(function (text) {
@@ -586,7 +607,7 @@
 				});
 			})
 			.then(function (data) {
-				if (my !== saveSeq) return data;
+				if (my !== saveSeq && !saveAgain) return data;
 				if (!data.ok) {
 					setStatus('is-err', data.error || 'Save failed.');
 					return data;
@@ -598,23 +619,37 @@
 				}
 				setErrorLine(0);
 				setStatus('', 'Saved');
-				if (thenReload && slug === currentSlug) runFrame();
+				saveTries = 0;
+				if (thenReload && slug === currentSlug && !saveAgain) runFrame();
 				return data;
 			})
 			.catch(function (err) {
-				if (my !== saveSeq) return;
-				if (err && err.name === 'AbortError') return;
-				if (!isRetry && isNetworkNoise(err && err.message)) {
-					return saveSource(thenReload, true);
+				if (my !== saveSeq && !saveAgain) return;
+				if (isNetworkNoise(err && err.message) && saveTries < 2) {
+					saveTries += 1;
+					saveAgain = true;
+					saveAgainReload = saveAgainReload || !!thenReload;
+					return;
 				}
 				setStatus('is-err', (err && err.message) || 'Save failed.');
+			})
+			.then(function (data) {
+				saveInFlight = null;
+				if (saveAgain) {
+					saveAgain = false;
+					var reload = saveAgainReload;
+					saveAgainReload = false;
+					return saveSource(reload);
+				}
+				return data;
 			});
+		return saveInFlight;
 	}
 
 	function scheduleSave() {
 		clearTimeout(saveTimer);
 		setStatus('is-wait', 'Editing…');
-		saveTimer = setTimeout(function () { saveSource(true); }, 400);
+		saveTimer = setTimeout(function () { saveSource(true); }, 500);
 	}
 
 	function flushSave(done) {
@@ -739,7 +774,7 @@
 	}
 
 	function createApp(name) {
-		return fetch('save.php', {
+		return fetch(labUrl('save.php'), {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ create: name })
@@ -908,7 +943,7 @@
 	resetBtn.addEventListener('click', function () {
 		if (!shipped[currentSlug]) return;
 		clearTimeout(saveTimer);
-		fetch('save.php', {
+		fetch(labUrl('save.php'), {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ app: currentSlug, reset: true })

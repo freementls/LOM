@@ -290,6 +290,77 @@ function lab_isolate_styles($html) {
 	}, $html);
 }
 
+function lab_script_blocks($text) {
+	$blocks = array();
+	if(!is_string($text) || $text === '') {
+		return $blocks;
+	}
+	if(!preg_match_all('/<script\b([^>]*)>([\s\S]*?)<\/script>/i', $text, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
+		return $blocks;
+	}
+	foreach($matches as $m) {
+		if(preg_match('/\bsrc\s*=/i', $m[1][0])) {
+			continue;
+		}
+		$body = $m[2][0];
+		$start = substr_count(substr($text, 0, $m[2][1]), "\n") + 1;
+		$blocks[] = array(
+			'body' => $body,
+			'o0' => $start,
+			'o1' => $start + substr_count($body, "\n"),
+			'inject' => (strpos($body, 'LAB_LINE_MAP') !== false || strpos($body, 'lab-js-error') !== false || strpos($body, 'window.onerror') !== false),
+		);
+	}
+	return $blocks;
+}
+
+function lab_script_line_map($source, $html) {
+	$src = array();
+	foreach(lab_script_blocks($source) as $b) {
+		if(!$b['inject']) {
+			$src[] = $b;
+		}
+	}
+	$out = array();
+	foreach(lab_script_blocks($html) as $b) {
+		if(!$b['inject']) {
+			$out[] = $b;
+		}
+	}
+	$map = array();
+	$used = array();
+	foreach($out as $oi => $ob) {
+		$pair = null;
+		$outNorm = preg_replace('/\s+/', ' ', trim($ob['body']));
+		foreach($src as $si => $sb) {
+			if(isset($used[$si])) {
+				continue;
+			}
+			$srcNorm = preg_replace('/\s+/', ' ', trim($sb['body']));
+			if($outNorm !== '' && $outNorm === $srcNorm) {
+				$pair = $sb;
+				$used[$si] = true;
+				break;
+			}
+		}
+		if($pair === null && isset($src[$oi]) && !isset($used[$oi])
+			&& substr_count($ob['body'], "\n") >= 2 && substr_count($src[$oi]['body'], "\n") >= 2) {
+			$pair = $src[$oi];
+			$used[$oi] = true;
+		}
+		if($pair === null) {
+			continue;
+		}
+		$map[] = array(
+			'o0' => $ob['o0'],
+			'o1' => $ob['o1'],
+			's0' => $pair['o0'],
+			's1' => $pair['o1'],
+		);
+	}
+	return $map;
+}
+
 function lab_json_input() {
 	$raw = file_get_contents('php://input');
 	$data = json_decode($raw, true);

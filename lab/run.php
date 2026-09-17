@@ -51,12 +51,14 @@ try {
 	exit;
 }
 $html = ob_get_clean();
-$inject = '<script>window.LAB_APP=' . json_encode($slug) . ';'
-	. '(function(){function r(m,l,c){if(parent===window)return;parent.postMessage({type:"lab-js-error",app:window.LAB_APP,message:String(m||""),line:l||0,col:c||0},location.origin);}window.onerror=function(m,s,l,c,e){r((e&&e.message)||m,l,c);};window.addEventListener("unhandledrejection",function(ev){var x=ev.reason;r((x&&x.message)||x,0,0);});})();'
-	. '</script>';
+$hook = '(function(){var M=[];function L(l,msg){l=+l||0;if(!M.length)return l;var i,r,n;if(msg&&/end of input|end of script/i.test(String(msg))&&M.length)return M[M.length-1].s1;for(i=0;i<M.length;i++){r=M[i];n=r.s1-r.s0+1;if(l>=1&&l<=n&&(l<r.o0||l<=n)){var x=r.s0+l-1;return x>r.s1?r.s1:x;}if(l>=r.o0&&l<=r.o1){x=r.s0+(l-r.o0);return x>r.s1?r.s1:x;}}if(M.length){r=M[M.length-1];if(l>=r.o0)return r.s1;}return l;}function r(m,l,c){if(parent===window)return;parent.postMessage({type:"lab-js-error",app:window.LAB_APP,message:String(m||""),line:L(l,m),col:c||0},location.origin);}window.onerror=function(m,s,l,c,e){r((e&&e.message)||m,l,c);};window.addEventListener("unhandledrejection",function(ev){var x=ev.reason;r((x&&x.message)||x,0,0);});window.LAB_LINE_MAP=M;})();';
+$inject = '<script>window.LAB_APP=' . json_encode($slug) . ';' . $hook . '</script>';
 if(preg_match('/<head[^>]*>/i', $html)) {
 	$html = preg_replace('/<head[^>]*>/i', '$0' . $inject, $html, 1);
 } else {
 	$html = $inject . $html;
 }
-echo lab_isolate_styles($html);
+$html = lab_isolate_styles($html);
+$map = lab_script_line_map($source, $html);
+$html = preg_replace('/var M=\[\]/', 'var M=' . json_encode($map, lab_json_flags()), $html, 1);
+echo $html;

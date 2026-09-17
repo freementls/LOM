@@ -16,13 +16,16 @@ Large-document scans optionally use sibling [fractal_substring](https://github.c
 
 **[https://freement.cloud/LOM/demo/](https://freement.cloud/LOM/demo/)** — edit the XML (same contents as `test.xml`), edit the LOM selector, and watch matches update. Writes (`set` / `new_` / `delete`) apply only when you press the button.
 
-Source for that page: [`demo/`](demo/). Locally: `php -S localhost:8765` then http://localhost:8765/demo/.
+**[https://freement.cloud/LOM/lab/](https://freement.cloud/LOM/lab/)** — app lab: PHP / JS / `$XML*` on the left, running app on the right. Writes go through AJAP (AJAX to PHP) and live-update the nowdocs.
+
+Source for those pages: [`demo/`](demo/), [`lab/`](lab/). Locally: `php -S localhost:8765` then http://localhost:8765/demo/ or http://localhost:8765/lab/.
 
 ## Quick paths
 
 | Path | What |
 |------|------|
 | [Live demo](https://freement.cloud/LOM/demo/) | Query playground on freement.cloud (XML + selector → matches) |
+| [App lab](https://freement.cloud/LOM/lab/) | Two-pane app workshop (code + rendered app, `$XML*` live data) |
 | `O.php` | Original PHP API (unchanged for existing programs) |
 | `native/` | C library (`liblom`), CLI (`lomc`), OData daemon (`lomd`) |
 | `powerapps/` | Entity config, OpenAPI custom connector, setup guide |

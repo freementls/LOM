@@ -81,6 +81,48 @@ class LomNative:
 		self._lib.lom_match_list_free(ctypes.byref(ml))
 		return out
 
+	def get_ois(self, selector: str) -> List[int]:
+		"""Return open indices (uint32) — internal currency; no offset pairs."""
+		class OiList(ctypes.Structure):
+			_fields_ = [
+				("items", ctypes.POINTER(ctypes.c_uint32)),
+				("count", ctypes.c_size_t),
+				("cap", ctypes.c_size_t),
+			]
+
+		self._lib.lom_oi_list_init.argtypes = [ctypes.POINTER(OiList)]
+		self._lib.lom_oi_list_free.argtypes = [ctypes.POINTER(OiList)]
+		self._lib.lom_doc_get_ois.argtypes = [
+			ctypes.c_void_p,
+			ctypes.c_char_p,
+			ctypes.POINTER(OiList),
+		]
+		ol = OiList()
+		self._lib.lom_oi_list_init(ctypes.byref(ol))
+		st = self._lib.lom_doc_get_ois(self._doc, selector.encode(), ctypes.byref(ol))
+		if st != 0:
+			self._lib.lom_oi_list_free(ctypes.byref(ol))
+			raise RuntimeError(f"get_ois failed: {st} {self.error}")
+		out = [int(ol.items[i]) for i in range(ol.count)]
+		self._lib.lom_oi_list_free(ctypes.byref(ol))
+		return out
+
+	def oi_match(self, oi: int) -> Tuple[int, int]:
+		"""Materialize one open index to (offset, end_off)."""
+		class Match(ctypes.Structure):
+			_fields_ = [("offset", ctypes.c_int64), ("end_off", ctypes.c_int64)]
+
+		self._lib.lom_doc_oi_match.argtypes = [
+			ctypes.c_void_p,
+			ctypes.c_uint32,
+			ctypes.POINTER(Match),
+		]
+		m = Match()
+		st = self._lib.lom_doc_oi_match(self._doc, ctypes.c_uint32(oi), ctypes.byref(m))
+		if st != 0:
+			raise RuntimeError(f"oi_match failed: {st} {self.error}")
+		return (int(m.offset), int(m.end_off))
+
 	def count(self, selector: str) -> int:
 		n = ctypes.c_size_t(0)
 		st = self._lib.lom_doc_count(self._doc, selector.encode(), ctypes.byref(n))
@@ -109,6 +151,20 @@ class LomNative:
 		st = self._lib.lom_doc_save_file(self._doc, path.encode())
 		if st != 0:
 			raise RuntimeError(f"save failed: {st} {self.error}")
+
+	def wal_persist(self) -> None:
+		self._lib.lom_doc_wal_persist.argtypes = [ctypes.c_void_p]
+		st = self._lib.lom_doc_wal_persist(self._doc)
+		if st != 0:
+			raise RuntimeError(f"wal_persist failed: {st} {self.error}")
+
+	def get_xpath(self, xpath: str) -> List[Tuple[int, int]]:
+		buf = ctypes.create_string_buffer(1024)
+		self._lib.lom_xpath_to_lom.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+		st = self._lib.lom_xpath_to_lom(xpath.encode(), buf, 1024)
+		if st != 0:
+			raise RuntimeError(f"xpath not in subset: {xpath}")
+		return self.get(buf.value.decode())
 
 	def close(self) -> None:
 		if self._doc:
@@ -143,3 +199,36 @@ class LomOData:
 		if filter:
 			q += "&$filter=" + urllib.parse.quote(filter)
 		return self._get(q)
+
+	def _req(self, method: str, path: str, body: Optional[str] = None) -> str:
+		req = urllib.request.Request(
+			self.base + "/" + path.lstrip("/"),
+			data=body.encode() if body is not None else None,
+			method=method,
+			headers={"X-Api-Key": self.api_key, "Content-Type": "application/json"},
+		)
+		with urllib.request.urlopen(req) as resp:
+			return resp.read().decode()
+
+	def query(self, selector: str = "", xpath: str = "", css: str = "", file: str = "") -> str:
+		parts = []
+		if selector:
+			parts.append(f'"selector":"{selector}"')
+		if xpath:
+			parts.append(f'"xpath":"{xpath}"')
+		if css:
+			parts.append(f'"css":"{css}"')
+		if file:
+			parts.append(f'"file":"{file}"')
+		return self._req("POST", "lom/query", "{" + ",".join(parts) + "}")
+
+	def create_person(self, fields: dict) -> str:
+		import json
+		return self._req("POST", "api/CreatePeople", json.dumps(fields))
+
+	def update_person(self, id: str, fields: dict) -> str:
+		import json
+		return self._req("PATCH", f"odata/People('{id}')", json.dumps(fields))
+
+	def delete_person(self, id: str) -> str:
+		return self._req("DELETE", f"odata/People('{id}')")

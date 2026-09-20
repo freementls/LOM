@@ -83,14 +83,21 @@ register_shutdown_function(function() use (&$completed, $started) {
 	), JSON_UNESCAPED_UNICODE);
 });
 
+$applied = ($action === 'delete' && $query !== '') || ($write !== '' && $action !== 'delete');
 ob_start();
 try {
+	$t_construct = microtime(true);
 	$O = new O($xml, false);
-	lom_demo_write($O, $action, $query, $write);
+	$construct_ms = (microtime(true) - $t_construct) * 1000;
+	if($applied) {
+		lom_demo_write($O, $action, $query, $write);
+	}
+	$t_query = microtime(true);
 	$result = ($mode === 'values') ? $O->_($query) : $O->get_tagged($query);
+	$query_ms = (microtime(true) - $t_query) * 1000;
 	$buffer = trim(ob_get_clean());
 	$matches = lom_demo_normalize($result);
-	$out_xml = $O->code;
+	$out_xml = $applied ? $O->code : null;
 } catch(Throwable $e) {
 	ob_end_clean();
 	$completed = true;
@@ -105,7 +112,10 @@ $payload = array(
 	'error' => ($buffer !== '' ? strip_tags($buffer) : null),
 	'matches' => $matches,
 	'count' => count($matches),
-	'ms' => round((microtime(true) - $started) * 1000, 2),
+	'ms' => round($query_ms, 3),
+	'construct_ms' => round($construct_ms, 3),
+	'query_ms' => round($query_ms, 3),
+	'engine' => 'php',
 	'mode' => $mode,
 	'action' => $action,
 	'xml' => $out_xml,

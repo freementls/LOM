@@ -1,1 +1,17 @@
-Require all denied
+# Allow HTTP access for demos, benches, and docs.
+# Public entry: /LOM/ → demo/. Sensitive paths stay blocked below.
+Require all granted
+
+Options -Indexes
+DirectoryIndex disabled
+
+<IfModule mod_rewrite.c>
+	RewriteEngine On
+	RewriteBase /LOM/
+	RewriteRule ^$ demo/ [R=302,L]
+</IfModule>
+
+# Never serve VCS, large fixtures, archives, or native build outputs.
+RedirectMatch 404 (?i)/(?:\.git|\.bench_out)(/|$)
+RedirectMatch 404 (?i)/native/(?:bin|lib|obj|php_ext)(/|$)
+RedirectMatch 404 (?i)\.(?:7z|zip|fzsd|fzsxsd)$

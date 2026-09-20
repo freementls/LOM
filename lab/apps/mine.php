@@ -7,6 +7,8 @@ $XMLrequests = '<requests>
 <request id="2"><name>Sam</name><for>vacation</for></request>
 <request id="3"><name>Susan</name><for>margaritas</for></request>
 <request id="4"><name>Xin</name><for>a basketball</for></request>
+<request id="1789642583596"><name>Bambi</name><for>a green leaf</for></request>
+<request id="1789642634957"><name>The man</name><for>a hamburger</for></request>
 </requests>';
 $XMLapprovers = '<approvers>
 <approver id="1"><name>Big Mike</name><requestid>4</requestid><decision>approved</decision></approver>
@@ -33,7 +35,7 @@ if($screen_from_get === 'new') {
 	print('<h2>New Request</h2>
 <label for="name">Name: </label><input type="text" id="name" />
 <label for="for">For: </label><input type="text" id="for" /><!-- ironic -->
-<button onclick="add()">Save</button>
+<button onclick="add_request()">Add request</button>
 ');
 } elseif($screen_from_get === 'existingRequests') {
 	print('<h2>Existing Requests</h2>
@@ -106,14 +108,25 @@ function ajap(xmlVar, action, query, write) {
 function go(section, requestId) {
 	location = 'run.php?app=' + LAB_APP + '&section=' + section + (requestId ? '&requestId=' + requestId : '') + '&time=' + Date.now();
 }
-function add() {
-	var requestId = Date.now();
-	var nameValue = document.getElementById('name').value;
-	var forValue = document.getElementById('for').value;
+
+/*function add_request() {
+	requestId = Date.Now();
+	requestor = document.getElementById('name').value;
+	request = document.getElementById('for').value;
+	alert('requestId: ' + requestId + ', requestor: ' + requestor + ', request: ' + request);
+}*/
+function add_request() {
+	requestId = Date.Now();
+	requestor = document.getElementById('name').value;
+	request = document.getElementById('for').value;
 	ajap('XMLrequests', 'new_', 'requests',
-		'<request id="' + requestId + '"><name>' + nameValue + '</name><for>' + forValue + '</for></request>'
-	).then(function () { go('existingRequests'); });
+		'<request id="' + requestId + '"><name>' + requestor + '</name><for>' + request + '</for><status>pending</status></request>'
+	).then(function () {
+		return ajap('XMLapprovers', 'new_', 'approvers',
+			'<approver id="' + requestId + '"><requestId>' + requestId + '</requestId><name>Grace</name><decision></decision></approver>');
+	}).then(function () { go('existingRequests', requestId); });
 }
+
 function decide(approverId, requestId, decision) {
 	ajap('XMLapprovers', 'set', 'approver@id=' + approverId, 'decision=' + decision).then(function () {
 		return ajap('XMLrequests', 'set', 'request@id=' + requestId, 'status=' + decision);
@@ -128,5 +141,5 @@ body {
 }
 #sections { text-align: center; }
 button { background-color: lightblue; font-size: 20px; border-radius: 6px; }
-button:hover { background-color: #999999; font-color: #222200; }
+/* button:hover { background-color: #999999; font-color: #222200; } */
 </style>

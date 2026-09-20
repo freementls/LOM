@@ -43,6 +43,35 @@ public final class LomODataClient implements AutoCloseable {
 		return get(q);
 	}
 
+	private String send(String method, String path, String body) throws Exception {
+		HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(base + "/" + path))
+			.header("X-Api-Key", apiKey)
+			.header("Content-Type", "application/json");
+		if(body != null) b.method(method, HttpRequest.BodyPublishers.ofString(body));
+		else b.method(method, HttpRequest.BodyPublishers.noBody());
+		HttpResponse<String> res = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+		if(res.statusCode() >= 300) {
+			throw new IllegalStateException("HTTP " + res.statusCode() + ": " + res.body());
+		}
+		return res.body();
+	}
+
+	public String query(String selector) throws Exception {
+		return send("POST", "lom/query", "{\"selector\":\"" + selector + "\"}");
+	}
+
+	public String createPerson(String jsonBody) throws Exception {
+		return send("POST", "api/CreatePeople", jsonBody);
+	}
+
+	public String updatePerson(String id, String jsonBody) throws Exception {
+		return send("PATCH", "odata/People('" + id + "')", jsonBody);
+	}
+
+	public String deletePerson(String id) throws Exception {
+		return send("DELETE", "odata/People('" + id + "')", null);
+	}
+
 	@Override
 	public void close() {}
 }

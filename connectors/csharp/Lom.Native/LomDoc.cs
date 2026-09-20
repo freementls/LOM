@@ -21,6 +21,14 @@ namespace Lom.Native
 		public UIntPtr Cap;
 	}
 
+	[StructLayout(LayoutKind.Sequential)]
+	struct LomOiList
+	{
+		public IntPtr Items;
+		public UIntPtr Count;
+		public UIntPtr Cap;
+	}
+
 	/// <summary>P/Invoke wrapper around liblom (in-process document engine).</summary>
 	public sealed class LomDoc : IDisposable
 	{
@@ -39,6 +47,12 @@ namespace Lom.Native
 		static extern int lom_doc_count(IntPtr doc, byte[] selectorUtf8, out UIntPtr count);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern int lom_doc_get_ois(IntPtr doc, byte[] selectorUtf8, IntPtr oiList);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern int lom_doc_oi_match(IntPtr doc, uint oi, out LomMatch match);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern int lom_doc_node_slice(IntPtr doc, long openOff, out IntPtr ptr, out UIntPtr len);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -54,6 +68,12 @@ namespace Lom.Native
 		static extern int lom_doc_save_file(IntPtr doc, byte[] pathUtf8);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern int lom_doc_wal_persist(IntPtr doc);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern int lom_xpath_to_lom(byte[] xpathUtf8, byte[] outBuf, UIntPtr cap);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern UIntPtr lom_doc_open_count(IntPtr doc);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -67,6 +87,12 @@ namespace Lom.Native
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern void lom_match_list_free(IntPtr list);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern void lom_oi_list_init(IntPtr list);
+
+		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+		static extern void lom_oi_list_free(IntPtr list);
 
 		[DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
 		static extern IntPtr lom_version();
@@ -116,6 +142,40 @@ namespace Lom.Native
 			if(st != 0)
 				throw new InvalidOperationException("count failed: " + st + " " + Error);
 			return (long)n;
+		}
+
+		/// <summary>Open indices (uint32) — internal currency; no offset pairs.</summary>
+		public List<uint> GetOis(string selector)
+		{
+			IntPtr listPtr = Marshal.AllocHGlobal(Marshal.SizeOf<LomOiList>());
+			try
+			{
+				Marshal.StructureToPtr(new LomOiList(), listPtr, false);
+				lom_oi_list_init(listPtr);
+				int st = lom_doc_get_ois(_doc, Z(selector), listPtr);
+				if(st != 0)
+					throw new InvalidOperationException("get_ois failed: " + st + " " + Error);
+				var ol = Marshal.PtrToStructure<LomOiList>(listPtr);
+				int n = (int)ol.Count;
+				var results = new List<uint>(n);
+				for(int i = 0; i < n; i++)
+					results.Add((uint)Marshal.ReadInt32(ol.Items, i * 4));
+				return results;
+			}
+			finally
+			{
+				lom_oi_list_free(listPtr);
+				Marshal.FreeHGlobal(listPtr);
+			}
+		}
+
+		/// <summary>Materialize one open index to a byte span.</summary>
+		public (long Offset, long End) OiMatch(uint oi)
+		{
+			int st = lom_doc_oi_match(_doc, oi, out LomMatch m);
+			if(st != 0)
+				throw new InvalidOperationException("oi_match failed: " + st + " " + Error);
+			return (m.Offset, m.EndOff);
 		}
 
 		/// <summary>Run a LOM selector; returns (offset, end, node XML slice) for each hit.</summary>
@@ -172,6 +232,22 @@ namespace Lom.Native
 		{
 			var st = lom_doc_save_file(_doc, Z(path));
 			if(st != 0) throw new InvalidOperationException("save failed: " + st + " " + Error);
+		}
+
+		public void WalPersist()
+		{
+			var st = lom_doc_wal_persist(_doc);
+			if(st != 0) throw new InvalidOperationException("wal_persist failed: " + st + " " + Error);
+		}
+
+		public List<(long Offset, long End, string Text)> GetXPath(string xpath)
+		{
+			var buf = new byte[1024];
+			var st = lom_xpath_to_lom(Z(xpath), buf, (UIntPtr)buf.Length);
+			if(st != 0) throw new InvalidOperationException("xpath not in subset: " + xpath);
+			int n = Array.IndexOf(buf, (byte)0);
+			string sel = Encoding.UTF8.GetString(buf, 0, n < 0 ? buf.Length : n);
+			return Get(sel);
 		}
 
 		public void Dispose()

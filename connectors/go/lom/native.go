@@ -86,6 +86,43 @@ func (d *Doc) Get(selector string) ([]Match, error) {
 	return out, nil
 }
 
+// GetOis returns open indices (uint32) without materializing offset pairs.
+func (d *Doc) GetOis(selector string) ([]uint32, error) {
+	if d == nil || d.ptr == nil {
+		return nil, errors.New("nil doc")
+	}
+	cs := C.CString(selector)
+	defer C.free(unsafe.Pointer(cs))
+	var list C.lom_oi_list
+	C.lom_oi_list_init(&list)
+	st := C.lom_doc_get_ois(d.ptr, cs, &list)
+	if st != C.LOM_OK {
+		C.lom_oi_list_free(&list)
+		return nil, fmt.Errorf("lom_doc_get_ois failed: %d %s", int(st), d.Error())
+	}
+	n := int(list.count)
+	out := make([]uint32, n)
+	if n > 0 && list.items != nil {
+		items := unsafe.Slice((*uint32)(unsafe.Pointer(list.items)), n)
+		copy(out, items)
+	}
+	C.lom_oi_list_free(&list)
+	return out, nil
+}
+
+// OiMatch materializes one open index to a byte span.
+func (d *Doc) OiMatch(oi uint32) (Match, error) {
+	if d == nil || d.ptr == nil {
+		return Match{}, errors.New("nil doc")
+	}
+	var m C.lom_match
+	st := C.lom_doc_oi_match(d.ptr, C.uint32_t(oi), &m)
+	if st != C.LOM_OK {
+		return Match{}, fmt.Errorf("lom_doc_oi_match failed: %d %s", int(st), d.Error())
+	}
+	return Match{Offset: int64(m.offset), EndOff: int64(m.end_off)}, nil
+}
+
 // Count returns cardinality without allocating match pairs.
 func (d *Doc) Count(selector string) (uint64, error) {
 	if d == nil || d.ptr == nil {
@@ -140,6 +177,17 @@ func (d *Doc) Delete(selector string) error {
 	st := C.lom_doc_delete(d.ptr, cs)
 	if st != C.LOM_OK {
 		return fmt.Errorf("delete failed: %d %s", int(st), d.Error())
+	}
+	return nil
+}
+
+func (d *Doc) WalPersist() error {
+	if d == nil || d.ptr == nil {
+		return errors.New("nil doc")
+	}
+	st := C.lom_doc_wal_persist(d.ptr)
+	if st != C.LOM_OK {
+		return fmt.Errorf("wal_persist failed: %d %s", int(st), d.Error())
 	}
 	return nil
 }

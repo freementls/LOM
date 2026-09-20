@@ -130,6 +130,7 @@ class O {
 	public $tagvalue_comparison_operators = array();
 	public $attribute_sets_comparison_operators = array();
 	public $native_doc = null; /* optional lom_accel document resource */
+	public $syntax_angle_mismatch = false; /* literal < or > in text; native scan is authoritative */
 	public $selector_regex_table = array(); /* id => array(pattern, flags, compiled) */
 	public $selector_regex_compile_cache = array(); /* "pattern\0flags" => compiled */
 	public $fmem_intern = array(); /* content-hash => string; L1 slice intern */
@@ -204,17 +205,21 @@ class O {
 			$this->file = false;
 		}
 		$this->initial_code = $this->code;
+		$this->syntax_angle_mismatch = false;
 		O::validate_syntax();
 		//$this->LOM = O::generate_LOM($this->code); // only generate_LOM as needed; it's possible that only simple preg operations on $this->code are needed
 		//print('$this->code in __construct: ');var_dump($this->code);
 		O::reset_tag_types();
 		O::check_tag_types($this->code);
+		O::set_LOM_operators();
+		O::native_doc_boot();
 		/* Large documents: defer the full offset_depths PHP array (huge per-key overhead)
-		 * until a query path needs it. Force with LOM_EAGER_DEPTHS=1. */
+		 * until a query path needs it. Force with LOM_EAGER_DEPTHS=1.
+		 * Native-backed docs and files with literal < / > in text skip PHP indexes. */
 		$code_bytes = strlen($this->code);
 		$eager = getenv('LOM_EAGER_DEPTHS');
 		$eager_on = ($eager !== false && $eager !== '' && $eager !== '0' && strcasecmp((string)$eager, 'false') !== 0 && strcasecmp((string)$eager, 'off') !== 0);
-		if(!$eager_on && $code_bytes >= 8 * 1024 * 1024) {
+		if($this->native_doc || $this->syntax_angle_mismatch || (!$eager_on && $code_bytes >= 8 * 1024 * 1024)) {
 			$this->offset_depths = array();
 			$this->offset_depths_pending = true;
 			$this->fmem_enabled = false; /* avoid second copies of large slices by default */
@@ -222,8 +227,6 @@ class O {
 			$this->offset_depths_pending = false;
 			O::set_offset_depths();
 		}
-		O::set_LOM_operators();
-		O::native_doc_boot();
 		//O::debug();
 	}
 
@@ -238,8 +241,14 @@ class O {
 	function native_doc_boot() {
 		$this->native_doc = null;
 		$env = getenv('LOM_NATIVE');
+		$file_backed = is_string($this->file) && $this->file !== '' && $this->file !== false
+			&& @is_file($this->file);
 		if($env === false) {
-			return false;
+			/* Default on for file-backed docs once liblom is loaded. */
+			if(!$file_backed) {
+				return false;
+			}
+			$env = '1';
 		}
 		$env = strtolower(trim((string)$env));
 		if(!in_array($env, array('1', 'true', 'on', 'yes'), true)) {
@@ -256,18 +265,48 @@ class O {
 		return true;
 	}
 
+	function native_finish_get($rows, $tagged_result = false) {
+		$this->offsets_from_get = array();
+		if(!is_array($rows)) {
+			return array();
+		}
+		$text_onlys = array();
+		$all_texts_in_single_tags = sizeof($rows) > 0;
+		$all_texts_untagged = sizeof($rows) > 0;
+		foreach($rows as $row) {
+			if(!is_array($row) || !isset($row[0])) {
+				continue;
+			}
+			if(isset($row[1])) {
+				$this->offsets_from_get[] = $row[1];
+			}
+			$string_of_match = $row[0];
+			if($all_texts_in_single_tags) {
+				$n = strlen($string_of_match);
+				if(!($n > 0 && $string_of_match[0] === '<' && $string_of_match[$n - 1] === '>'
+					&& substr_count($string_of_match, '<') === 2 && substr_count($string_of_match, '>') === 2)) {
+					$all_texts_in_single_tags = false;
+				}
+			}
+			if($all_texts_untagged && (strpos($string_of_match, '<') !== false || strpos($string_of_match, '>') !== false)) {
+				$all_texts_untagged = false;
+			}
+			$text_onlys[] = O::tagless($string_of_match);
+		}
+		if($tagged_result) {
+			return $rows;
+		}
+		if($all_texts_in_single_tags || $all_texts_untagged) {
+			if(sizeof($text_onlys) === 1) {
+				return $text_onlys[0];
+			}
+			return $text_onlys;
+		}
+		return $rows;
+	}
+
 	function native_selector_supported($selector) {
 		if(!is_string($selector) || $selector === '') {
-			return false;
-		}
-		if(strpos($selector, '|') !== false || strpos($selector, '.') !== false || strpos($selector, '&') !== false) {
-			return false;
-		}
-		if(strpos($selector, '__') !== false) {
-			return false;
-		}
-		// Indexed selectors are always 0-based in PHP; keep them off the native path.
-		if(strpos($selector, '[') !== false) {
 			return false;
 		}
 		return true;
@@ -464,6 +503,17 @@ class O {
 			return (int)$m[1];
 		}
 		return false;
+	}
+
+	function lom_regex_caret_prefix_only($pattern) {
+		if(!is_string($pattern) || $pattern === '' || $pattern[0] !== '^') {
+			return false;
+		}
+		$n = strlen($pattern);
+		if($n >= 2 && $pattern[$n - 1] === '$' && ($n < 3 || $pattern[$n - 2] !== '\\')) {
+			return false;
+		}
+		return true;
 	}
 
 	function lom_regex_allowed_flags($flags) {
@@ -707,6 +757,10 @@ class O {
 			switch($op) {
 				case '=':
 					if($off === 0 && $mlen === $text_len) {
+						return true;
+					}
+					/* `/^ski/i` is a start anchor, not a full-value pattern. */
+					if($off === 0 && O::lom_regex_caret_prefix_only($entry['pattern'])) {
 						return true;
 					}
 					break;
@@ -2021,7 +2075,7 @@ class O {
 			if($this->native_doc && $matching_array === false && O::native_selector_supported($selector) && function_exists('lom_doc_get_tagged_parent')) {
 				$r = lom_doc_get_tagged_parent($this->native_doc, $selector);
 				if(is_array($r)) {
-					return $r;
+					return O::native_finish_get($r, true);
 				}
 			}
 			return O::get_parent($selector, $matching_array, $add_to_context, $ignore_context, $parent_node_only, true);
@@ -3802,6 +3856,9 @@ class O {
 			}
 			return $parents_array;
 		} elseif(is_string($selector)) {
+			if($matching_array === false || $matching_array === NULL || (is_array($matching_array) && sizeof($matching_array) === 0)) {
+				return $this->get($selector . "'", false, $add_to_context, $ignore_context, $parent_node_only, $tagged_result);
+			}
 			$normalized_selector = O::normalize_selector($selector);
 			$selector_uses_overlay = $this->_lom_selector_has_overlay($normalized_selector);
 			// Keep parent reads on the same selector path so get() can reuse context/cache
@@ -3939,7 +3996,7 @@ class O {
 		if($this->native_doc && $matching_array === false && O::native_selector_supported($selector) && function_exists('lom_doc_get_tagged')) {
 			$r = lom_doc_get_tagged($this->native_doc, $selector);
 			if(is_array($r)) {
-				return $r;
+				return O::native_finish_get($r, true);
 			}
 		}
 		return O::get($selector, $matching_array, $add_to_context, $ignore_context, $parent_node_only, true);
@@ -3957,9 +4014,230 @@ class O {
 		return O::get($selector, $matching_array, $add_to_context, $ignore_context, $parent_node_only, $tagged_result);
 	}
 
+	function xpath($xpath, $matching_array = false) {
+		$sel = $this->xpath_to_lom($xpath);
+		if($sel === false) {
+			return false;
+		}
+		$eval = $this->route_eval_selector($sel);
+		if($eval !== null) {
+			return $eval;
+		}
+		return $this->get($sel, $matching_array);
+	}
+
+	function css($css, $matching_array = false) {
+		$sel = $this->css_to_lom($css);
+		if($sel === false) {
+			return false;
+		}
+		return $this->get($sel, $matching_array);
+	}
+
+	/* #sel / sum: / avg: / count() are numbers, not match lists. null = not an eval form. */
+	function route_eval_selector($selector) {
+		if(!is_string($selector) || $selector === '') {
+			return null;
+		}
+		if($selector[0] === '#' && !preg_match('/^#[A-Za-z0-9]+#/', $selector)) {
+			return $this->count(substr($selector, 1));
+		}
+		if(strncmp($selector, 'sum:', 4) === 0) {
+			return $this->sum(substr($selector, 4));
+		}
+		if(strncmp($selector, 'avg:', 4) === 0) {
+			return $this->average(substr($selector, 4));
+		}
+		if(preg_match('/^(count|sum|average|avg)\((.*)\)$/s', $selector, $m) && strpos($m[2], '(') === false) {
+			if($m[1] === 'count') {
+				return $this->count($m[2]);
+			}
+			if($m[1] === 'sum') {
+				return $this->sum($m[2]);
+			}
+			return $this->average($m[2]);
+		}
+		return null;
+	}
+
+	function xpath_to_lom($xpath) {
+		if(!is_string($xpath) || $xpath === '') {
+			return false;
+		}
+		if(function_exists('lom_xpath_to_lom')) {
+			$compiled = lom_xpath_to_lom($xpath);
+			return is_string($compiled) && $compiled !== '' ? $compiled : false;
+		}
+		$sel = '';
+		$p = ltrim($xpath);
+		if(preg_match('/^(count|sum|avg|average)\((.*)\)\s*$/s', $p, $cm) && substr_count($cm[2], '(') === 0) {
+			$inner = $this->xpath_to_lom($cm[2]);
+			if($inner === false) {
+				return false;
+			}
+			if($cm[1] === 'count') {
+				return '#' . $inner;
+			}
+			if($cm[1] === 'sum') {
+				return 'sum:' . $inner;
+			}
+			return 'avg:' . $inner;
+		}
+		$first = true;
+		$pending = 0;
+		if(substr($p, 0, 2) === '//') {
+			$pending = 1;
+			$p = substr($p, 2);
+		} elseif(isset($p[0]) && $p[0] === '/') {
+			$p = substr($p, 1);
+		}
+		while($p !== '') {
+			$p = ltrim($p);
+			if($p === '') {
+				break;
+			}
+			if(substr($p, 0, 2) === '//') {
+				$pending = 1;
+				$p = substr($p, 2);
+				continue;
+			}
+			if($p[0] === '/') {
+				$pending = 0;
+				$p = substr($p, 1);
+				continue;
+			}
+			if($p[0] === '|') {
+				$sel .= '|';
+				$first = true;
+				$pending = 0;
+				$p = substr($p, 1);
+				continue;
+			}
+			if(substr($p, 0, 8) === 'parent::') {
+				$pending = 2;
+				$p = substr($p, 8);
+				continue;
+			}
+			if(substr($p, 0, 10) === 'ancestor::') {
+				$pending = 3;
+				$p = substr($p, 10);
+				continue;
+			}
+			if(substr($p, 0, 2) === '..' && (strlen($p) === 2 || $p[2] === '/' || $p[2] === '|')) {
+				$p = substr($p, 2);
+				if($p === '' || $p[0] === '|' || $p[0] === '/') {
+					$sel .= "'";
+					$first = false;
+					$pending = 0;
+				} else {
+					$pending = 2;
+				}
+				continue;
+			}
+			if(!$first) {
+				if($pending === 1) {
+					$sel .= '__';
+				} elseif($pending === 2) {
+					$sel .= "'";
+				} elseif($pending === 3) {
+					$sel .= '"';
+				} else {
+					$sel .= '_';
+				}
+			} elseif($pending === 2) {
+				$sel .= "'";
+			} elseif($pending === 3) {
+				$sel .= '"';
+			}
+			$pending = 0;
+			$first = false;
+			if($p[0] === '*') {
+				$sel .= '*';
+				$p = substr($p, 1);
+			} elseif(preg_match('/^([A-Za-z_][\w:.-]*)/', $p, $m)) {
+				$sel .= $m[1];
+				$p = substr($p, strlen($m[1]));
+			} else {
+				return false;
+			}
+			while(isset($p[0]) && $p[0] === '[') {
+				$p = substr($p, 1);
+				if(preg_match('/^last\(\)\]/', $p)) {
+					$sel .= '[$]';
+					$p = substr($p, 7);
+				} elseif(preg_match('/^(\d+)\]/', $p, $m)) {
+					$sel .= '[' . ((int)$m[1] - 1) . ']';
+					$p = substr($p, strlen($m[1]) + 1);
+				} elseif(preg_match('/^@([A-Za-z_][\w:.-]*)(?:\s*=\s*[\'"]([^\'"]*)[\'"])?\]/', $p, $m)) {
+					$an = $m[1];
+					$sel .= '@' . $an;
+					if(isset($m[2])) {
+						$sel .= '=' . $m[2];
+					}
+					$p = substr($p, strlen($m[0]));
+				} else {
+					return false;
+				}
+			}
+		}
+		return $sel !== '' ? $sel : false;
+	}
+
+	function css_to_lom($css) {
+		if(!is_string($css) || $css === '') {
+			return false;
+		}
+		if(function_exists('lom_css_to_lom')) {
+			$compiled = lom_css_to_lom($css);
+			return is_string($compiled) && $compiled !== '' ? $compiled : false;
+		}
+		$parts = preg_split('/\s+>\s*|\s+/', trim($css));
+		$sel = '';
+		foreach($parts as $i => $part) {
+			if($part === '') {
+				continue;
+			}
+			if($i) {
+				$sel .= '_';
+			}
+			if(!preg_match('/^([A-Za-z_*][\w:.-]*)(.*)$/', $part, $m)) {
+				return false;
+			}
+			$name = $m[1] === '*' ? '*' : $m[1];
+			$sel .= $name;
+			$rest = $m[2];
+			if(preg_match('/\[([A-Za-z_][\w:-]*)(?:=[\'"]?([^\'\]]*)[\'"]?)?\]/', $rest, $am)) {
+				$sel .= '@' . $am[1];
+				if(isset($am[2]) && $am[2] !== '') {
+					$sel .= '=' . $am[2];
+				}
+			}
+			if(preg_match('/:nth-child\((\d+)\)/', $rest, $nm)) {
+				$sel .= '[' . ((int)$nm[1] - 1) . ']';
+			}
+			if(strpos($rest, ':last-of-type') !== false) {
+				$sel .= '[$]';
+			}
+		}
+		return $sel !== '' ? $sel : false;
+	}
+
 	function get($selector, $matching_array = false, $add_to_context = true, $ignore_context = false, $parent_node_only = false, $tagged_result = false) {
 		$profile_token = $this->profile_function_start('get');
 		try {
+		if(($matching_array === false || $matching_array === null) && is_string($selector)) {
+			$eval = $this->route_eval_selector($selector);
+			if($eval !== null) {
+				return $eval;
+			}
+		}
+		if($this->native_doc && $matching_array === false && is_string($selector) && !is_numeric($selector)
+			&& O::native_selector_supported($selector) && function_exists('lom_doc_get_tagged')) {
+			$r = lom_doc_get_tagged($this->native_doc, $selector);
+			if(is_array($r)) {
+				return O::native_finish_get($r, $tagged_result);
+			}
+		}
 		/* Large docs: keep depths lazy until a path that needs them (not slim/native fastpaths). */
 		if(!$this->offset_depths_pending) {
 			/* already built */
@@ -7621,6 +7899,9 @@ if(is_numeric($indices)) {
 		if(!is_string($raw) || $raw === '') {
 			return false;
 		}
+		if($raw === '$') {
+			return '$';
+		}
 		if(ctype_digit($raw)) {
 			return (int)$raw;
 		}
@@ -7682,6 +7963,13 @@ if(is_numeric($indices)) {
 			return $piece_matches;
 		}
 		$out = array();
+		if($spec === '$') {
+			if(!is_array($piece_matches) || sizeof($piece_matches) === 0) {
+				return array();
+			}
+			$last = $piece_matches[sizeof($piece_matches) - 1];
+			return array($last);
+		}
 		if(is_int($spec)) {
 			if($spec >= 0 && isset($piece_matches[$spec])) {
 				$out[] = $piece_matches[$spec];
@@ -7763,6 +8051,9 @@ if(is_numeric($indices)) {
 			return $hit;
 		}
 		if(!is_int($spec)) {
+			if($spec === '$') {
+				return true;
+			}
 			return false;
 		}
 		$hit = ($counter === $spec);
@@ -8989,54 +9280,53 @@ if(is_numeric($indices)) {
 			}
 			$selector_strings[] = $current_selector_string;
 			foreach($selector_strings as $selector_string) {
-				$us_placeholder = '';
-				if(strpos($selector_string, '#underscore#') !== false) {
-					$us_placeholder = "\x1E";
-					$selector_string = str_replace('#underscore#', $us_placeholder, $selector_string);
+				$selector_string = str_replace(
+					array('{underscore}', '#underscore#', '{forwardslash}', '#forwardslash#', '{apostrophe}', '#apostrophe#', '{quote}', '#quote#'),
+					array("\x1E", "\x1E", "\x1F", "\x1F", "\x01", "\x01", "\x02", "\x02"),
+					$selector_string
+				);
+				if($selector_string !== '' && ($selector_string[0] === "'" || $selector_string[0] === '"')) {
+					$selector_string = '*' . $selector_string;
 				}
-				$depth = 0;
 				if($selector_string !== '' && $selector_string[0] === '_') {
 					$scopes = array('direct');
-					//$fractal_depths = array(array('+1', '+1'));
 					$offset = 1;
 				} else {
 					$scopes = array(false);
-					//$fractal_depths = array(array('++', '++'));
 					$offset = 0;
 				}
 				$pieces = array();
 				$piece = '';
-				while($offset < strlen($selector_string)) {
-					if($selector_string[$offset] === '_') {
-						// ___ could be unpredicatable but it's their own fault if someone uses that!
-						if($selector_string[$offset + 1] === '_') {
+				$selector_len = strlen($selector_string);
+				while($offset < $selector_len) {
+					$ch = $selector_string[$offset];
+					if($ch === '_' || $ch === "'" || $ch === '"') {
+						if($ch === '_' && isset($selector_string[$offset + 1]) && $selector_string[$offset + 1] === '_') {
 							$scopes[] = false;
-							//$fractal_depths[] = array('++', '++');
 							$offset++;
+						} elseif($ch === "'") {
+							$scopes[] = 'parent';
+						} elseif($ch === '"') {
+							$scopes[] = 'ancestor';
 						} else {
 							$scopes[] = 'direct';
-							//$fractal_depths[] = array('+1', '+1');
 						}
 						$pieces[] = $piece;
 						$piece = '';
 						$offset++;
 						continue;
-					}/* elseif($selector_string[$offset] == ' ' || $selector_string[$offset] == "\t" || $selector_string[$offset]  == "\n" || $selector_string[$offset]  == "\r") { // ignore spaces
+					}
+					$piece .= $ch;
 					$offset++;
-					continue;
-				} elseif($selector_string[$offset] === '@') {
-
-				}*/
-				$piece .= $selector_string[$offset];
-				$offset++;
 				}
 				if(strlen($piece) > 0) {
 					$pieces[] = $piece;
 				}
-				if($us_placeholder !== '') {
-					foreach($pieces as $pk => $pv) {
-						$pieces[$pk] = str_replace($us_placeholder, '_', $pv);
-					}
+				if(sizeof($pieces) < sizeof($scopes)) {
+					$pieces[] = '*';
+				}
+				foreach($pieces as $pk => $pv) {
+					$pieces[$pk] = str_replace(array("\x1E", "\x1F", "\x01", "\x02"), array('_', '/', "'", '"'), $pv);
 				}
 				$this->selector_scope_sets[] = $scopes;
 				$this->selector_piece_sets[] = $pieces;
@@ -12305,7 +12595,40 @@ if(is_numeric($indices)) {
 		return $parent_node;
 	}
 
+	function get_ois($selector) {
+		if($this->native_doc && is_string($selector) && function_exists('lom_doc_get_ois')) {
+			$r = lom_doc_get_ois($this->native_doc, $selector);
+			if(is_array($r)) {
+				return $r;
+			}
+		}
+		return array();
+	}
+
+	function count($selector, $parent_node = false) {
+		if($this->native_doc && ($parent_node === false || $parent_node === null) && is_string($selector) && function_exists('lom_doc_count')) {
+			$n = lom_doc_count($this->native_doc, $selector);
+			if($n !== false) {
+				return (int)$n;
+			}
+		}
+		if(is_array($selector)) {
+			return sizeof($selector);
+		}
+		$matches = O::get_tagged($selector, $parent_node);
+		if(!is_array($matches)) {
+			return 0;
+		}
+		return sizeof($matches);
+	}
+
 	function sum($selector, $parent_node = false) {
+		if($this->native_doc && ($parent_node === false || $parent_node === null) && is_string($selector) && function_exists('lom_doc_sum')) {
+			$v = lom_doc_sum($this->native_doc, $selector);
+			if($v !== false) {
+				return $v;
+			}
+		}
 		//print('$selector, $parent_node in sum: ');var_dump($selector, $parent_node);
 		//print('$this->context in sum: ');var_dump($this->context);
 		$sum = 0;
@@ -12361,6 +12684,13 @@ if(is_numeric($indices)) {
 	}
 
 	function average($selector, $parent_node = false) {
+		if($this->native_doc && ($parent_node === false || $parent_node === null) && is_string($selector) && function_exists('lom_doc_average')) {
+			$v = lom_doc_average($this->native_doc, $selector);
+			if($v !== false) {
+				return $v;
+			}
+			return false;
+		}
 		$sum = 0;
 		if(is_numeric($selector)) { // treat it as an offset
 			$selector = (int)$selector;
@@ -12409,7 +12739,7 @@ if(is_numeric($indices)) {
 	}
 	}
 	return $sum / sizeof($values);*/
-		$average = $sum / sizeof($matches);
+		$average = sizeof($matches) ? ($sum / sizeof($matches)) : false;
 		return $average;
 	}
 
@@ -14414,12 +14744,12 @@ if(is_numeric($indices)) {
 	}
 
 	function validate_syntax() {
-		// only simplistically checks syntax
 		$opening_substr_count = substr_count($this->code, '<');
 		$closing_substr_count = substr_count($this->code, '>');
 		if($opening_substr_count !== $closing_substr_count) {
-			print('$opening_substr_count, $closing_substr_count, $this->file: ');var_dump($opening_substr_count, $closing_substr_count, $this->file);
-			O::fatal_error('$opening_substr_count !== $closing_substr_count');
+			/* Literal < or > in text / CDATA unbalances this check. Native
+			 * construct is authoritative; do not reject the file. */
+			$this->syntax_angle_mismatch = true;
 		}
 	}
 
@@ -15258,17 +15588,18 @@ if(is_numeric($indices)) {
 		$this->comparison_operators_regex = substr($this->comparison_operators_regex, 0, strlen($this->comparison_operators_regex) - 1);
 		$this->selector_operators = array(
 			/*' ',*/
-			'\\' => '#backslash#',
-			'/' => '#forwardslash#',
-			'_' => '#underscore#',
-			'@' => '#at#',
-			'&' => '#ampersand#',
-			'[' => '#leftsquarebracket#',
-			']' => '#rightsquarebracket#',
-			'.' => '#dot#',
-			'*' => '#asterisk#',
-			'|' => '#bar#',
-			//"'" => '#apostrophe#'
+			'\\' => '{backslash}',
+			'/' => '{forwardslash}',
+			'_' => '{underscore}',
+			'@' => '{at}',
+			'&' => '{ampersand}',
+			'[' => '{leftsquarebracket}',
+			']' => '{rightsquarebracket}',
+			'.' => '{dot}',
+			'*' => '{asterisk}',
+			'|' => '{bar}',
+			"'" => '{apostrophe}',
+			'"' => '{quote}',
 		);
 		$this->operators = array_merge($this->comparison_operators, $this->selector_operators);
 		return true;
@@ -15340,6 +15671,24 @@ if(is_numeric($indices)) {
 			*	$string = str_replace('<asterisk>', '*', $string);
 			*	$string = str_replace('<bar>', '|', $string);*/
 		foreach($this->operators as $raw => $coded) {
+			$string = str_replace($coded, $raw, $string);
+		}
+		/* One version of the old #word# escapes still reads. */
+		$legacy = array(
+			'#backslash#' => '\\',
+			'#forwardslash#' => '/',
+			'#underscore#' => '_',
+			'#at#' => '@',
+			'#ampersand#' => '&',
+			'#leftsquarebracket#' => '[',
+			'#rightsquarebracket#' => ']',
+			'#dot#' => '.',
+			'#asterisk#' => '*',
+			'#bar#' => '|',
+			'#apostrophe#' => "'",
+			'#quote#' => '"',
+		);
+		foreach($legacy as $coded => $raw) {
 			$string = str_replace($coded, $raw, $string);
 		}
 		return $string;

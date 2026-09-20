@@ -84,6 +84,27 @@ typedef struct lom_scan_result {
 	size_t self_closing_count;
 	lom_status status;
 	char error[256];
+
+	/* Fractal recipe: prefix rows live in opens[0, open_count). Virtual
+	 * open_count is prefix + tile_n * stride (see lom_doc_open_count).
+	 * k-class: leftover siblings that also tile get their own template. */
+#define LOM_RECIPE_KMAX 8
+	lom_open_row *recipe_tmpl; /* concatenated class templates */
+	size_t recipe_tmpl_n;      /* concat length (k=1: one template) */
+	size_t recipe_stride;      /* voi: prefix + tile * stride + local */
+	size_t recipe_k;
+	size_t recipe_k_tmpl_n[LOM_RECIPE_KMAX];
+	size_t recipe_k_tmpl_off[LOM_RECIPE_KMAX];
+	size_t recipe_k_tile_n[LOM_RECIPE_KMAX];
+	uint8_t *recipe_tile_cls; /* tile_n bytes; NULL => all class 0 */
+	uint64_t *recipe_starts;
+	uint64_t *recipe_ends;
+	size_t recipe_tile_n;
+	int32_t recipe_root_parent;
+	int recipe_owned; /* 1 => free tmpl/starts/ends/tile_cls */
+	int recipe_class_n; /* recipe templates used (k), else census unique tags */
+	double phase_census_ms;
+	double phase_sample_ms;
 } lom_scan_result;
 
 static inline int64_t lom_open_node_end(const lom_scan_result *s, const lom_open_row *r) {
@@ -133,7 +154,16 @@ typedef struct lom_match_list {
 	lom_match *items;
 	size_t count;
 	size_t cap;
+	int borrowed; /* 1 => items owned by fcache hold; do not free() */
+	void *hold;   /* lom_fcache_hold* when borrowed */
 } lom_match_list;
+
+/* Open-index results — 4 B/hit, no offset materialization. */
+typedef struct lom_oi_list {
+	uint32_t *items;
+	size_t count;
+	size_t cap;
+} lom_oi_list;
 
 typedef struct lom_doc lom_doc;
 
@@ -151,20 +181,41 @@ LOM_API lom_status lom_doc_status(const lom_doc *doc);
 LOM_API const char *lom_doc_error(const lom_doc *doc);
 LOM_API const char *lom_doc_code(const lom_doc *doc, size_t *out_len);
 LOM_API size_t lom_doc_open_count(const lom_doc *doc);
+/* 1 if create_file loaded path.lomidx (mmap sidecar), else 0. */
+LOM_API int lom_doc_from_sidecar(const lom_doc *doc);
+/* 1 if this doc uses a fractal tile recipe (no wholesale open table). */
+LOM_API int lom_doc_recipe_active(const lom_doc *doc);
+/* Recipe templates in use (k-class); 1 = single template. */
+LOM_API int lom_doc_recipe_class_count(const lom_doc *doc);
+/* Construct phase clocks in milliseconds (0 if not measured). */
+LOM_API void lom_doc_construct_phases(const lom_doc *doc,
+	double *census_ms, double *sample_ms, double *persist_ms);
 LOM_API bool lom_doc_brackets_balanced(const lom_doc *doc);
 
 LOM_API void lom_match_list_init(lom_match_list *m);
 LOM_API void lom_match_list_free(lom_match_list *m);
+LOM_API void lom_oi_list_init(lom_oi_list *m);
+LOM_API void lom_oi_list_free(lom_oi_list *m);
 
 /* Selector subset: tag chains with optional [n], tag@attr, tag@attr=val,
    tag chains ending in =text, and comparison ops with /pattern/flags
    (PCRE2; '=' means full-span match). Use '_' between child steps
-   ('__' for descendant). Tag names containing '_' must be encoded by
-   the caller. '/' after a comparison op starts a regex literal. */
+   ('__' for descendant, '\'' parent, '"' ancestor). [$] is last
+   same-name sibling. Leading #sel is count sugar (not a match list).
+   Tag names containing '_' must be encoded ({underscore} or #underscore#).
+   '/' after a comparison op starts a regex literal. */
 LOM_API lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out);
 /* Match count without allocating offset pairs — prefer this for broad `$count` /
  * cardinality checks (e.g. `*` / `note` on GB docs). */
 LOM_API lom_status lom_doc_count(lom_doc *doc, const char *selector, size_t *out_count);
+/* Sum / mean of tagless inner text. Empty average is LOM_ERR_NOTFOUND. */
+LOM_API lom_status lom_doc_sum(lom_doc *doc, const char *selector, double *out);
+LOM_API lom_status lom_doc_average(lom_doc *doc, const char *selector, double *out);
+/* Internal query currency: open indices (uint32). Writes, vars, context, unions,
+ * and count use this. lom_doc_get() materializes offset pairs from these ois. */
+LOM_API lom_status lom_doc_get_ois(lom_doc *doc, const char *selector, lom_oi_list *out);
+/* Resolve one open index to a match (applies overlay / offset bias). */
+LOM_API lom_status lom_doc_oi_match(const lom_doc *doc, uint32_t oi, lom_match *out);
 LOM_API lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list *out);
 LOM_API lom_status lom_doc_node_slice(const lom_doc *doc, int64_t open_off, const char **ptr, size_t *len);
 
@@ -178,6 +229,23 @@ LOM_API lom_status lom_doc_child_text(const lom_doc *doc, int64_t open_off, cons
 LOM_API lom_status lom_doc_set_attr(lom_doc *doc, int64_t open_off, const char *attr, const char *value);
 LOM_API lom_status lom_doc_ensure_ids(lom_doc *doc, const char *row_selector, const char *id_attr);
 LOM_API lom_status lom_doc_save_file(const lom_doc *doc, const char *path);
+/* Persist in-memory overlay / same-size edits beside the XML (path.lomwal). */
+LOM_API lom_status lom_doc_wal_persist(lom_doc *doc);
+LOM_API lom_status lom_doc_wal_load(lom_doc *doc);
+/* Flatten overlay, rewrite XML once, drop WAL, refresh sidecar. */
+LOM_API lom_status lom_doc_checkpoint(lom_doc *doc, const char *path);
+LOM_API int lom_doc_wal_pending(const lom_doc *doc);
+
+/* Conversational context + living named selections (native). */
+LOM_API void lom_doc_clear_context(lom_doc *doc);
+LOM_API lom_status lom_doc_var_set(lom_doc *doc, const char *name, const char *selector);
+LOM_API lom_status lom_doc_var_get(lom_doc *doc, const char *name, lom_match_list *out);
+
+/* Compatibility facades — compile a subset to a LOM selector. */
+LOM_API lom_status lom_xpath_to_lom(const char *xpath, char *out, size_t out_cap);
+LOM_API lom_status lom_css_to_lom(const char *css, char *out, size_t out_cap);
+LOM_API lom_status lom_doc_get_xpath(lom_doc *doc, const char *xpath, lom_match_list *out);
+LOM_API lom_status lom_doc_get_css(lom_doc *doc, const char *css, lom_match_list *out);
 LOM_API lom_status lom_doc_delete_offset(lom_doc *doc, int64_t open_off);
 LOM_API lom_status lom_doc_set_inner_text_offset(lom_doc *doc, int64_t open_off, const char *text);
 LOM_API lom_status lom_doc_set_child_text_offset(lom_doc *doc, int64_t open_off, const char *child_tag, const char *text);

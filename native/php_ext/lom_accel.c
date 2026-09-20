@@ -7,6 +7,7 @@
 #include "lom.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 typedef struct {
@@ -54,10 +55,24 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_lom_doc_set, 0, 0, 3)
 	ZEND_ARG_TYPE_INFO(0, text, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_lom_xpath, 0, 0, 1)
+	ZEND_ARG_TYPE_INFO(0, xpath, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_lom_doc_oi_match, 0, 0, 2)
+	ZEND_ARG_INFO(0, doc)
+	ZEND_ARG_TYPE_INFO(0, oi, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_lom_doc_new, 0, 0, 3)
 	ZEND_ARG_INFO(0, doc)
 	ZEND_ARG_TYPE_INFO(0, selector, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, fragment, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_lom_doc_checkpoint, 0, 0, 2)
+	ZEND_ARG_INFO(0, doc)
+	ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
 static lom_doc *fetch_doc(zval *zid)
@@ -66,18 +81,25 @@ static lom_doc *fetch_doc(zval *zid)
 	return r ? r->doc : NULL;
 }
 
-static void matches_to_php(lom_doc *doc, lom_match_list *m, zval *return_value)
+static void match_row_to_php(lom_doc *doc, int64_t offset, zval *return_value)
+{
+	const char *ptr = NULL;
+	size_t len = 0;
+	if(lom_doc_node_slice(doc, offset, &ptr, &len) != LOM_OK) return;
+	zval row;
+	array_init(&row);
+	add_next_index_stringl(&row, ptr, len);
+	add_next_index_long(&row, (zend_long)offset);
+	add_next_index_zval(return_value, &row);
+}
+
+static void ois_to_tagged_php(lom_doc *doc, lom_oi_list *ois, zval *return_value)
 {
 	array_init(return_value);
-	for(size_t i = 0; i < m->count; i++) {
-		const char *ptr = NULL;
-		size_t len = 0;
-		if(lom_doc_node_slice(doc, m->items[i].offset, &ptr, &len) != LOM_OK) continue;
-		zval row;
-		array_init(&row);
-		add_next_index_stringl(&row, ptr, len);
-		add_next_index_long(&row, (zend_long)m->items[i].offset);
-		add_next_index_zval(return_value, &row);
+	for(size_t i = 0; i < ois->count; i++) {
+		lom_match m;
+		if(lom_doc_oi_match(doc, ois->items[i], &m) != LOM_OK) continue;
+		match_row_to_php(doc, m.offset, return_value);
 	}
 }
 
@@ -232,14 +254,14 @@ PHP_FUNCTION(lom_doc_get_tagged)
 	ZEND_PARSE_PARAMETERS_END();
 	lom_doc *doc = fetch_doc(zid);
 	if(!doc) RETURN_FALSE;
-	lom_match_list m;
-	lom_match_list_init(&m);
-	if(lom_doc_get(doc, ZSTR_VAL(sel), &m) != LOM_OK) {
-		lom_match_list_free(&m);
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	if(lom_doc_get_ois(doc, ZSTR_VAL(sel), &ois) != LOM_OK) {
+		lom_oi_list_free(&ois);
 		RETURN_FALSE;
 	}
-	matches_to_php(doc, &m, return_value);
-	lom_match_list_free(&m);
+	ois_to_tagged_php(doc, &ois, return_value);
+	lom_oi_list_free(&ois);
 }
 
 PHP_FUNCTION(lom_doc_get_tagged_parent)
@@ -258,8 +280,64 @@ PHP_FUNCTION(lom_doc_get_tagged_parent)
 		lom_match_list_free(&m);
 		RETURN_FALSE;
 	}
-	matches_to_php(doc, &m, return_value);
+	array_init(return_value);
+	for(size_t i = 0; i < m.count; i++)
+		match_row_to_php(doc, m.items[i].offset, return_value);
 	lom_match_list_free(&m);
+}
+
+PHP_FUNCTION(lom_doc_count)
+{
+	zval *zid;
+	zend_string *sel;
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_RESOURCE(zid)
+		Z_PARAM_STR(sel)
+	ZEND_PARSE_PARAMETERS_END();
+	lom_doc *doc = fetch_doc(zid);
+	if(!doc) RETURN_FALSE;
+	size_t n = 0;
+	if(lom_doc_count(doc, ZSTR_VAL(sel), &n) != LOM_OK) RETURN_FALSE;
+	RETURN_LONG((zend_long)n);
+}
+
+PHP_FUNCTION(lom_doc_get_ois)
+{
+	zval *zid;
+	zend_string *sel;
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_RESOURCE(zid)
+		Z_PARAM_STR(sel)
+	ZEND_PARSE_PARAMETERS_END();
+	lom_doc *doc = fetch_doc(zid);
+	if(!doc) RETURN_FALSE;
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	if(lom_doc_get_ois(doc, ZSTR_VAL(sel), &ois) != LOM_OK) {
+		lom_oi_list_free(&ois);
+		RETURN_FALSE;
+	}
+	array_init(return_value);
+	for(size_t i = 0; i < ois.count; i++)
+		add_next_index_long(return_value, (zend_long)ois.items[i]);
+	lom_oi_list_free(&ois);
+}
+
+PHP_FUNCTION(lom_doc_oi_match)
+{
+	zval *zid;
+	zend_long oi;
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_RESOURCE(zid)
+		Z_PARAM_LONG(oi)
+	ZEND_PARSE_PARAMETERS_END();
+	lom_doc *doc = fetch_doc(zid);
+	if(!doc) RETURN_FALSE;
+	lom_match m;
+	if(lom_doc_oi_match(doc, (uint32_t)oi, &m) != LOM_OK) RETURN_FALSE;
+	array_init(return_value);
+	add_next_index_long(return_value, (zend_long)m.offset);
+	add_next_index_long(return_value, (zend_long)m.end_off);
 }
 
 PHP_FUNCTION(lom_doc_set_inner_text)
@@ -303,6 +381,71 @@ PHP_FUNCTION(lom_doc_sync_code)
 	RETURN_STRINGL(code, len);
 }
 
+PHP_FUNCTION(lom_doc_checkpoint)
+{
+	zval *zid;
+	zend_string *path;
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_RESOURCE(zid)
+		Z_PARAM_STR(path)
+	ZEND_PARSE_PARAMETERS_END();
+	lom_doc *doc = fetch_doc(zid);
+	if(!doc) RETURN_FALSE;
+	RETURN_BOOL(lom_doc_checkpoint(doc, ZSTR_VAL(path)) == LOM_OK);
+}
+
+PHP_FUNCTION(lom_doc_sum)
+{
+	zval *zid;
+	zend_string *sel;
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_RESOURCE(zid)
+		Z_PARAM_STR(sel)
+	ZEND_PARSE_PARAMETERS_END();
+	lom_doc *doc = fetch_doc(zid);
+	if(!doc) RETURN_FALSE;
+	double v = 0;
+	if(lom_doc_sum(doc, ZSTR_VAL(sel), &v) != LOM_OK) RETURN_FALSE;
+	RETURN_DOUBLE(v);
+}
+
+PHP_FUNCTION(lom_doc_average)
+{
+	zval *zid;
+	zend_string *sel;
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_RESOURCE(zid)
+		Z_PARAM_STR(sel)
+	ZEND_PARSE_PARAMETERS_END();
+	lom_doc *doc = fetch_doc(zid);
+	if(!doc) RETURN_FALSE;
+	double v = 0;
+	if(lom_doc_average(doc, ZSTR_VAL(sel), &v) != LOM_OK) RETURN_FALSE;
+	RETURN_DOUBLE(v);
+}
+
+PHP_FUNCTION(lom_xpath_to_lom)
+{
+	zend_string *xp;
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_STR(xp)
+	ZEND_PARSE_PARAMETERS_END();
+	char buf[2048];
+	if(lom_xpath_to_lom(ZSTR_VAL(xp), buf, sizeof(buf)) != LOM_OK) RETURN_FALSE;
+	RETURN_STRING(buf);
+}
+
+PHP_FUNCTION(lom_css_to_lom)
+{
+	zend_string *css;
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_STR(css)
+	ZEND_PARSE_PARAMETERS_END();
+	char buf[2048];
+	if(lom_css_to_lom(ZSTR_VAL(css), buf, sizeof(buf)) != LOM_OK) RETURN_FALSE;
+	RETURN_STRING(buf);
+}
+
 static const zend_function_entry lom_accel_functions[] = {
 	PHP_FE(lom_accel_available, arginfo_lom_accel_available)
 	PHP_FE(lom_accel_version, arginfo_lom_accel_version)
@@ -311,9 +454,17 @@ static const zend_function_entry lom_accel_functions[] = {
 	PHP_FE(lom_doc_code, arginfo_lom_doc_op)
 	PHP_FE(lom_doc_get_tagged, arginfo_lom_doc_get)
 	PHP_FE(lom_doc_get_tagged_parent, arginfo_lom_doc_get)
+	PHP_FE(lom_doc_count, arginfo_lom_doc_get)
+	PHP_FE(lom_doc_sum, arginfo_lom_doc_get)
+	PHP_FE(lom_doc_average, arginfo_lom_doc_get)
+	PHP_FE(lom_xpath_to_lom, arginfo_lom_xpath)
+	PHP_FE(lom_css_to_lom, arginfo_lom_xpath)
+	PHP_FE(lom_doc_get_ois, arginfo_lom_doc_get)
+	PHP_FE(lom_doc_oi_match, arginfo_lom_doc_oi_match)
 	PHP_FE(lom_doc_set_inner_text, arginfo_lom_doc_set)
 	PHP_FE(lom_doc_new_before_close, arginfo_lom_doc_new)
 	PHP_FE(lom_doc_sync_code, arginfo_lom_doc_op)
+	PHP_FE(lom_doc_checkpoint, arginfo_lom_doc_checkpoint)
 	PHP_FE_END
 };
 
@@ -340,7 +491,7 @@ zend_module_entry lom_accel_module_entry = {
 	NULL,
 	NULL,
 	PHP_MINFO(lom_accel),
-	"0.2.0",
+	"0.3.2",
 	STANDARD_MODULE_PROPERTIES
 };
 

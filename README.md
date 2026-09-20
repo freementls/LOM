@@ -6,11 +6,13 @@ Living Object Model — hierarchical XML document engine (PHP `O.php`) with a na
 
 **License:** [Apache License 2.0](LICENSE).
 
+**Start here:** [`docs/USING.md`](docs/USING.md) — selector primer, when LOM wins (live document, selective poke), when to stream/XMLWriter, how to compact.
+
 Selectors use `_` / `__` for child / descendant. Comparison values may be PCRE literals: `hobby%=/s.*/i` (see `regex_selector_test.php`). Multi-language connectors: [`connectors/`](connectors/).
 
 Large-document scans optionally use sibling [fractal_substring](https://github.com/freementls/fractal_substring) (`libfss`; `LOM_FSS_SCAN=0` to disable).
 
-**Research draft:** [`docs/paper/lom_living_object_model.md`](docs/paper/lom_living_object_model.md) (includes [§9 Competing interests](docs/paper/lom_living_object_model.md#9-competing-interests--conflict-of-interest)) · **Numbers:** [`docs/RESULTS.md`](docs/RESULTS.md) (native 100 MB construct ~0.7–1.2 s; 1 GB ~5–7 s; connectors under [`connectors/`](connectors/)).
+**Research draft:** [`docs/paper/lom_living_object_model.md`](docs/paper/lom_living_object_model.md) (includes [§9 Competing interests](docs/paper/lom_living_object_model.md#9-competing-interests--conflict-of-interest)) · **Numbers:** [`docs/RESULTS.md`](docs/RESULTS.md) (native 100 MB construct ~0.65 s; 20 GB recipe construct ~2.7 s / reload ~0.04 ms; irregular mix recipe construct ~1.3 ms; connectors under [`connectors/`](connectors/)).
 
 ## Live demo
 
@@ -18,7 +20,7 @@ Large-document scans optionally use sibling [fractal_substring](https://github.c
 
 **[https://freement.cloud/LOM/lab/](https://freement.cloud/LOM/lab/)** — app lab: PHP / JS / `$XML*` on the left, running app on the right. Writes go through AJAP (AJAX to PHP) and live-update the nowdocs.
 
-Source for those pages: [`demo/`](demo/), [`lab/`](lab/). Locally: `php -S localhost:8765` then http://localhost:8765/demo/ or http://localhost:8765/lab/.
+Source for those pages: [`demo/`](demo/), [`lab/`](lab/). Locally: `php -S localhost:8765` then http://localhost:8765/demo/ or http://localhost:8765/lab/. A localhost-only 1 GB / 20 GB playground lives at [`demo/large/`](demo/large/) (Apache `Require local`; not linked from the public demo).
 
 ## Quick paths
 
@@ -30,6 +32,7 @@ Source for those pages: [`demo/`](demo/), [`lab/`](lab/). Locally: `php -S local
 | `native/` | C library (`liblom`), CLI (`lomc`), OData daemon (`lomd`) |
 | `powerapps/` | Entity config, OpenAPI custom connector, setup guide |
 | `connectors/` | C#, Python, TypeScript, Java, Go clients (ABI + OData) |
+| [`docs/USING.md`](docs/USING.md) | Selector primer, WAL/compact, when not to use LOM |
 | `docs/paper/` | Working research paper draft |
 | `docs/RESULTS.md` | Benchmark snapshot |
 | `LICENSE` | Apache-2.0 |
@@ -61,4 +64,4 @@ make -C native php-ext
 php -d extension=$PWD/native/php_ext/modules/lom_accel.so …
 ```
 
-Set `LOM_ACCEL=0` to force pure PHP. Set `LOM_NATIVE=1` to route simple get/set/new_ through `lom_doc`.
+Set `LOM_ACCEL=0` to force pure PHP. File-backed docs default to `liblom` when the accelerator is loaded (`LOM_NATIVE=0` to force PHP). `O::xpath()` / `O::css()` compile a documented subset to LOM selectors.

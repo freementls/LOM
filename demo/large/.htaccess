@@ -1,0 +1,5 @@
+# Local-only big-fixture playground. Not linked from the public demo.
+<IfModule mod_authz_core.c>
+	Require local
+</IfModule>
+DirectoryIndex index.php

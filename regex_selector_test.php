@@ -36,6 +36,8 @@ function expect_true($label, $cond) {
 // Operators on tag text
 expect_count('= full match skiing', 'hobby=/skiing/i', 1);
 expect_count('= ski.* needs full cover (0)', 'hobby=/ski.*/i', 1); // ski.* covers skiing
+expect_count('= /^ski/i is prefix not full-span', 'hobby=/^ski/i', 1);
+expect_count('= /^ski$/i still full-span', 'hobby=/^ski$/i', 0);
 expect_count('%= s\\w+ substring', 'hobby%=/s\\w+/', 4); // skiing,swimming,fishing(shing),sleeping
 expect_count('^= starts with s', 'hobby^=/s/i', 3);
 expect_count('$= ends with ing', 'hobby$=/ing$/', 4);
@@ -76,6 +78,15 @@ expect_count('regex + [1] node index', 'hobby%=/ing/[1]', 1);
 $cmd = 'php -r \'require "' . __DIR__ . '/O.php"; $O=new O("' . __DIR__ . '/test.xml"); $O->get_tagged("hobby=/x/e");\' 2>&1';
 $out = shell_exec($cmd);
 expect_true('reject flag e', is_string($out) && (strpos($out, 'unsupported regex flags') !== false || strpos($out, 'invalid') !== false || strpos($out, 'fatal') !== false || strlen($out) > 0));
+
+// Demo chips (must stay live on test.xml)
+expect_count('demo hobby%=/s.*/i', 'hobby%=/s.*/i', 4);
+expect_count('demo hobby^=/ski/i', 'hobby^=/ski/i', 1);
+expect_count('demo hobby$=/ing$/', 'hobby$=/ing$/', 4);
+expect_count('demo hobby%=/ski|swim/', 'hobby%=/ski|swim/', 2);
+expect_count('demo hobby!=/sleep/i', 'hobby!=/sleep/i', 4);
+expect_count('demo name^=/sal/i', 'name^=/sal/i', 3);
+expect_count('demo name!=sally', 'name!=sally', 4);
 
 // Existing non-regex regressions
 expect_count('literal hobby skiing', 'hobby=skiing', 1);

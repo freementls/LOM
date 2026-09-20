@@ -10,8 +10,14 @@ typedef struct lom_fcache_entry {
 	size_t key_len;
 	void *val;
 	size_t val_len;
+	size_t refs; /* 1 = linked in a bucket; +1 per live hold */
+	int linked;
 	struct lom_fcache_entry *next;
 } lom_fcache_entry;
+
+struct lom_fcache_hold {
+	lom_fcache_entry *e;
+};
 
 struct lom_fcache {
 	lom_fcache_entry **buckets;
@@ -29,6 +35,15 @@ static uint64_t fnv1a64(const unsigned char *p, size_t n) {
 	return h;
 }
 
+static void entry_release(lom_fcache_entry *e) {
+	if(!e) return;
+	if(e->refs > 0) e->refs--;
+	if(e->refs || e->linked) return;
+	free(e->key);
+	free(e->val);
+	free(e);
+}
+
 lom_fcache *lom_fcache_create(size_t bucket_hint) {
 	lom_fcache *c = calloc(1, sizeof(*c));
 	if(!c) return NULL;
@@ -43,16 +58,7 @@ lom_fcache *lom_fcache_create(size_t bucket_hint) {
 
 void lom_fcache_free(lom_fcache *c) {
 	if(!c) return;
-	for(size_t i = 0; i < c->nbuckets; i++) {
-		lom_fcache_entry *e = c->buckets[i];
-		while(e) {
-			lom_fcache_entry *n = e->next;
-			free(e->key);
-			free(e->val);
-			free(e);
-			e = n;
-		}
-	}
+	lom_fcache_clear(c);
 	free(c->buckets);
 	free(c);
 }
@@ -63,9 +69,9 @@ void lom_fcache_clear(lom_fcache *c) {
 		lom_fcache_entry *e = c->buckets[i];
 		while(e) {
 			lom_fcache_entry *n = e->next;
-			free(e->key);
-			free(e->val);
-			free(e);
+			e->next = NULL;
+			e->linked = 0;
+			entry_release(e);
 			e = n;
 		}
 		c->buckets[i] = NULL;
@@ -104,24 +110,56 @@ bool lom_fcache_put(lom_fcache *c, const void *key, size_t key_len, const void *
 	ne->key_len = key_len;
 	ne->val_len = val_len;
 	ne->hash = h;
+	ne->refs = 1;
+	ne->linked = 1;
 	ne->next = c->buckets[bi];
 	c->buckets[bi] = ne;
 	return true;
 }
 
-const void *lom_fcache_get(lom_fcache *c, const void *key, size_t key_len, size_t *out_len) {
+static lom_fcache_entry *find_entry(lom_fcache *c, const void *key, size_t key_len, int hit_count) {
 	if(!c || !key) return NULL;
 	uint64_t h = fnv1a64(key, key_len);
 	size_t bi = (size_t)(h % c->nbuckets);
 	for(lom_fcache_entry *e = c->buckets[bi]; e; e = e->next) {
 		if(e->hash == h && e->key_len == key_len && memcmp(e->key, key, key_len) == 0) {
-			c->hits++;
-			if(out_len) *out_len = e->val_len;
-			return e->val;
+			if(hit_count) c->hits++;
+			return e;
 		}
 	}
-	c->misses++;
+	if(hit_count) c->misses++;
 	return NULL;
+}
+
+const void *lom_fcache_get(lom_fcache *c, const void *key, size_t key_len, size_t *out_len) {
+	lom_fcache_entry *e = find_entry(c, key, key_len, 1);
+	if(!e) return NULL;
+	if(out_len) *out_len = e->val_len;
+	return e->val;
+}
+
+const void *lom_fcache_borrow(lom_fcache *c, const void *key, size_t key_len, size_t *out_len,
+	lom_fcache_hold **out_hold) {
+	if(out_hold) *out_hold = NULL;
+	lom_fcache_entry *e = find_entry(c, key, key_len, 1);
+	if(!e) return NULL;
+	lom_fcache_hold *h = malloc(sizeof(*h));
+	if(!h) return NULL;
+	e->refs++;
+	h->e = e;
+	if(out_len) *out_len = e->val_len;
+	if(out_hold) *out_hold = h;
+	else {
+		entry_release(e);
+		free(h);
+	}
+	return e->val;
+}
+
+void lom_fcache_hold_release(lom_fcache_hold *h) {
+	if(!h) return;
+	entry_release(h->e);
+	free(h);
 }
 
 size_t lom_fcache_hits(const lom_fcache *c) { return c ? c->hits : 0; }

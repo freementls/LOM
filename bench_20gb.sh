@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Full measured 20GB native profile — no extrapolation.
-# Construct + queries (region, descendant, attr, text, indexed, regex, parent)
-# + writes (set, new_, delete, re-read, validate).
+# Construct + queries (region, descendant, attr, text, indexed, regex)
+# + writes (set, new_, delete, validate) + dest lom_doc_checkpoint
+# (scratch fixture_20GB.xml.checkpoint.xml, then unlink; source fixture intact).
 #
 # Usage:
 #   ./bench_20gb.sh
@@ -14,6 +15,8 @@ FIX20="$OUT/fixture_20GB.xml"
 REPORT="$OUT/bench_20gb.txt"
 mkdir -p "$OUT"
 export LOM_OPEN_TMPDIR="${LOM_OPEN_TMPDIR:-/var/tmp}"
+export LOM_SIDECAR="${LOM_SIDECAR:-1}"
+export LOM_TILE="${LOM_TILE:-1}"
 make -C "$ROOT/native" -j"$(nproc)" >/dev/null
 
 mem_avail_kb() { awk '/MemAvailable:/ {print $2}' /proc/meminfo; }
@@ -65,12 +68,24 @@ fi
 BYTES=$(stat -c%s "$FIX20")
 echo "fixture_bytes=$BYTES open_tmpdir=$LOM_OPEN_TMPDIR" | tee -a "$REPORT"
 
+# Construct-only gates: recipe sidecar, no wholesale 21 GiB open table.
+{
+  echo "## construct-only gates"
+  rm -f "$FIX1.lomidx" "$FIX1.lomopens" "$FIX20.lomidx" "$FIX20.lomopens"
+  echo "--- 1GB ---"
+  /usr/bin/time -f 'wall_s=%e maxrss_kb=%M' "$ROOT/native/bin/lomc" --construct-only "$FIX1"
+  echo "--- 20GB ---"
+  /usr/bin/time -f 'wall_s=%e maxrss_kb=%M' "$ROOT/native/bin/lomc" --construct-only "$FIX20"
+} 2>&1 | tee -a "$REPORT"
+
 cat > /tmp/lom_20gb_full.c <<'EOF'
 #include "lom.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 static long rss_kb(void) {
 	FILE *f = fopen("/proc/self/status", "r");
@@ -102,33 +117,66 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "construct fail: %s\n", d ? lom_doc_error(d) : "null");
 		return 1;
 	}
-	size_t len = 0; lom_doc_code(d, &len);
-	snprintf(extra, sizeof(extra), "opens=%zu bytes=%zu", lom_doc_open_count(d), len);
+	size_t len = 0;
+	{ struct stat st; if(stat(path, &st) == 0 && st.st_size > 0) len = (size_t)st.st_size; }
+	snprintf(extra, sizeof(extra), "opens=%zu bytes=%zu sidecar=%d recipe=%d",
+		lom_doc_open_count(d), len, lom_doc_from_sidecar(d), lom_doc_recipe_active(d));
 	line("construct", t1 - t0, extra);
 
-	struct { const char *key; const char *sel; int parent; } qs[] = {
-		{"region_cold", "region", 0},
-		{"region_warm", "region", 0},
-		{"descendant_cold", "region_zone_entity_stats", 0},
-		{"descendant_warm", "region_zone_entity_stats", 0},
-		{"attr_kind_cold", "entity@kind", 0},
-		{"attr_kind_warm", "entity@kind", 0},
-		{"text_eq_cold", "name=/^Entity_42$/", 0},
-		{"indexed_cold", "region[10]_zone[5]_entity[7]_stats", 0},
-		{"regex_cold", "name%=/Entity_1/", 0},
-		{"regex_warm", "name%=/Entity_1/", 0},
-		{"parent_cold", "region_zone_entity_stats", 1},
+	/* Huge selectors stay count-only — a full get of tens of millions of
+	 * matches would allocate offset pairs and blow RSS. */
+	struct { const char *key; const char *sel; } counts[] = {
+		{"region_cold", "region"},
+		{"region_warm", "region"},
+		{"descendant_cold", "region_zone_entity_stats"},
+		{"descendant_warm", "region_zone_entity_stats"},
+		{"attr_kind_cold", "entity@kind"},
+		{"attr_kind_warm", "entity@kind"},
 	};
-	for(size_t i = 0; i < sizeof(qs)/sizeof(qs[0]); i++) {
+	for(size_t i = 0; i < sizeof(counts)/sizeof(counts[0]); i++) {
+		size_t n = 0;
+		t0 = ms();
+		lom_status st = lom_doc_count(d, counts[i].sel, &n);
+		t1 = ms();
+		snprintf(extra, sizeof(extra), "n=%zu st=%d", n, (int)st);
+		line(counts[i].key, t1 - t0, extra);
+	}
+
+	struct { const char *key; const char *sel; } gets[] = {
+		{"text_eq_cold", "entity_meta_name=Entity#underscore#42"},
+		{"text_re_cold", "name=/^Entity_42$/"},
+		{"indexed_cold", "region[10]_zone[5]_entity[7]_stats"},
+	};
+	for(size_t i = 0; i < sizeof(gets)/sizeof(gets[0]); i++) {
 		lom_match_list m; lom_match_list_init(&m);
 		t0 = ms();
-		lom_status st = qs[i].parent
-			? lom_doc_get_parent(d, qs[i].sel, &m)
-			: lom_doc_get(d, qs[i].sel, &m);
+		lom_status st = lom_doc_get(d, gets[i].sel, &m);
 		t1 = ms();
 		snprintf(extra, sizeof(extra), "n=%zu st=%d", m.count, (int)st);
-		line(qs[i].key, t1 - t0, extra);
+		line(gets[i].key, t1 - t0, extra);
 		lom_match_list_free(&m);
+	}
+
+	lom_doc_free(d);
+	printf("after_free_rss_MB=%.1f\n", rss_kb() / 1024.0);
+
+	/* Sidecar reload before any write (set/new_/delete unlink .lomidx). */
+	t0 = ms();
+	d = lom_doc_create_file(path);
+	t1 = ms();
+	if(!d || lom_doc_status(d) != LOM_OK) {
+		fprintf(stderr, "reload fail: %s\n", d ? lom_doc_error(d) : "null");
+		return 1;
+	}
+	snprintf(extra, sizeof(extra), "opens=%zu", lom_doc_open_count(d));
+	line("sidecar_reload", t1 - t0, extra);
+	{
+		size_t n = 0;
+		t0 = ms();
+		lom_doc_count(d, "region_zone_entity_stats", &n);
+		t1 = ms();
+		snprintf(extra, sizeof(extra), "n=%zu", n);
+		line("reload_descendant_count", t1 - t0, extra);
 	}
 
 	const char *note = "region[1]_zone[3]_entity[4]_meta_note";
@@ -172,23 +220,55 @@ int main(int argc, char **argv) {
 	snprintf(extra, sizeof(extra), "ok=%d", ok);
 	line("validate", t1 - t0, extra);
 
-	/* Save to a scratch path under .bench_out (not overwriting the fixture). */
+	/* Canonical rewrite of the edited doc (overlay streamed; does not flatten 21 GiB in RAM). */
 	char savepath[512];
-	snprintf(savepath, sizeof(savepath), "%s.bench_write_snip.xml", path);
-	/* Only save a note that save works on mmap-private: write may be huge — skip full 20GB rewrite
-	 * unless LOM_20GB_SAVE=1. */
-	if(getenv("LOM_20GB_SAVE") && getenv("LOM_20GB_SAVE")[0] == '1') {
-		t0 = ms();
-		wst = lom_doc_save_file(d, savepath);
-		t1 = ms();
-		snprintf(extra, sizeof(extra), "st=%d path=%s", (int)wst, savepath);
-		line("save", t1 - t0, extra);
-	} else {
-		printf("save_ms=skipped (set LOM_20GB_SAVE=1 to rewrite 20GB)\n");
+	snprintf(savepath, sizeof(savepath), "%s.checkpoint.xml", path);
+	unlink(savepath);
+	t0 = ms();
+	wst = lom_doc_checkpoint(d, savepath);
+	t1 = ms();
+	{
+		struct stat st;
+		long long wbytes = (stat(savepath, &st) == 0) ? (long long)st.st_size : -1;
+		snprintf(extra, sizeof(extra), "st=%d written=%lld", (int)wst, wbytes);
+		line("checkpoint", t1 - t0, extra);
+	}
+	lom_doc_free(d);
+	d = NULL;
+	if(wst == LOM_OK) {
+		char idxp[640];
+		snprintf(idxp, sizeof idxp, "%s.lomidx", savepath);
+		if(access(idxp, F_OK) == 0) {
+			t0 = ms();
+			lom_doc *ck = lom_doc_create_file(savepath);
+			t1 = ms();
+			size_t n = 0;
+			double t2 = ms();
+			if(ck) lom_doc_count(ck, "region", &n);
+			double t3 = ms();
+			snprintf(extra, sizeof(extra), "n=%zu recipe=%d sidecar=%d construct_ms=%.1f",
+				n, ck ? lom_doc_recipe_active(ck) : -1,
+				ck ? lom_doc_from_sidecar(ck) : -1, t1 - t0);
+			line("checkpoint_reload", t3 - t2, extra);
+			if(ck) lom_doc_free(ck);
+		} else {
+			printf("checkpoint_reload_ms=skipped (no dest sidecar)\n");
+			fflush(stdout);
+		}
+	}
+	{
+		char extra_path[640];
+		snprintf(extra_path, sizeof extra_path, "%s.lomidx", savepath);
+		unlink(extra_path);
+		snprintf(extra_path, sizeof extra_path, "%s.lomopens", savepath);
+		unlink(extra_path);
+		snprintf(extra_path, sizeof extra_path, "%s.lomwal", savepath);
+		unlink(extra_path);
+		unlink(savepath);
 	}
 
 	lom_doc_free(d);
-	printf("after_free_rss_MB=%.1f\n", rss_kb() / 1024.0);
+	printf("after_reload_free_rss_MB=%.1f\n", rss_kb() / 1024.0);
 	return 0;
 }
 EOF

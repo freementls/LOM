@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <time.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -99,7 +100,51 @@ struct lom_doc {
 	lom_status status;
 	char error[256];
 	int aux_dirty; /* 1 => tag/CSR indexes stale; rebuild on next query */
+	char *source_path; /* file create: sidecar lives beside this path */
+	void *sidecar_map;
+	size_t sidecar_map_len;
+	int sidecar_fd;
+	int sidecar_owns; /* opens/strings/tag_rows point into sidecar_map */
+	double phase_persist_ms;
+	size_t hot_tile;
+	lom_scan_result hot_scan;
+	uint32_t *recipe_nids;
+	char *hot_bytes;
+	size_t hot_bytes_lo;
+	size_t hot_bytes_n;
+#ifndef LOM_HOT_CACHE
+#define LOM_HOT_CACHE 4
+#endif
+	struct {
+		size_t tile;
+		lom_scan_result scan;
+		char *bytes;
+		size_t lo, n;
+		unsigned gen;
+	} hot_park[LOM_HOT_CACHE];
+	unsigned hot_gen;
+	int recipe_jump_ok;
+	size_t recipe_jump_pre_n;
+	char recipe_jump_pre[80];
+	uint64_t recipe_jump_v0;
+	uint64_t recipe_jump_stride;
+	lom_oi_list ctx;
+	int ctx_live;
+	char var_name[16][40];
+	lom_oi_list var_list[16];
+	int var_n;
+	int wal_dirty;
+	/* Instruction hot-slot: repeated same-size set_inner_text pins (sel, off, len). */
+	char slot_sel[160];
+	int64_t slot_off;
+	size_t slot_ilen;
+	int slot_hits;
 };
+
+static void doc_sidecar_invalidate(lom_doc *d);
+static char doc_byte(const lom_doc *d, size_t i);
+static int doc_ensure_code(lom_doc *d);
+static void wal_path_for(const char *xml_path, char *out, size_t cap);
 
 static int env_flag_on(const char *name, int default_on) {
 	const char *v = getenv(name);
@@ -117,8 +162,8 @@ static void doc_init_accel(lom_doc *d) {
 	/* Fractal string: enabled for lazy ensure; construct build only with LOM_FSTR=eager. */
 	d->use_fstr = env_flag_on("LOM_FSTR", 1);
 	d->use_pieces = env_flag_on("LOM_PIECES", 1);
-	/* Parallel tag-row build duplicates per-thread buffers; default off for RAM. */
-	d->use_parallel = env_flag_on("LOM_PARALLEL", 0);
+	/* Parallel piece-local scan: default on; hardware gate may still serialise. */
+	d->use_parallel = env_flag_on("LOM_PARALLEL", 1);
 	d->mmap_fd = -1;
 	d->code_is_mmap = 0;
 	d->code_overlay = 0;
@@ -138,9 +183,42 @@ static void doc_init_accel(lom_doc *d) {
 	d->tag_pend_cap = 0;
 	d->open_sorted_n = 0;
 	d->piece_count = 0;
+	lom_oi_list_init(&d->ctx);
+	d->ctx_live = 0;
+	d->var_n = 0;
+	d->wal_dirty = 0;
 	d->fstr = NULL;
 	memset(d->piece_dirty, 0, sizeof(d->piece_dirty));
 	d->aux_dirty = 0;
+	d->source_path = NULL;
+	d->sidecar_map = NULL;
+	d->sidecar_map_len = 0;
+	d->sidecar_fd = -1;
+	d->sidecar_owns = 0;
+	d->phase_persist_ms = 0;
+	d->hot_tile = (size_t)-1;
+	lom_scan_result_init(&d->hot_scan);
+	d->recipe_nids = NULL;
+	d->hot_bytes = NULL;
+	d->hot_bytes_lo = 0;
+	d->hot_bytes_n = 0;
+	d->hot_gen = 0;
+	d->recipe_jump_ok = 0;
+	d->recipe_jump_pre_n = 0;
+	d->recipe_jump_v0 = 0;
+	d->recipe_jump_stride = 0;
+	d->slot_off = -1;
+	d->slot_ilen = 0;
+	d->slot_hits = 0;
+	d->slot_sel[0] = 0;
+	for(int i = 0; i < LOM_HOT_CACHE; i++) {
+		d->hot_park[i].tile = (size_t)-1;
+		lom_scan_result_init(&d->hot_park[i].scan);
+		d->hot_park[i].bytes = NULL;
+		d->hot_park[i].lo = 0;
+		d->hot_park[i].n = 0;
+		d->hot_park[i].gen = 0;
+	}
 	if(d->use_fmem) {
 		d->fmem = lom_fmem_create(2048);
 	}
@@ -167,6 +245,21 @@ static void doc_free_accel(lom_doc *d) {
 	d->tag_pend_name = NULL;
 	d->tag_pend_oi = NULL;
 	d->tag_pend_n = d->tag_pend_cap = 0;
+	lom_scan_result_free(&d->hot_scan);
+	d->hot_tile = (size_t)-1;
+	free(d->hot_bytes);
+	d->hot_bytes = NULL;
+	d->hot_bytes_lo = 0;
+	d->hot_bytes_n = 0;
+	for(int i = 0; i < LOM_HOT_CACHE; i++) {
+		lom_scan_result_free(&d->hot_park[i].scan);
+		free(d->hot_park[i].bytes);
+		d->hot_park[i].bytes = NULL;
+		d->hot_park[i].tile = (size_t)-1;
+	}
+	d->recipe_jump_ok = 0;
+	free(d->recipe_nids);
+	d->recipe_nids = NULL;
 }
 
 static void doc_invalidate_fstr(lom_doc *d) {
@@ -182,7 +275,7 @@ static void doc_invalidate_fstr(lom_doc *d) {
 static void doc_ensure_fstr(lom_doc *d) {
 	if(d->fstr || !d->use_fstr || !d->code || d->code_len < 4096) return;
 	if(d->code_overlay) return;
-	if(d->code_len >= (size_t)256 * 1024 * 1024) return;
+	/* Lazy per mapped window — do not skip GB files (piece/tile prune needs it). */
 	d->fstr = lom_fstr_build(
 		d->code, d->code_len,
 		d->scan.opens, d->scan.open_count,
@@ -233,6 +326,7 @@ static void doc_mark_dirty_at(lom_doc *d, size_t offset) {
 	d->piece_dirty[pi] = 1;
 	/* Invalidate memoized selectors; keep the table (fcache) for re-fill — avoids churn. */
 	if(d->fcache) lom_fcache_clear(d->fcache);
+	doc_sidecar_invalidate(d);
 }
 
 static void doc_fmem_ingest_strings(lom_doc *d) {
@@ -243,17 +337,33 @@ static void doc_fmem_ingest_strings(lom_doc *d) {
 }
 
 static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need);
+static const lom_open_row *doc_open_at(lom_doc *d, size_t oi, lom_open_row *scratch);
+static int32_t row_parent(const lom_doc *d, const lom_open_row *r);
+static size_t doc_virt_opens(const lom_doc *d);
+static lom_status matches_from_ois_bytes(lom_doc *d, const uint32_t *ois, size_t n, lom_match_list *out);
+static int ptr_in_sidecar(const lom_doc *d, const void *p);
 
 /* Splice mutates the open table with realloc/memmove — copy mmap'd opens to heap first. */
+static int sidecar_opens_interior(const lom_doc *d) {
+	if(!d->sidecar_owns || !d->sidecar_map || !d->scan.opens || !d->sidecar_map_len)
+		return 0;
+	const char *p = (const char *)d->scan.opens;
+	const char *base = (const char *)d->sidecar_map;
+	return p >= base && p < base + d->sidecar_map_len;
+}
+
 static bool doc_opens_to_heap(lom_doc *d) {
-	if(!d->scan.opens_is_mmap) return true;
+	int interior = sidecar_opens_interior(d);
+	if(!d->scan.opens_is_mmap && !interior) return true;
 	size_t n = d->scan.open_count;
 	size_t bytes = (n ? n : 1) * sizeof(lom_open_row);
 	lom_open_row *p = malloc(bytes);
 	if(!p) return false;
 	if(n) memcpy(p, d->scan.opens, n * sizeof(lom_open_row));
-	munmap(d->scan.opens, d->scan.opens_map_bytes ? d->scan.opens_map_bytes : bytes);
-	if(d->scan.opens_fd >= 0) close(d->scan.opens_fd);
+	if(d->scan.opens_is_mmap && !interior) {
+		munmap(d->scan.opens, d->scan.opens_map_bytes ? d->scan.opens_map_bytes : bytes);
+		if(d->scan.opens_fd >= 0) close(d->scan.opens_fd);
+	}
 	d->scan.opens = p;
 	d->scan.open_cap = n ? n : 1;
 	d->scan.opens_fd = -1;
@@ -262,14 +372,55 @@ static bool doc_opens_to_heap(lom_doc *d) {
 	return true;
 }
 
+static int doc_strings_to_heap(lom_doc *d) {
+	int blob_in = ptr_in_sidecar(d, d->scan.string_blob);
+	int offs_in = ptr_in_sidecar(d, d->scan.string_offs);
+	if(!blob_in && !offs_in) return 1;
+	if(blob_in) {
+		size_t n = d->scan.string_blob_len ? d->scan.string_blob_len : 1;
+		char *nb = malloc(n);
+		if(!nb) return 0;
+		if(d->scan.string_blob_len) memcpy(nb, d->scan.string_blob, d->scan.string_blob_len);
+		d->scan.string_blob = nb;
+		d->scan.string_blob_cap = n;
+	}
+	if(offs_in) {
+		size_t n = d->scan.string_count ? d->scan.string_count : 1;
+		size_t *no = malloc(n * sizeof(size_t));
+		if(!no) return 0;
+		if(d->scan.string_count) memcpy(no, d->scan.string_offs, d->scan.string_count * sizeof(size_t));
+		d->scan.string_offs = no;
+		d->scan.string_cap = n;
+	}
+	return 1;
+}
+
+static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need);
+
 void lom_match_list_init(lom_match_list *m) {
 	memset(m, 0, sizeof(*m));
 }
 
 void lom_match_list_free(lom_match_list *m) {
 	if(!m) return;
-	free(m->items);
+	if(m->hold) {
+		lom_fcache_hold_release((lom_fcache_hold *)m->hold);
+		m->hold = NULL;
+		m->items = NULL;
+	} else if(!m->borrowed) {
+		free(m->items);
+	}
 	lom_match_list_init(m);
+}
+
+void lom_oi_list_init(lom_oi_list *m) {
+	if(m) memset(m, 0, sizeof(*m));
+}
+
+void lom_oi_list_free(lom_oi_list *m) {
+	if(!m) return;
+	free(m->items);
+	lom_oi_list_init(m);
 }
 
 static bool grow_cap(void **ptr, size_t elem, size_t *cap, size_t need) {
@@ -300,6 +451,46 @@ static bool match_push_fast(lom_match_list *m, int64_t off, int64_t end) {
 	m->items[m->count].end_off = end;
 	m->count++;
 	return true;
+}
+
+static bool oi_list_assign_copy(lom_oi_list *out, const uint32_t *src, size_t n) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
+	if(n == 0) return true;
+	if(!grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, n))
+		return false;
+	memcpy(out->items, src, n * sizeof(uint32_t));
+	out->count = n;
+	return true;
+}
+
+static bool oi_push(lom_oi_list *m, uint32_t oi) {
+	if(!grow_cap((void **)&m->items, sizeof(uint32_t), &m->cap, m->count + 1)) return false;
+	m->items[m->count++] = oi;
+	return true;
+}
+
+static bool oi_push_fast(lom_oi_list *m, uint32_t oi) {
+	if(m->count >= m->cap) return oi_push(m, oi);
+	m->items[m->count++] = oi;
+	return true;
+}
+
+static bool oi_in_ctx(const lom_doc *d, uint32_t oi) {
+	if(!d || !d->ctx_live || !d->ctx.count) return 0;
+	int32_t cur = (int32_t)oi;
+	for(;;) {
+		for(size_t c = 0; c < d->ctx.count; c++) {
+			if(d->ctx.items[c] == (uint32_t)cur) return 1;
+		}
+		if(cur < 0 || (size_t)cur >= doc_virt_opens(d)) return 0;
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at((lom_doc *)d, (size_t)cur, &scratch);
+		if(!row) return 0;
+		int32_t p = row_parent(d, row);
+		if(p < 0) return 0;
+		cur = p;
+	}
 }
 
 static int64_t row_open_off(const lom_doc *d, const lom_open_row *r) {
@@ -356,6 +547,302 @@ static size_t decode_open_idx(const lom_doc *d, uint32_t stored) {
 	if(d->idx_bias_delta && oi >= d->idx_bias_from)
 		oi += d->idx_bias_delta;
 	return oi;
+}
+
+static int doc_has_recipe(const lom_doc *d) {
+	return d && d->scan.recipe_tile_n && d->scan.recipe_tmpl && d->scan.recipe_tmpl_n;
+}
+
+static size_t recipe_stride_n(const lom_scan_result *s) {
+	if(!s) return 0;
+	if(s->recipe_stride) return s->recipe_stride;
+	return s->recipe_tmpl_n;
+}
+
+static size_t recipe_k_n(const lom_scan_result *s) {
+	if(!s || s->recipe_k == 0) return 1;
+	return s->recipe_k > LOM_RECIPE_KMAX ? LOM_RECIPE_KMAX : s->recipe_k;
+}
+
+static size_t recipe_tile_cls_id(const lom_scan_result *s, size_t tile) {
+	if(!s || !s->recipe_tile_cls || recipe_k_n(s) <= 1) return 0;
+	if(tile >= s->recipe_tile_n) return 0;
+	return (size_t)s->recipe_tile_cls[tile];
+}
+
+static const lom_open_row *recipe_cls_rows(const lom_scan_result *s, size_t c, size_t *tn) {
+	size_t k = recipe_k_n(s);
+	if(k > 1 && c < k) {
+		*tn = s->recipe_k_tmpl_n[c];
+		return s->recipe_tmpl + s->recipe_k_tmpl_off[c];
+	}
+	if(s->recipe_k_tmpl_n[0]) {
+		*tn = s->recipe_k_tmpl_n[0];
+		return s->recipe_tmpl + s->recipe_k_tmpl_off[0];
+	}
+	*tn = s->recipe_tmpl_n;
+	return s->recipe_tmpl;
+}
+
+static size_t recipe_voi_of(const lom_scan_result *s, size_t tile, size_t local) {
+	return s->open_count + tile * recipe_stride_n(s) + local;
+}
+
+static size_t recipe_locals_nid(const lom_scan_result *s, size_t c, uint32_t nid,
+	uint32_t *locals, size_t max) {
+	size_t tn = 0, n = 0;
+	const lom_open_row *tmpl = recipe_cls_rows(s, c, &tn);
+	if(!tmpl) return 0;
+	for(size_t i = 0; i < tn; i++) {
+		if(tmpl[i].name_id != nid) continue;
+		if(locals && n < max) locals[n] = (uint32_t)i;
+		n++;
+		if(locals && n >= max) break;
+	}
+	return n;
+}
+
+static size_t doc_virt_opens(const lom_doc *d) {
+	if(!d) return 0;
+	if(!doc_has_recipe(d)) return d->scan.open_count;
+	return d->scan.open_count + d->scan.recipe_tile_n * recipe_stride_n(&d->scan);
+}
+
+static int64_t recipe_range_start(const lom_doc *d, size_t tile) {
+	int64_t s = (int64_t)d->scan.recipe_starts[tile];
+	if(d->off_bias_delta && s >= d->off_bias_from) s += d->off_bias_delta;
+	return s;
+}
+
+static int64_t recipe_range_end(const lom_doc *d, size_t tile) {
+	int64_t e = (int64_t)d->scan.recipe_ends[tile];
+	if(d->off_bias_delta && e >= d->off_bias_from) e += d->off_bias_delta;
+	return e;
+}
+
+static void recipe_drop_current(lom_doc *d) {
+	lom_scan_result_free(&d->hot_scan);
+	d->hot_tile = (size_t)-1;
+	free(d->hot_bytes);
+	d->hot_bytes = NULL;
+	d->hot_bytes_lo = 0;
+	d->hot_bytes_n = 0;
+}
+
+static void recipe_park_free_slot(lom_doc *d, int i) {
+	lom_scan_result_free(&d->hot_park[i].scan);
+	free(d->hot_park[i].bytes);
+	d->hot_park[i].bytes = NULL;
+	d->hot_park[i].tile = (size_t)-1;
+	d->hot_park[i].lo = 0;
+	d->hot_park[i].n = 0;
+	d->hot_park[i].gen = 0;
+}
+
+static void recipe_invalidate_hot(lom_doc *d) {
+	recipe_drop_current(d);
+	for(int i = 0; i < LOM_HOT_CACHE; i++) recipe_park_free_slot(d, i);
+	d->recipe_jump_ok = 0;
+	d->recipe_jump_pre_n = 0;
+	d->recipe_jump_stride = 0;
+}
+
+static int recipe_hot_restore(lom_doc *d, size_t tile) {
+	for(int i = 0; i < LOM_HOT_CACHE; i++) {
+		if(d->hot_park[i].tile != tile) continue;
+		recipe_drop_current(d);
+		d->hot_tile = tile;
+		d->hot_scan = d->hot_park[i].scan;
+		d->hot_bytes = d->hot_park[i].bytes;
+		d->hot_bytes_lo = d->hot_park[i].lo;
+		d->hot_bytes_n = d->hot_park[i].n;
+		lom_scan_result_init(&d->hot_park[i].scan);
+		d->hot_park[i].bytes = NULL;
+		d->hot_park[i].tile = (size_t)-1;
+		d->hot_park[i].lo = 0;
+		d->hot_park[i].n = 0;
+		return 1;
+	}
+	return 0;
+}
+
+static void recipe_hot_park(lom_doc *d) {
+	if(d->hot_tile == (size_t)-1) return;
+	int slot = -1;
+	unsigned oldest = UINT_MAX;
+	for(int i = 0; i < LOM_HOT_CACHE; i++) {
+		if(d->hot_park[i].tile == (size_t)-1) { slot = i; break; }
+		if(d->hot_park[i].gen <= oldest) {
+			oldest = d->hot_park[i].gen;
+			slot = i;
+		}
+	}
+	if(slot < 0) slot = 0;
+	if(d->hot_park[slot].tile != (size_t)-1) recipe_park_free_slot(d, slot);
+	d->hot_park[slot].tile = d->hot_tile;
+	d->hot_park[slot].scan = d->hot_scan;
+	d->hot_park[slot].bytes = d->hot_bytes;
+	d->hot_park[slot].lo = d->hot_bytes_lo;
+	d->hot_park[slot].n = d->hot_bytes_n;
+	d->hot_park[slot].gen = ++d->hot_gen;
+	lom_scan_result_init(&d->hot_scan);
+	d->hot_bytes = NULL;
+	d->hot_bytes_lo = 0;
+	d->hot_bytes_n = 0;
+	d->hot_tile = (size_t)-1;
+}
+
+static const char *doc_hot_ptr(const lom_doc *d, size_t off, size_t len) {
+	if(d->hot_bytes && off >= d->hot_bytes_lo
+		&& off + len <= d->hot_bytes_lo + d->hot_bytes_n)
+		return d->hot_bytes + (off - d->hot_bytes_lo);
+	for(int i = 0; i < LOM_HOT_CACHE; i++) {
+		if(!d->hot_park[i].bytes) continue;
+		if(off >= d->hot_park[i].lo
+			&& off + len <= d->hot_park[i].lo + d->hot_park[i].n)
+			return d->hot_park[i].bytes + (off - d->hot_park[i].lo);
+	}
+	return NULL;
+}
+
+static int recipe_ensure_nids(lom_doc *d) {
+	if(d->recipe_nids) return 1;
+	size_t n = d->scan.recipe_tmpl_n;
+	d->recipe_nids = malloc(n * sizeof(uint32_t));
+	if(!d->recipe_nids) return 0;
+	for(size_t i = 0; i < n; i++)
+		d->recipe_nids[i] = d->scan.recipe_tmpl[i].name_id;
+	return 1;
+}
+
+/* Scan one tile into hot_scan. Unmapped recipe docs pread the tile (~13–50 KiB). */
+static lom_status recipe_instantiate_tile(lom_doc *d, size_t tile) {
+	if(!doc_has_recipe(d) || tile >= d->scan.recipe_tile_n) return LOM_ERR_ARG;
+	size_t cls = recipe_tile_cls_id(&d->scan, tile);
+	size_t tn = 0;
+	const lom_open_row *ct = recipe_cls_rows(&d->scan, cls, &tn);
+	if(!ct || !tn) return LOM_ERR_PARSE;
+	if(d->hot_tile == tile && d->hot_scan.open_count == tn)
+		return LOM_OK;
+	if(recipe_hot_restore(d, tile)) return LOM_OK;
+	recipe_hot_park(d);
+	(void)recipe_ensure_nids(d);
+	int64_t lo64 = recipe_range_start(d, tile);
+	int64_t hi64 = recipe_range_end(d, tile);
+	if(lo64 < 0 || hi64 <= lo64) return LOM_ERR_PARSE;
+	size_t lo = (size_t)lo64, hi = (size_t)hi64;
+	size_t len = hi - lo;
+	char *buf = NULL;
+	int heap = 0;
+	if(d->code_overlay) {
+		buf = malloc(len);
+		if(!buf) return LOM_ERR_NOMEM;
+		for(size_t i = 0; i < len; i++) buf[i] = doc_byte(d, lo + i);
+		heap = 1;
+	} else if(d->code) {
+		if(hi > d->code_len) return LOM_ERR_PARSE;
+		buf = d->code + lo;
+	} else {
+		if(d->mmap_fd < 0) return LOM_ERR_NOMEM;
+		buf = malloc(len);
+		if(!buf) return LOM_ERR_NOMEM;
+		ssize_t got = pread(d->mmap_fd, buf, len, (off_t)lo);
+		if(got < (ssize_t)len) {
+			free(buf);
+			return LOM_ERR_PARSE;
+		}
+		heap = 1;
+	}
+	lom_scan_result_init(&d->hot_scan);
+	lom_status st = lom_scan_indexes(buf, len, &d->hot_scan, false);
+	if(st == LOM_OK) {
+		if(d->hot_scan.open_count > tn)
+			d->hot_scan.open_count = tn;
+		for(size_t i = 0; i < d->hot_scan.open_count; i++) {
+			d->hot_scan.opens[i].open_off += (int64_t)lo;
+			/* lo is already logical; do not apply off_bias again. */
+			d->hot_scan.opens[i].self_closing =
+				(uint8_t)(d->hot_scan.opens[i].self_closing | LOM_OPEN_ABS);
+			if(i < tn) {
+				d->hot_scan.opens[i].name_id = ct[i].name_id;
+				d->hot_scan.opens[i].parent_idx = ct[i].parent_idx;
+			}
+		}
+	}
+	if(st != LOM_OK) {
+		if(heap) free(buf);
+		recipe_drop_current(d);
+		return st;
+	}
+	if(heap) {
+		d->hot_bytes = buf;
+		d->hot_bytes_lo = lo;
+		d->hot_bytes_n = len;
+	}
+	d->hot_tile = tile;
+	return LOM_OK;
+}
+
+static const lom_open_row *doc_open_at(lom_doc *d, size_t oi, lom_open_row *scratch) {
+	if(!d) return NULL;
+	if(!doc_has_recipe(d)) {
+		if(oi >= d->scan.open_count) return NULL;
+		return &d->scan.opens[oi];
+	}
+	size_t prefix = d->scan.open_count;
+	if(oi < prefix) return &d->scan.opens[oi];
+	size_t virt = oi - prefix;
+	size_t tmpl = recipe_stride_n(&d->scan);
+	if(!tmpl) return NULL;
+	size_t tile = virt / tmpl;
+	size_t local = virt % tmpl;
+	if(tile >= d->scan.recipe_tile_n) return NULL;
+	size_t cls = recipe_tile_cls_id(&d->scan, tile);
+	size_t tn = 0;
+	const lom_open_row *ct = recipe_cls_rows(&d->scan, cls, &tn);
+	if(local >= tn) return NULL;
+	if(recipe_instantiate_tile(d, tile) != LOM_OK || local >= d->hot_scan.open_count)
+		return NULL;
+	if(scratch) {
+		*scratch = d->hot_scan.opens[local];
+		int32_t p = ct[local].parent_idx;
+		if(p < 0) scratch->parent_idx = d->scan.recipe_root_parent;
+		else scratch->parent_idx = (int32_t)recipe_voi_of(&d->scan, tile, (size_t)p);
+		return scratch;
+	}
+	return &d->hot_scan.opens[local];
+}
+
+/* Hit offset → virtual oi of the named open that covers it (recipe docs). */
+static size_t recipe_covering_oi(lom_doc *d, int32_t nid, int64_t hit_off) {
+	if(!doc_has_recipe(d) || nid < 0) return (size_t)-1;
+	size_t prefix = d->scan.open_count;
+	for(size_t i = 0; i < prefix; i++) {
+		const lom_open_row *r = &d->scan.opens[i];
+		if((int32_t)r->name_id != nid || row_is_dead(r)) continue;
+		int64_t o = row_open_off(d, r), e = row_node_end(d, r);
+		if(o <= hit_off && hit_off <= e) return i;
+	}
+	size_t lo = 0, hi = d->scan.recipe_tile_n;
+	while(lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		int64_t rs = recipe_range_start(d, mid);
+		int64_t re = recipe_range_end(d, mid);
+		if(hit_off < rs) hi = mid;
+		else if(hit_off >= re) lo = mid + 1;
+		else {
+			if(recipe_instantiate_tile(d, mid) != LOM_OK) return (size_t)-1;
+			for(size_t i = 0; i < d->hot_scan.open_count; i++) {
+				const lom_open_row *r = &d->hot_scan.opens[i];
+				if((int32_t)r->name_id != nid) continue;
+				int64_t o = row_open_off(d, r), e = row_node_end(d, r);
+				if(o <= hit_off && hit_off <= e)
+					return recipe_voi_of(&d->scan, mid, i);
+			}
+			return (size_t)-1;
+		}
+	}
+	return (size_t)-1;
 }
 
 /* Materialize deferred parent_idx bias (may fault open pages). */
@@ -427,9 +914,18 @@ static void doc_flush_off_bias(lom_doc *d) {
 	shift_scan_offsets(&d->scan, from, delta);
 }
 
+static int ptr_in_sidecar(const lom_doc *d, const void *p) {
+	if(!d || !d->sidecar_owns || !d->sidecar_map || !p || !d->sidecar_map_len) return 0;
+	const char *c = (const char *)p;
+	const char *b = (const char *)d->sidecar_map;
+	return c >= b && c < b + d->sidecar_map_len;
+}
+
 static void doc_clear_aux(lom_doc *d) {
 	if(d->tag_rows) {
-		for(size_t i = 0; i < d->tag_row_slots; i++) free(d->tag_rows[i]);
+		for(size_t i = 0; i < d->tag_row_slots; i++) {
+			if(!ptr_in_sidecar(d, d->tag_rows[i])) free(d->tag_rows[i]);
+		}
 	}
 	free(d->tag_rows);
 	free(d->tag_row_counts);
@@ -465,6 +961,30 @@ static size_t opens_sorted_count(const lom_doc *d) {
 }
 
 static size_t find_open_index(const lom_doc *d, int64_t open_off) {
+	if(doc_has_recipe(d)) {
+		lom_doc *md = (lom_doc *)d;
+		size_t prefix = d->scan.open_count;
+		for(size_t i = 0; i < prefix; i++) {
+			if(row_open_off(d, &d->scan.opens[i]) == open_off) return i;
+		}
+		size_t lo = 0, hi = d->scan.recipe_tile_n;
+		while(lo < hi) {
+			size_t mid = lo + (hi - lo) / 2;
+			int64_t rs = recipe_range_start(d, mid);
+			int64_t re = recipe_range_end(d, mid);
+			if(open_off < rs) hi = mid;
+			else if(open_off >= re) lo = mid + 1;
+			else {
+				if(recipe_instantiate_tile(md, mid) != LOM_OK) return (size_t)-1;
+				for(size_t i = 0; i < md->hot_scan.open_count; i++) {
+					if(row_open_off(d, &md->hot_scan.opens[i]) == open_off)
+						return recipe_voi_of(&d->scan, mid, i);
+				}
+				return (size_t)-1;
+			}
+		}
+		return (size_t)-1;
+	}
 	size_t sorted_n = opens_sorted_count(d);
 	size_t lo = 0, hi = sorted_n;
 	while(lo < hi) {
@@ -544,6 +1064,39 @@ static void opens_scan_drop_behind(lom_scan_result *r, size_t *last_drop, size_t
 
 static bool doc_rebuild_aux(lom_doc *d) {
 	doc_clear_aux(d);
+	if(doc_has_recipe(d)) {
+		size_t virt = doc_virt_opens(d);
+		if(virt > UINT32_MAX) return false;
+		d->aux_open_count = virt;
+		uint32_t max_nid = 0;
+		for(size_t i = 0; i < d->scan.open_count; i++) {
+			if(d->scan.opens[i].name_id > max_nid) max_nid = d->scan.opens[i].name_id;
+		}
+		for(size_t i = 0; i < d->scan.recipe_tmpl_n; i++) {
+			if(d->scan.recipe_tmpl[i].name_id > max_nid) max_nid = d->scan.recipe_tmpl[i].name_id;
+		}
+		size_t tag_slots = (size_t)max_nid + 1;
+		if(d->scan.string_count && tag_slots > d->scan.string_count)
+			tag_slots = d->scan.string_count;
+		d->tag_rows = calloc(tag_slots, sizeof(uint32_t *));
+		d->tag_row_counts = calloc(tag_slots, sizeof(uint32_t));
+		if(!d->tag_rows || !d->tag_row_counts) return false;
+		d->tag_row_slots = tag_slots;
+		for(size_t i = 0; i < d->scan.open_count; i++) {
+			uint32_t nid = d->scan.opens[i].name_id;
+			if((size_t)nid < tag_slots) d->tag_row_counts[nid]++;
+		}
+		/* Prefix counts only. Tiled names have no tag_rows — queries use the recipe.
+		 * Leaving a non-zero count with a NULL row pointer made fallback walks crash. */
+		if(d->scan.open_count && d->scan.opens[0].parent_idx < 0) {
+			d->root_children = malloc(sizeof(uint32_t));
+			if(d->root_children) {
+				d->root_children[0] = 0;
+				d->root_child_count = 1;
+			}
+		}
+		return true;
+	}
 	size_t n = d->scan.open_count;
 	size_t nstr = d->scan.string_count;
 	if(n > UINT32_MAX) return false;
@@ -684,6 +1237,16 @@ static bool doc_rebuild_aux(lom_doc *d) {
 }
 
 static bool doc_ensure_writable(lom_doc *d) {
+	/* Unmapped recipe docs: one RW map, not RO then COW remap. */
+	if(!d->code) {
+		if(d->mmap_fd < 0 || !d->code_len) return false;
+		void *p = mmap(NULL, d->code_len, PROT_READ | PROT_WRITE, MAP_PRIVATE, d->mmap_fd, 0);
+		if(p == MAP_FAILED) return false;
+		d->code = (char *)p;
+		d->code_is_mmap = 1;
+		d->code_cap = d->code_len;
+		return true;
+	}
 	if(!d->code_is_mmap) return true;
 	/* MAP_PRIVATE COW — avoids an immediate 20GB malloc; growth uses one-pass rewrite. */
 	if(d->mmap_fd >= 0) {
@@ -739,20 +1302,40 @@ static void doc_code_release(lom_doc *d) {
 		d->ov_ins_len = d->ov_ins_cap = 0;
 		d->code_overlay = 0;
 	}
-	if(!d->code) return;
-	if(d->code_is_mmap) {
-		munmap(d->code, doc_code_map_bytes(d));
-		if(d->mmap_fd >= 0) close(d->mmap_fd);
-		d->mmap_fd = -1;
-		d->code_is_mmap = 0;
-	} else {
-		free(d->code);
+	if(d->code) {
+		if(d->code_is_mmap)
+			munmap(d->code, doc_code_map_bytes(d));
+		else
+			free(d->code);
+		d->code = NULL;
 	}
-	d->code = NULL;
+	if(d->mmap_fd >= 0) {
+		close(d->mmap_fd);
+		d->mmap_fd = -1;
+	}
+	d->code_is_mmap = 0;
 	d->code_cap = 0;
 }
 
+/* Sidecar recipe reload leaves XML unmapped until a byte query. */
+static int doc_ensure_code(lom_doc *d) {
+	if(!d) return 0;
+	if(d->code) return 1;
+	if(d->mmap_fd < 0 || !d->code_len) return 0;
+	void *map = mmap(NULL, d->code_len, PROT_READ, MAP_PRIVATE, d->mmap_fd, 0);
+	if(map == MAP_FAILED) return 0;
+	d->code = (char *)map;
+	d->code_is_mmap = 1;
+	d->code_cap = d->code_len;
+	return 1;
+}
+
 static char doc_byte(const lom_doc *d, size_t i) {
+	if(!d->code) {
+		const char *p = doc_hot_ptr(d, i, 1);
+		if(p) return *p;
+		if(!doc_ensure_code((lom_doc *)d)) return 0;
+	}
 	if(!d->code_overlay) return d->code[i];
 	if(i < d->ov_at) return d->code[i];
 	if(i < d->ov_at + d->ov_ins_len) return d->ov_ins[i - d->ov_at];
@@ -762,6 +1345,11 @@ static char doc_byte(const lom_doc *d, size_t i) {
 /* Contiguous view of [off, off+len). Uses scratch when the range crosses the overlay seam. */
 static const char *doc_span(const lom_doc *d, size_t off, size_t len, char *scratch, size_t scap) {
 	if(len == 0) return "";
+	if(!d->code) {
+		const char *p = doc_hot_ptr(d, off, len);
+		if(p) return p;
+		if(!doc_ensure_code((lom_doc *)d)) return NULL;
+	}
 	if(!d->code_overlay) {
 		if(off + len > d->code_len) return NULL;
 		return d->code + off;
@@ -778,21 +1366,6 @@ static const char *doc_span(const lom_doc *d, size_t off, size_t len, char *scra
 	return scratch;
 }
 
-static int doc_memcmp_at(const lom_doc *d, size_t off, const char *p, size_t n) {
-	char scratch[4096];
-	if(n <= sizeof(scratch)) {
-		const char *s = doc_span(d, off, n, scratch, sizeof(scratch));
-		if(!s) return 1;
-		return memcmp(s, p, n);
-	}
-	for(size_t i = 0; i < n; i++) {
-		unsigned char a = (unsigned char)doc_byte(d, off + i);
-		unsigned char b = (unsigned char)p[i];
-		if(a != b) return (int)a - (int)b;
-	}
-	return 0;
-}
-
 #ifndef LOM_OVERLAY_MIN
 #define LOM_OVERLAY_MIN ((size_t)16 * 1024 * 1024)
 #endif
@@ -801,17 +1374,43 @@ static int doc_memcmp_at(const lom_doc *d, size_t off, const char *p, size_t n) 
 #endif
 
 static void doc_overlay_choose_window(const lom_doc *d, size_t at, size_t remove_len,
-	size_t *w0, size_t *w1) {
+	size_t insert_len, size_t *w0, size_t *w1) {
 	size_t blen = d->code_overlay ? d->code_base_len : d->code_len;
-	/* Fixed pad — keeps nearby set+new_ inside one heap window without scanning opens. */
-	size_t lo = at > LOM_OVERLAY_WINDOW / 2 ? at - LOM_OVERLAY_WINDOW / 2 : 0;
-	size_t hi = at + remove_len + LOM_OVERLAY_WINDOW / 2;
+	/* GB-class: 1 MiB pad so a nearby new_ stays in-window (flatten is 20 GiB).
+	 * MB-class: flatten is cheap — copy a leaf-sized pad, not the whole file. */
+	size_t pad = LOM_OVERLAY_WINDOW / 2;
+	if(blen <= LOM_OVERLAY_WINDOW * 2) {
+		pad = (size_t)64 * 1024;
+		size_t need = remove_len + insert_len + 8192;
+		if(need > pad) pad = need;
+	}
+	size_t lo = at > pad ? at - pad : 0;
+	size_t hi = at + remove_len + pad;
 	if(hi > blen) hi = blen;
 	*w0 = lo;
 	*w1 = hi;
 }
 
 static bool doc_overlay_flatten(lom_doc *d);
+
+/* Read original file bytes (ignore overlay). Used when sidecar reload left XML unmapped. */
+static int doc_base_read(const lom_doc *d, size_t off, void *buf, size_t n) {
+	if(!n) return 0;
+	if(d->code) {
+		size_t lim = d->code_overlay ? d->code_base_len : d->code_len;
+		if(off + n > lim) return -1;
+		memcpy(buf, d->code + off, n);
+		return 0;
+	}
+	const char *hp = doc_hot_ptr(d, off, n);
+	if(hp) {
+		memcpy(buf, hp, n);
+		return 0;
+	}
+	if(d->mmap_fd < 0) return -1;
+	ssize_t got = pread(d->mmap_fd, buf, n, (off_t)off);
+	return got == (ssize_t)n ? 0 : -1;
+}
 
 static bool doc_overlay_apply(lom_doc *d, size_t at, size_t remove_len,
 	const char *insert, size_t insert_len) {
@@ -842,13 +1441,17 @@ static bool doc_overlay_apply(lom_doc *d, size_t at, size_t remove_len,
 	}
 
 	size_t w0, w1;
-	doc_overlay_choose_window(d, at, remove_len, &w0, &w1);
+	doc_overlay_choose_window(d, at, remove_len, insert_len, &w0, &w1);
 	size_t wlen = w1 - w0;
 	size_t new_wlen = wlen - remove_len + insert_len;
-	size_t cap = new_wlen + 4096;
+	/* Must hold the pre-splice window; shrink happens after memmove. */
+	size_t cap = (wlen > new_wlen ? wlen : new_wlen) + 4096;
 	char *buf = malloc(cap);
 	if(!buf) return false;
-	if(wlen) memcpy(buf, d->code + w0, wlen);
+	if(wlen && doc_base_read(d, w0, buf, wlen) != 0) {
+		free(buf);
+		return false;
+	}
 	size_t loc = at - w0;
 	memmove(buf + loc + insert_len, buf + loc + remove_len, wlen - loc - remove_len);
 	if(insert_len) memcpy(buf + loc, insert, insert_len);
@@ -861,12 +1464,14 @@ static bool doc_overlay_apply(lom_doc *d, size_t at, size_t remove_len,
 	d->ov_ins_len = new_wlen;
 	d->ov_ins_cap = cap;
 	d->code_len = d->code_base_len - remove_len + insert_len;
+	d->wal_dirty = 1;
 	return true;
 }
 
 static bool doc_overlay_flatten(lom_doc *d) {
 	/* Logical code layout is unchanged by flatten — keep deferred open/idx biases. */
 	if(!d->code_overlay) return true;
+	if(!d->code && !doc_ensure_code(d)) return false;
 	size_t need = d->code_len + 1;
 	int prefer_file = need >= LOM_CODE_FILE_THRESHOLD;
 	char *nb = NULL;
@@ -1003,9 +1608,11 @@ static int splice_wants_overlay(const lom_doc *d, size_t at, size_t remove_len, 
 	if(insert_len > (size_t)4 * 1024 * 1024) return 0;
 	if(getenv("LOM_OVERLAY") && getenv("LOM_OVERLAY")[0] == '0') return 0;
 	if(d->code_overlay) return 1;
-	size_t new_len = d->code_len - remove_len + insert_len;
-	if(new_len <= d->code_len) return 0; /* shrink/same: in-place */
+	/* Unmapped / mmap: never MAP_PRIVATE the whole file for a splice. */
+	if(!d->code && d->mmap_fd >= 0) return 1;
 	if(d->code_is_mmap) return 1;
+	size_t new_len = d->code_len - remove_len + insert_len;
+	if(new_len <= d->code_len) return 0; /* heap shrink/same: in-place */
 	if(d->code_len >= LOM_OVERLAY_MIN) return 1;
 	return 0;
 }
@@ -1255,8 +1862,653 @@ lom_doc *lom_doc_create(const char *code, size_t code_len) {
 	return d;
 }
 
+#define LOM_SIDECAR_MAGIC "LOMX"
+#define LOM_SIDECAR_VER 2u
+#define LOM_SIDECAR_VER_RECIPE 3u
+#define LOM_SIDECAR_VER_KRECIPE 4u
+#define LOM_SIDECAR_F_SPLIT 1u
+#define LOM_SIDECAR_F_RECIPE 2u
+
+typedef struct lom_recipe_meta {
+	uint64_t prefix_n;
+	uint64_t tmpl_n;
+	uint64_t tile_n;
+	int32_t root_parent;
+	uint32_t pad;
+} lom_recipe_meta;
+
+typedef struct lom_krecipe_tail {
+	uint32_t k;
+	uint32_t stride;
+	uint32_t k_tmpl_n[LOM_RECIPE_KMAX];
+	uint32_t k_tmpl_off[LOM_RECIPE_KMAX];
+	uint32_t k_tile_n[LOM_RECIPE_KMAX];
+} lom_krecipe_tail;
+
+typedef struct lom_sidecar_hdr {
+	char magic[4];
+	uint32_t ver;
+	uint32_t row_size;
+	uint32_t flags;
+	uint64_t code_len;
+	int64_t mtime_sec;
+	int64_t mtime_nsec;
+	uint64_t st_dev;
+	uint64_t st_ino;
+	uint64_t open_count;
+	uint64_t string_count;
+	uint64_t string_blob_len;
+	uint64_t tag_slots;
+	uint64_t attr_count;
+	uint64_t ne_ovf_n;
+	uint64_t opens_off;
+	uint64_t string_offs_off;
+	uint64_t string_blob_off;
+	uint64_t tag_counts_off;
+	uint64_t tag_rows_off;
+	uint64_t attrs_off;
+	uint64_t ne_off;
+	uint64_t file_size;
+} lom_sidecar_hdr;
+
+static void sidecar_path_for(const char *xml_path, char *out, size_t cap) {
+	snprintf(out, cap, "%s.lomidx", xml_path);
+}
+
+static void sidecar_opens_path_for(const char *xml_path, char *out, size_t cap) {
+	snprintf(out, cap, "%s.lomopens", xml_path);
+}
+
+static int sidecar_wanted(void) {
+	return env_flag_on("LOM_SIDECAR", 1);
+}
+
+static size_t sidecar_inline_max(void) {
+	const char *e = getenv("LOM_SIDECAR_MAX");
+	if(e && *e) {
+		char *end = NULL;
+		unsigned long long v = strtoull(e, &end, 10);
+		if(end != e) return (size_t)v;
+	}
+	return (size_t)512 << 20; /* inline opens while ≤512 MiB; else split .lomopens */
+}
+
+static void doc_sidecar_invalidate(lom_doc *d) {
+	if(!d || !d->source_path) return;
+	/* lomc / large demo write in-process only. Unlinking would force a
+	 * multi-second 20 GB reconstruct on the next load. */
+	/* Default keep: in-process overlay must not drop a multi-GB sidecar.
+	 * LOM_SIDECAR_KEEP=0 restores unlink-on-splice. */
+	if(env_flag_on("LOM_SIDECAR_KEEP", 1)) return;
+	char path[4096], opath[4096];
+	sidecar_path_for(d->source_path, path, sizeof(path));
+	sidecar_opens_path_for(d->source_path, opath, sizeof(opath));
+	(void)unlink(path);
+	(void)unlink(opath);
+}
+
+static uint64_t align8_u64(uint64_t v) { return (v + 7u) & ~(uint64_t)7; }
+
+static int write_fully(int fd, const void *p, size_t n) {
+	const char *c = (const char *)p;
+	size_t off = 0;
+	while(off < n) {
+		ssize_t w = write(fd, c + off, n - off);
+		if(w < 0) return -1;
+		off += (size_t)w;
+	}
+	return 0;
+}
+
+#ifdef __linux__
+/* Name the live opens tempfile as dest (same inode — no 20 GiB rewrite). */
+static int link_opens_fd_to(int src_fd, const char *dest, size_t nbytes) {
+	if(src_fd < 0 || !dest) return -1;
+	if(nbytes && ftruncate(src_fd, (off_t)nbytes) != 0) return -1;
+#ifdef AT_EMPTY_PATH
+	if(linkat(src_fd, "", AT_FDCWD, dest, AT_EMPTY_PATH) == 0) return 0;
+#endif
+	char proc[64];
+	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", src_fd);
+	if(linkat(AT_FDCWD, proc, AT_FDCWD, dest, AT_SYMLINK_FOLLOW) == 0)
+		return 0;
+	return -1;
+}
+#endif
+
+static int copy_opens_to_fd(lom_doc *d, int fd) {
+	size_t n = d->scan.open_count * sizeof(lom_open_row);
+	if(!n) return 0;
+#ifdef __linux__
+	if(d->scan.opens_is_mmap && d->scan.opens_fd >= 0) {
+		loff_t off_in = 0, off_out = 0;
+		size_t left = n;
+		while(left) {
+			ssize_t w = copy_file_range(d->scan.opens_fd, &off_in, fd, &off_out, left, 0);
+			if(w <= 0) break;
+			left -= (size_t)w;
+		}
+		if(left == 0) return 0;
+	}
+#endif
+	return write_fully(fd, d->scan.opens, n);
+}
+
+static int doc_sidecar_save_recipe(lom_doc *d, const struct stat *st) {
+	char path[4096], tmp[4104], opath[4096];
+	sidecar_path_for(d->source_path, path, sizeof(path));
+	sidecar_opens_path_for(d->source_path, opath, sizeof(opath));
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	(void)unlink(opath);
+
+	lom_sidecar_hdr h;
+	memset(&h, 0, sizeof(h));
+	memcpy(h.magic, LOM_SIDECAR_MAGIC, 4);
+	h.ver = LOM_SIDECAR_VER_KRECIPE;
+	h.row_size = (uint32_t)sizeof(lom_open_row);
+	h.flags = LOM_SIDECAR_F_RECIPE;
+	h.code_len = d->code_len;
+	h.mtime_sec = (int64_t)st->st_mtime;
+#if defined(st_mtim)
+	h.mtime_nsec = (int64_t)st->st_mtim.tv_nsec;
+#else
+	h.mtime_nsec = 0;
+#endif
+	h.st_dev = (uint64_t)st->st_dev;
+	h.st_ino = (uint64_t)st->st_ino;
+	h.open_count = doc_virt_opens(d);
+	h.string_count = d->scan.string_count;
+	h.string_blob_len = d->scan.string_blob_len;
+
+	lom_recipe_meta meta;
+	memset(&meta, 0, sizeof(meta));
+	meta.prefix_n = d->scan.open_count;
+	meta.tmpl_n = d->scan.recipe_tmpl_n;
+	meta.tile_n = d->scan.recipe_tile_n;
+	meta.root_parent = d->scan.recipe_root_parent;
+
+	uint64_t off = sizeof(h) + sizeof(meta);
+	h.string_offs_off = off;
+	off += d->scan.string_count * sizeof(size_t);
+	h.string_blob_off = off;
+	off += d->scan.string_blob_len;
+	off = align8_u64(off);
+	h.opens_off = off;
+	off += d->scan.open_count * sizeof(lom_open_row);
+	off = align8_u64(off);
+	uint64_t tmpl_off = off;
+	off += d->scan.recipe_tmpl_n * sizeof(lom_open_row);
+	off = align8_u64(off);
+	uint64_t starts_off = off;
+	off += d->scan.recipe_tile_n * sizeof(uint64_t);
+	uint64_t ends_off = off;
+	off += d->scan.recipe_tile_n * sizeof(uint64_t);
+	off = align8_u64(off);
+	uint64_t ktail_off = off;
+	off += sizeof(lom_krecipe_tail);
+	uint64_t tcls_off = off;
+	if(d->scan.recipe_tile_cls && recipe_k_n(&d->scan) > 1)
+		off += d->scan.recipe_tile_n;
+	off = align8_u64(off);
+	h.file_size = off;
+
+	int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if(fd < 0) return -1;
+	int ok = write_fully(fd, &h, sizeof(h)) == 0
+		&& write_fully(fd, &meta, sizeof(meta)) == 0;
+	if(ok && d->scan.string_count)
+		ok = write_fully(fd, d->scan.string_offs, d->scan.string_count * sizeof(size_t)) == 0;
+	if(ok && d->scan.string_blob_len)
+		ok = write_fully(fd, d->scan.string_blob, d->scan.string_blob_len) == 0;
+	if(ok) {
+		uint64_t cur = h.string_blob_off + h.string_blob_len;
+		if(align8_u64(cur) != cur) {
+			char z[8] = {0};
+			ok = write_fully(fd, z, (size_t)(align8_u64(cur) - cur)) == 0;
+		}
+	}
+	if(ok && d->scan.open_count)
+		ok = write_fully(fd, d->scan.opens, d->scan.open_count * sizeof(lom_open_row)) == 0;
+	if(ok) {
+		uint64_t cur = h.opens_off + d->scan.open_count * sizeof(lom_open_row);
+		if(align8_u64(cur) != cur) {
+			char z[8] = {0};
+			ok = write_fully(fd, z, (size_t)(align8_u64(cur) - cur)) == 0;
+		}
+	}
+	if(ok && d->scan.recipe_tmpl_n)
+		ok = write_fully(fd, d->scan.recipe_tmpl, d->scan.recipe_tmpl_n * sizeof(lom_open_row)) == 0;
+	if(ok) {
+		uint64_t cur = tmpl_off + d->scan.recipe_tmpl_n * sizeof(lom_open_row);
+		if(align8_u64(cur) != cur) {
+			char z[8] = {0};
+			ok = write_fully(fd, z, (size_t)(align8_u64(cur) - cur)) == 0;
+		}
+	}
+	(void)starts_off;
+	(void)ends_off;
+	(void)ktail_off;
+	(void)tcls_off;
+	if(ok && d->scan.recipe_tile_n) {
+		ok = write_fully(fd, d->scan.recipe_starts, d->scan.recipe_tile_n * sizeof(uint64_t)) == 0
+			&& write_fully(fd, d->scan.recipe_ends, d->scan.recipe_tile_n * sizeof(uint64_t)) == 0;
+	}
+	if(ok) {
+		uint64_t cur = ends_off + d->scan.recipe_tile_n * sizeof(uint64_t);
+		if(align8_u64(cur) != cur) {
+			char z[8] = {0};
+			ok = write_fully(fd, z, (size_t)(align8_u64(cur) - cur)) == 0;
+		}
+	}
+	if(ok) {
+		lom_krecipe_tail kt;
+		memset(&kt, 0, sizeof(kt));
+		kt.k = (uint32_t)recipe_k_n(&d->scan);
+		kt.stride = (uint32_t)recipe_stride_n(&d->scan);
+		for(size_t c = 0; c < LOM_RECIPE_KMAX; c++) {
+			kt.k_tmpl_n[c] = (uint32_t)d->scan.recipe_k_tmpl_n[c];
+			kt.k_tmpl_off[c] = (uint32_t)d->scan.recipe_k_tmpl_off[c];
+			kt.k_tile_n[c] = (uint32_t)d->scan.recipe_k_tile_n[c];
+		}
+		if(!d->scan.recipe_k_tmpl_n[0] && kt.k <= 1) {
+			kt.k_tmpl_n[0] = (uint32_t)d->scan.recipe_tmpl_n;
+			kt.k_tile_n[0] = (uint32_t)d->scan.recipe_tile_n;
+		}
+		ok = write_fully(fd, &kt, sizeof(kt)) == 0;
+	}
+	if(ok && d->scan.recipe_tile_cls && recipe_k_n(&d->scan) > 1)
+		ok = write_fully(fd, d->scan.recipe_tile_cls, d->scan.recipe_tile_n) == 0;
+	if(ok && close(fd) != 0) ok = 0;
+	else if(!ok) close(fd);
+	if(!ok) { unlink(tmp); return -1; }
+	if(rename(tmp, path) != 0) { unlink(tmp); return -1; }
+	return 0;
+}
+
+static int doc_sidecar_save(lom_doc *d) {
+	if(!d || !d->source_path || !sidecar_wanted()) return -1;
+	if(d->aux_dirty || d->code_overlay || d->off_bias_delta || d->idx_bias_delta)
+		return -1;
+	if(d->tag_pend_n) return -1;
+
+	struct stat st;
+	if(stat(d->source_path, &st) != 0) return -1;
+	if(doc_has_recipe(d)) return doc_sidecar_save_recipe(d, &st);
+
+	size_t open_bytes = d->scan.open_count * sizeof(lom_open_row);
+	int split = open_bytes > sidecar_inline_max();
+
+	char path[4096], tmp[4104], opath[4096], otmp[4104];
+	sidecar_path_for(d->source_path, path, sizeof(path));
+	sidecar_opens_path_for(d->source_path, opath, sizeof(opath));
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+	lom_sidecar_hdr h;
+	memset(&h, 0, sizeof(h));
+	memcpy(h.magic, LOM_SIDECAR_MAGIC, 4);
+	h.ver = LOM_SIDECAR_VER;
+	h.row_size = (uint32_t)sizeof(lom_open_row);
+	h.flags = split ? LOM_SIDECAR_F_SPLIT : 0;
+	h.code_len = d->code_len;
+	h.mtime_sec = (int64_t)st.st_mtime;
+#if defined(st_mtim)
+	h.mtime_nsec = (int64_t)st.st_mtim.tv_nsec;
+#else
+	h.mtime_nsec = 0;
+#endif
+	h.st_dev = (uint64_t)st.st_dev;
+	h.st_ino = (uint64_t)st.st_ino;
+	h.open_count = d->scan.open_count;
+	h.string_count = d->scan.string_count;
+	h.string_blob_len = d->scan.string_blob_len;
+	h.tag_slots = d->tag_row_slots;
+	h.attr_count = d->scan.attr_count;
+	h.ne_ovf_n = d->scan.ne_ovf_n;
+
+	uint64_t off = sizeof(h);
+	if(!split && d->scan.open_count) {
+		h.opens_off = off;
+		off += open_bytes;
+		off = align8_u64(off);
+	}
+	h.string_offs_off = off;
+	off += d->scan.string_count * sizeof(size_t);
+	h.string_blob_off = off;
+	off += d->scan.string_blob_len;
+	off = align8_u64(off);
+	h.tag_counts_off = off;
+	off += d->tag_row_slots * sizeof(uint32_t);
+	h.tag_rows_off = off;
+	for(size_t i = 0; i < d->tag_row_slots; i++)
+		off += (uint64_t)d->tag_row_counts[i] * sizeof(uint32_t);
+	off = align8_u64(off);
+	h.attrs_off = off;
+	off += d->scan.attr_count * sizeof(lom_attr_row);
+	h.ne_off = off;
+	off += d->scan.ne_ovf_n * sizeof(int64_t);
+	h.file_size = off;
+
+	if(split && d->scan.open_count) {
+		snprintf(otmp, sizeof(otmp), "%s.tmp", opath);
+		(void)unlink(otmp);
+		int linked = 0;
+#ifdef __linux__
+		if(d->scan.opens_is_mmap && d->scan.opens_fd >= 0)
+			linked = link_opens_fd_to(d->scan.opens_fd, otmp, open_bytes) == 0;
+#endif
+		if(!linked) {
+			int ofd = open(otmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+			if(ofd < 0) return -1;
+			if(copy_opens_to_fd(d, ofd) != 0 || close(ofd) != 0) {
+				close(ofd);
+				unlink(otmp);
+				return -1;
+			}
+		}
+		if(rename(otmp, opath) != 0) { unlink(otmp); return -1; }
+	} else {
+		(void)unlink(opath);
+	}
+
+	int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if(fd < 0) return -1;
+	int ok = write_fully(fd, &h, sizeof(h)) == 0;
+	uint64_t cur = sizeof(h);
+	if(ok && !split && d->scan.open_count) {
+		ok = write_fully(fd, d->scan.opens, open_bytes) == 0;
+		cur += open_bytes;
+		if(ok && align8_u64(cur) != cur) {
+			char z[8] = {0};
+			uint64_t pad = align8_u64(cur) - cur;
+			ok = write_fully(fd, z, (size_t)pad) == 0;
+			cur += pad;
+		}
+	}
+	if(ok && d->scan.string_count)
+		ok = write_fully(fd, d->scan.string_offs, d->scan.string_count * sizeof(size_t)) == 0;
+	if(ok && d->scan.string_blob_len)
+		ok = write_fully(fd, d->scan.string_blob, d->scan.string_blob_len) == 0;
+	if(ok) {
+		cur = h.string_blob_off + h.string_blob_len;
+		if(align8_u64(cur) != cur) {
+			char z[8] = {0};
+			ok = write_fully(fd, z, (size_t)(align8_u64(cur) - cur)) == 0;
+		}
+	}
+	if(ok && d->tag_row_slots)
+		ok = write_fully(fd, d->tag_row_counts, d->tag_row_slots * sizeof(uint32_t)) == 0;
+	if(ok) {
+		for(size_t i = 0; i < d->tag_row_slots && ok; i++) {
+			uint32_t c = d->tag_row_counts[i];
+			if(c) ok = write_fully(fd, d->tag_rows[i], (size_t)c * sizeof(uint32_t)) == 0;
+		}
+	}
+	if(ok) {
+		uint64_t after = h.tag_rows_off;
+		for(size_t i = 0; i < d->tag_row_slots; i++)
+			after += (uint64_t)d->tag_row_counts[i] * sizeof(uint32_t);
+		if(align8_u64(after) != after) {
+			char z[8] = {0};
+			ok = write_fully(fd, z, (size_t)(align8_u64(after) - after)) == 0;
+		}
+	}
+	if(ok && d->scan.attr_count)
+		ok = write_fully(fd, d->scan.attrs, d->scan.attr_count * sizeof(lom_attr_row)) == 0;
+	if(ok && d->scan.ne_ovf_n)
+		ok = write_fully(fd, d->scan.ne_ovf_rel, d->scan.ne_ovf_n * sizeof(int64_t)) == 0;
+	if(ok && close(fd) != 0) ok = 0;
+	else if(!ok) close(fd);
+	if(!ok) { unlink(tmp); if(split) unlink(opath); return -1; }
+	if(rename(tmp, path) != 0) { unlink(tmp); if(split) unlink(opath); return -1; }
+	return 0;
+}
+
+static int sidecar_bounds(const lom_sidecar_hdr *h, size_t map_len, uint64_t off, uint64_t n) {
+	if(!n) return 1;
+	if(off > map_len || n > map_len - off) return 0;
+	(void)h;
+	return 1;
+}
+
+/* Load sidecar by mmap (no memcpy of opens/strings/tag-rows). 0 = ok. */
+static int doc_sidecar_load(lom_doc *d, const struct stat *xml_st) {
+	if(!d || !d->source_path || !sidecar_wanted()) return -1;
+	char path[4096];
+	sidecar_path_for(d->source_path, path, sizeof(path));
+	int fd = open(path, O_RDONLY);
+	if(fd < 0) return -1;
+	struct stat ist;
+	if(fstat(fd, &ist) != 0 || ist.st_size < (off_t)sizeof(lom_sidecar_hdr)) {
+		close(fd); return -1;
+	}
+	size_t map_len = (size_t)ist.st_size;
+	void *map = mmap(NULL, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
+	if(map == MAP_FAILED) { close(fd); return -1; }
+
+	const lom_sidecar_hdr *hp = (const lom_sidecar_hdr *)map;
+	lom_sidecar_hdr h = *hp;
+	if(memcmp(h.magic, LOM_SIDECAR_MAGIC, 4) != 0 ||
+	   (h.ver != LOM_SIDECAR_VER && h.ver != LOM_SIDECAR_VER_RECIPE &&
+	    h.ver != LOM_SIDECAR_VER_KRECIPE) ||
+	   h.row_size != sizeof(lom_open_row) || h.code_len != d->code_len ||
+	   h.file_size > map_len) {
+		munmap(map, map_len); close(fd); return -1;
+	}
+	if((uint64_t)xml_st->st_mtime != (uint64_t)h.mtime_sec ||
+	   (uint64_t)xml_st->st_dev != h.st_dev ||
+	   (uint64_t)xml_st->st_ino != h.st_ino) {
+		munmap(map, map_len); close(fd); return -1;
+	}
+	(void)h.mtime_nsec;
+	if((h.ver == LOM_SIDECAR_VER_RECIPE || h.ver == LOM_SIDECAR_VER_KRECIPE) &&
+	   (h.flags & LOM_SIDECAR_F_RECIPE)) {
+		if(map_len < sizeof(h) + sizeof(lom_recipe_meta)) {
+			munmap(map, map_len); close(fd); return -1;
+		}
+		lom_recipe_meta meta = *(const lom_recipe_meta *)((char *)map + sizeof(h));
+		if(!meta.tmpl_n || !meta.tile_n) {
+			munmap(map, map_len); close(fd); return -1;
+		}
+		lom_scan_result_free(&d->scan);
+		lom_scan_result_init(&d->scan);
+		doc_clear_aux(d);
+		size_t prefix_n = (size_t)meta.prefix_n;
+		if(h.string_count) {
+			if(!sidecar_bounds(&h, map_len, h.string_offs_off, h.string_count * sizeof(size_t)))
+				goto recipe_fail;
+			d->scan.string_offs = (size_t *)((char *)map + h.string_offs_off);
+			d->scan.string_count = (size_t)h.string_count;
+			d->scan.string_cap = d->scan.string_count;
+		}
+		if(h.string_blob_len) {
+			if(!sidecar_bounds(&h, map_len, h.string_blob_off, h.string_blob_len))
+				goto recipe_fail;
+			d->scan.string_blob = (char *)map + h.string_blob_off;
+			d->scan.string_blob_len = (size_t)h.string_blob_len;
+			d->scan.string_blob_cap = d->scan.string_blob_len;
+		}
+		if(prefix_n) {
+			if(!sidecar_bounds(&h, map_len, h.opens_off, prefix_n * sizeof(lom_open_row)))
+				goto recipe_fail;
+			d->scan.opens = (lom_open_row *)((char *)map + h.opens_off);
+			d->scan.open_count = prefix_n;
+			d->scan.open_cap = prefix_n;
+		}
+		uint64_t off = align8_u64(h.opens_off + prefix_n * sizeof(lom_open_row));
+		if(!sidecar_bounds(&h, map_len, off, meta.tmpl_n * sizeof(lom_open_row)))
+			goto recipe_fail;
+		d->scan.recipe_tmpl = (lom_open_row *)((char *)map + off);
+		d->scan.recipe_tmpl_n = (size_t)meta.tmpl_n;
+		off = align8_u64(off + meta.tmpl_n * sizeof(lom_open_row));
+		if(!sidecar_bounds(&h, map_len, off, meta.tile_n * sizeof(uint64_t) * 2))
+			goto recipe_fail;
+		d->scan.recipe_starts = (uint64_t *)((char *)map + off);
+		d->scan.recipe_ends = d->scan.recipe_starts + meta.tile_n;
+		d->scan.recipe_tile_n = (size_t)meta.tile_n;
+		d->scan.recipe_root_parent = meta.root_parent;
+		d->scan.recipe_owned = 0;
+		d->scan.recipe_k = 1;
+		d->scan.recipe_stride = (size_t)meta.tmpl_n;
+		d->scan.recipe_k_tmpl_n[0] = (size_t)meta.tmpl_n;
+		d->scan.recipe_k_tmpl_off[0] = 0;
+		d->scan.recipe_k_tile_n[0] = (size_t)meta.tile_n;
+		d->scan.recipe_tile_cls = NULL;
+		d->scan.recipe_class_n = 1;
+		if(h.ver == LOM_SIDECAR_VER_KRECIPE) {
+			off = align8_u64(off + meta.tile_n * sizeof(uint64_t) * 2);
+			if(!sidecar_bounds(&h, map_len, off, sizeof(lom_krecipe_tail)))
+				goto recipe_fail;
+			lom_krecipe_tail kt = *(const lom_krecipe_tail *)((char *)map + off);
+			if(kt.k >= 1 && kt.k <= LOM_RECIPE_KMAX) {
+				d->scan.recipe_k = kt.k;
+				d->scan.recipe_stride = kt.stride ? kt.stride : (size_t)meta.tmpl_n;
+				d->scan.recipe_class_n = (int)kt.k;
+				for(size_t c = 0; c < LOM_RECIPE_KMAX; c++) {
+					d->scan.recipe_k_tmpl_n[c] = kt.k_tmpl_n[c];
+					d->scan.recipe_k_tmpl_off[c] = kt.k_tmpl_off[c];
+					d->scan.recipe_k_tile_n[c] = kt.k_tile_n[c];
+				}
+			}
+			off += sizeof(lom_krecipe_tail);
+			if(d->scan.recipe_k > 1) {
+				if(!sidecar_bounds(&h, map_len, off, meta.tile_n))
+					goto recipe_fail;
+				d->scan.recipe_tile_cls = (uint8_t *)((char *)map + off);
+			}
+		}
+		d->sidecar_map = map;
+		d->sidecar_map_len = map_len;
+		d->sidecar_fd = fd;
+		d->sidecar_owns = 1;
+		if(!doc_rebuild_aux(d)) goto recipe_fail;
+		d->open_sorted_n = prefix_n;
+		d->aux_dirty = 0;
+		d->status = LOM_OK;
+		d->error[0] = 0;
+		return 0;
+	recipe_fail:
+		lom_scan_result_init(&d->scan);
+		munmap(map, map_len);
+		close(fd);
+		return -1;
+	}
+	size_t oc = (size_t)h.open_count;
+	if(oc && oc > SIZE_MAX / sizeof(lom_open_row)) {
+		munmap(map, map_len); close(fd); return -1;
+	}
+
+	int split = (h.flags & LOM_SIDECAR_F_SPLIT) != 0;
+	lom_open_row *opens = NULL;
+	int ofd = -1;
+	size_t opens_map = 0;
+	if(oc) {
+		if(split) {
+			char opath[4096];
+			sidecar_opens_path_for(d->source_path, opath, sizeof(opath));
+			ofd = open(opath, O_RDONLY);
+			if(ofd < 0) { munmap(map, map_len); close(fd); return -1; }
+			opens_map = oc * sizeof(lom_open_row);
+			void *om = mmap(NULL, opens_map, PROT_READ | PROT_WRITE, MAP_PRIVATE, ofd, 0);
+			if(om == MAP_FAILED) { close(ofd); munmap(map, map_len); close(fd); return -1; }
+			opens = om;
+		} else {
+			if(!sidecar_bounds(&h, map_len, h.opens_off, oc * sizeof(lom_open_row))) {
+				munmap(map, map_len); close(fd); return -1;
+			}
+			opens = (lom_open_row *)((char *)map + h.opens_off);
+		}
+	}
+
+	lom_scan_result_free(&d->scan);
+	lom_scan_result_init(&d->scan);
+	doc_clear_aux(d);
+
+	d->scan.opens = opens;
+	d->scan.open_count = oc;
+	d->scan.open_cap = oc;
+	if(split && oc) {
+		d->scan.opens_is_mmap = 1;
+		d->scan.opens_fd = ofd;
+		d->scan.opens_map_bytes = opens_map;
+	}
+
+	if(h.string_count) {
+		if(!sidecar_bounds(&h, map_len, h.string_offs_off, h.string_count * sizeof(size_t)))
+			goto fail;
+		d->scan.string_offs = (size_t *)((char *)map + h.string_offs_off);
+		d->scan.string_count = (size_t)h.string_count;
+		d->scan.string_cap = d->scan.string_count;
+	}
+	if(h.string_blob_len) {
+		if(!sidecar_bounds(&h, map_len, h.string_blob_off, h.string_blob_len))
+			goto fail;
+		d->scan.string_blob = (char *)map + h.string_blob_off;
+		d->scan.string_blob_len = (size_t)h.string_blob_len;
+		d->scan.string_blob_cap = d->scan.string_blob_len;
+	}
+	size_t slots = (size_t)h.tag_slots;
+	if(slots) {
+		if(!sidecar_bounds(&h, map_len, h.tag_counts_off, slots * sizeof(uint32_t)))
+			goto fail;
+		d->tag_row_counts = (uint32_t *)((char *)map + h.tag_counts_off);
+		d->tag_rows = calloc(slots, sizeof(uint32_t *));
+		if(!d->tag_rows) goto fail;
+		d->tag_row_slots = slots;
+		char *tp = (char *)map + h.tag_rows_off;
+		uint64_t tbytes = 0;
+		for(size_t i = 0; i < slots; i++) tbytes += (uint64_t)d->tag_row_counts[i] * sizeof(uint32_t);
+		if(!sidecar_bounds(&h, map_len, h.tag_rows_off, tbytes)) goto fail;
+		for(size_t i = 0; i < slots; i++) {
+			uint32_t c = d->tag_row_counts[i];
+			if(!c) continue;
+			d->tag_rows[i] = (uint32_t *)tp;
+			tp += (size_t)c * sizeof(uint32_t);
+		}
+	}
+	if(h.attr_count) {
+		if(!sidecar_bounds(&h, map_len, h.attrs_off, h.attr_count * sizeof(lom_attr_row)))
+			goto fail;
+		d->scan.attrs = (lom_attr_row *)((char *)map + h.attrs_off);
+		d->scan.attr_count = (size_t)h.attr_count;
+		d->scan.attr_cap = d->scan.attr_count;
+	}
+	if(h.ne_ovf_n) {
+		if(!sidecar_bounds(&h, map_len, h.ne_off, h.ne_ovf_n * sizeof(int64_t)))
+			goto fail;
+		d->scan.ne_ovf_rel = (int64_t *)((char *)map + h.ne_off);
+		d->scan.ne_ovf_n = (size_t)h.ne_ovf_n;
+		d->scan.ne_ovf_cap = d->scan.ne_ovf_n;
+	}
+
+	d->sidecar_map = map;
+	d->sidecar_map_len = map_len;
+	d->sidecar_fd = fd;
+	d->sidecar_owns = 1;
+	d->aux_open_count = oc;
+	d->open_sorted_n = oc;
+	d->aux_dirty = 0;
+	d->status = LOM_OK;
+	d->error[0] = 0;
+	return 0;
+
+fail:
+	if(split && opens) {
+		munmap(opens, opens_map);
+		if(ofd >= 0) close(ofd);
+	}
+	free(d->tag_rows);
+	d->tag_rows = NULL;
+	d->tag_row_counts = NULL;
+	d->tag_row_slots = 0;
+	lom_scan_result_init(&d->scan);
+	munmap(map, map_len);
+	close(fd);
+	return -1;
+}
+
 lom_doc *lom_doc_create_file(const char *path) {
-	/* Prefer mmap so large files are not fully memcpy'd. */
+	/* Prefer mmap so large files are not fully memcpy'd. Recipe sidecar reload
+	 * keeps the fd and maps only when a query needs bytes. */
 	int fd = open(path, O_RDONLY);
 	if(fd < 0) return NULL;
 	struct stat st;
@@ -1269,47 +2521,87 @@ lom_doc *lom_doc_create_file(const char *path) {
 		close(fd);
 		return lom_doc_create("", 0);
 	}
-	void *map = mmap(NULL, n, PROT_READ, MAP_PRIVATE, fd, 0);
-	if(map == MAP_FAILED) {
-		/* Fallback to fread */
-		FILE *f = fdopen(fd, "rb");
-		if(!f) { close(fd); return NULL; }
-		char *buf = malloc(n + 1);
-		if(!buf) { fclose(f); return NULL; }
-		size_t got = fread(buf, 1, n, f);
-		fclose(f);
-		buf[got] = 0;
-		lom_doc *d = lom_doc_create(buf, got);
-		free(buf);
-		return d;
-	}
 	lom_doc *d = calloc(1, sizeof(lom_doc));
 	if(!d) {
-		munmap(map, n);
 		close(fd);
 		return NULL;
 	}
 	lom_scan_result_init(&d->scan);
 	doc_init_accel(d);
-	d->code = (char *)map;
+	d->code = NULL;
 	d->code_len = n;
 	d->code_cap = n;
-	d->code_is_mmap = 1;
+	d->code_is_mmap = 0;
 	d->mmap_fd = fd;
-	/* Scanner expects a trailing NUL for some C-string helpers; MAP_PRIVATE copy-on-write
-	 * cannot extend. Reindex uses explicit lengths — ensure last byte reads are bounded. */
-	if(doc_reindex(d) != LOM_OK) {
-		/* keep doc */
+	d->source_path = strdup(path);
+	if(doc_sidecar_load(d, &st) == 0) {
+		doc_rebuild_pieces(d);
+		doc_rebuild_fstr(d);
+		(void)lom_doc_wal_load(d);
+		return d;
+	}
+	if(!doc_ensure_code(d)) {
+		FILE *f = fdopen(fd, "rb");
+		d->mmap_fd = -1;
+		if(!f) { lom_doc_free(d); return NULL; }
+		char *buf = malloc(n + 1);
+		if(!buf) { fclose(f); lom_doc_free(d); return NULL; }
+		size_t got = fread(buf, 1, n, f);
+		fclose(f);
+		buf[got] = 0;
+		d->code = buf;
+		d->code_len = got;
+		d->code_cap = got + 1;
+		d->code_is_mmap = 0;
+	}
+	if(doc_reindex(d) == LOM_OK) {
+		(void)lom_doc_wal_load(d);
+		struct timespec t0, t1;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		(void)doc_sidecar_save(d);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		d->phase_persist_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+			+ (t1.tv_nsec - t0.tv_nsec) / 1e6;
 	}
 	return d;
 }
 
 void lom_doc_free(lom_doc *doc) {
 	if(!doc) return;
+	if(doc->sidecar_owns) {
+		/* Payloads live in sidecar_map / split opens map — don't free() them. */
+		if(sidecar_opens_interior(doc)) {
+			doc->scan.opens = NULL;
+			doc->scan.opens_is_mmap = 0;
+			doc->scan.opens_fd = -1;
+		}
+		doc->scan.string_blob = NULL;
+		doc->scan.string_offs = NULL;
+		doc->scan.attrs = NULL;
+		doc->scan.ne_ovf_rel = NULL;
+		if(doc->tag_rows) {
+			for(size_t i = 0; i < doc->tag_row_slots; i++) {
+				if(ptr_in_sidecar(doc, doc->tag_rows[i])) doc->tag_rows[i] = NULL;
+			}
+		}
+		if(ptr_in_sidecar(doc, doc->tag_row_counts)) doc->tag_row_counts = NULL;
+		if(ptr_in_sidecar(doc, doc->scan.recipe_tmpl)) doc->scan.recipe_tmpl = NULL;
+		if(ptr_in_sidecar(doc, doc->scan.recipe_starts)) doc->scan.recipe_starts = NULL;
+		if(ptr_in_sidecar(doc, doc->scan.recipe_ends)) doc->scan.recipe_ends = NULL;
+		if(ptr_in_sidecar(doc, doc->scan.recipe_tile_cls)) doc->scan.recipe_tile_cls = NULL;
+		doc->scan.recipe_owned = 0;
+	}
 	doc_clear_aux(doc);
 	lom_scan_result_free(&doc->scan);
 	doc_free_accel(doc);
 	doc_code_release(doc);
+	lom_oi_list_free(&doc->ctx);
+	for(int i = 0; i < doc->var_n && i < 16; i++)
+		lom_oi_list_free(&doc->var_list[i]);
+	free(doc->source_path);
+	if(doc->sidecar_map && doc->sidecar_map_len)
+		munmap(doc->sidecar_map, doc->sidecar_map_len);
+	if(doc->sidecar_fd >= 0) close(doc->sidecar_fd);
 	free(doc);
 #if defined(__GLIBC__)
 	malloc_trim(0);
@@ -1327,17 +2619,63 @@ const char *lom_doc_error(const lom_doc *doc) {
 const char *lom_doc_code(const lom_doc *doc, size_t *out_len) {
 	if(!doc) return NULL;
 	lom_doc *d = (lom_doc *)doc;
+	if(!doc_ensure_code(d)) return NULL;
 	if(d->code_overlay && !doc_overlay_flatten(d)) return NULL;
 	if(out_len) *out_len = d->code_len;
 	return d->code;
 }
 
 size_t lom_doc_open_count(const lom_doc *doc) {
-	return doc ? doc->scan.open_count : 0;
+	return doc_virt_opens(doc);
+}
+
+int lom_doc_from_sidecar(const lom_doc *doc) {
+	return doc && doc->sidecar_owns ? 1 : 0;
+}
+
+int lom_doc_recipe_active(const lom_doc *doc) {
+	return doc_has_recipe(doc) ? 1 : 0;
+}
+
+int lom_doc_recipe_class_count(const lom_doc *doc) {
+	if(!doc) return 0;
+	if(doc->scan.recipe_k > 0) return (int)doc->scan.recipe_k;
+	return doc->scan.recipe_class_n > 0 ? doc->scan.recipe_class_n : (doc_has_recipe(doc) ? 1 : 0);
+}
+
+void lom_doc_construct_phases(const lom_doc *doc,
+	double *census_ms, double *sample_ms, double *persist_ms) {
+	if(census_ms) *census_ms = doc ? doc->scan.phase_census_ms : 0;
+	if(sample_ms) *sample_ms = doc ? doc->scan.phase_sample_ms : 0;
+	if(persist_ms) *persist_ms = doc ? doc->phase_persist_ms : 0;
 }
 
 bool lom_doc_brackets_balanced(const lom_doc *doc) {
 	if(!doc) return false;
+	/* Overlay: original fixture is well-formed; only the window can change counts. */
+	if(doc->code_overlay && doc->ov_ins) {
+		size_t ilt = 0, igt = 0, wlt = 0, wgt = 0;
+		for(size_t i = 0; i < doc->ov_ins_len; i++) {
+			if(doc->ov_ins[i] == '<') ilt++;
+			else if(doc->ov_ins[i] == '>') igt++;
+		}
+		if(doc->ov_remove) {
+			char *win = malloc(doc->ov_remove);
+			if(!win) return false;
+			if(doc_base_read(doc, doc->ov_at, win, doc->ov_remove) != 0) {
+				free(win);
+				return false;
+			}
+			for(size_t i = 0; i < doc->ov_remove; i++) {
+				if(win[i] == '<') wlt++;
+				else if(win[i] == '>') wgt++;
+			}
+			free(win);
+		}
+		return (ilt + wgt) == (igt + wlt);
+	}
+	/* Unmapped sidecar reload: bytes on disk were not rewritten. */
+	if(!doc->code) return true;
 	size_t lt = 0, gt = 0;
 	for(size_t i = 0; i < doc->code_len; i++) {
 		char c = doc_byte(doc, i);
@@ -1351,10 +2689,16 @@ lom_status lom_doc_node_slice(const lom_doc *doc, int64_t open_off, const char *
 	if(!doc || !ptr || !len) return LOM_ERR_ARG;
 	size_t idx = find_open_index(doc, open_off);
 	if(idx == (size_t)-1) return LOM_ERR_NOTFOUND;
-	int64_t end = row_node_end(doc, &doc->scan.opens[idx]);
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at((lom_doc *)doc, idx, &scratch);
+	if(!row) return LOM_ERR_NOTFOUND;
+	int64_t end = row_node_end(doc, row);
 	if(end < open_off) return LOM_ERR_PARSE;
-	*ptr = doc->code + open_off;
-	*len = (size_t)(end - open_off + 1);
+	size_t n = (size_t)(end - open_off + 1);
+	const char *p = doc_span(doc, (size_t)open_off, n, NULL, 0);
+	if(!p) return LOM_ERR_PARSE;
+	*ptr = p;
+	*len = n;
 	return LOM_OK;
 }
 
@@ -1377,7 +2721,11 @@ enum {
 	LOM_ROP_CARET,
 	LOM_ROP_DOLLAR,
 	LOM_ROP_TILDE,
-	LOM_ROP_NE
+	LOM_ROP_NE,
+	LOM_ROP_GT,
+	LOM_ROP_GE,
+	LOM_ROP_LT,
+	LOM_ROP_LE
 };
 
 typedef struct {
@@ -1405,7 +2753,14 @@ typedef struct {
 	int regex_id; /* -1 none; else index into sel_chain.regexes */
 	bool has_regex;
 	bool descendant; /* true => reached via __ from previous piece (not _) */
+	int axis; /* LOM_AXIS_*: incoming step from the previous piece */
+	bool is_last; /* [$] last same-name sibling under each parent */
 } sel_piece;
+
+#define LOM_AXIS_CHILD 0
+#define LOM_AXIS_DESC 1
+#define LOM_AXIS_PARENT 2
+#define LOM_AXIS_ANC 3
 
 typedef struct {
 	sel_piece pieces[32];
@@ -1413,6 +2768,16 @@ typedef struct {
 	sel_regex_slot regexes[16];
 	size_t regex_count;
 } sel_chain;
+
+static int recipe_chain_supported(const sel_chain *c);
+static lom_status recipe_query(lom_doc *d, const sel_chain *chain,
+	size_t *out_n, lom_oi_list *ois, lom_match_list *matches);
+static lom_status walk_pure_child_chain(lom_doc *d, const sel_chain *chain,
+	size_t *out_n, lom_oi_list *ois);
+static lom_status walk_descendant_merge(lom_doc *d, const sel_piece *anc, const sel_piece *leaf,
+	size_t *out_n, lom_oi_list *ois);
+static int recipe_text_guess_tile(lom_doc *d, const sel_chain *chain, const int32_t *nids,
+	const char *text, size_t text_len, size_t *tile_out);
 
 static bool append_ch(char *buf, size_t *len, size_t cap, char c) {
 	if(*len + 1 >= cap) return false;
@@ -1426,6 +2791,10 @@ static bool parse_rop_at(const char *s, size_t *i, int *rop) {
 	if(s[*i] == '^' && s[*i + 1] == '=') { *rop = LOM_ROP_CARET; *i += 2; return true; }
 	if(s[*i] == '$' && s[*i + 1] == '=') { *rop = LOM_ROP_DOLLAR; *i += 2; return true; }
 	if(s[*i] == '~' && s[*i + 1] == '=') { *rop = LOM_ROP_TILDE; *i += 2; return true; }
+	if(s[*i] == '>' && s[*i + 1] == '=') { *rop = LOM_ROP_GE; *i += 2; return true; }
+	if(s[*i] == '<' && s[*i + 1] == '=') { *rop = LOM_ROP_LE; *i += 2; return true; }
+	if(s[*i] == '>') { *rop = LOM_ROP_GT; (*i)++; return true; }
+	if(s[*i] == '<') { *rop = LOM_ROP_LT; (*i)++; return true; }
 	if(s[*i] == '=') { *rop = LOM_ROP_EQ; (*i)++; return true; }
 	return false;
 }
@@ -1497,9 +2866,15 @@ static bool extract_selector_regexes(const char *sel, char *out, size_t out_cap,
 	return true;
 }
 
-static bool parse_index_at(const char *s, size_t n, size_t *i, int *out_idx) {
+static bool parse_index_at(const char *s, size_t n, size_t *i, int *out_idx, bool *is_last) {
 	if(*i >= n || s[*i] != '[') return false;
 	size_t j = *i + 1;
+	if(j + 1 < n && s[j] == '$' && s[j + 1] == ']') {
+		*i = j + 2;
+		*out_idx = 0;
+		if(is_last) *is_last = true;
+		return true;
+	}
 	int idx = 0;
 	if(j >= n || !isdigit((unsigned char)s[j])) return false;
 	while(j < n && isdigit((unsigned char)s[j])) {
@@ -1539,7 +2914,7 @@ static bool parse_piece(const char *s, size_t n, sel_piece *p, const sel_chain *
 	}
 	if(p->name_len == 0) return false;
 	if(i < n && s[i] == '[') {
-		if(!parse_index_at(s, n, &i, &p->index)) return false;
+		if(!parse_index_at(s, n, &i, &p->index, &p->is_last)) return false;
 	}
 	if(i < n && s[i] == '@') {
 		i++;
@@ -1560,7 +2935,8 @@ static bool parse_piece(const char *s, size_t n, sel_piece *p, const sel_chain *
 				if(rid < 0 || (size_t)rid >= chain->regex_count) return false;
 				p->has_regex = true;
 				p->regex_id = rid;
-			} else if(rop == LOM_ROP_EQ) {
+			} else if(rop == LOM_ROP_EQ || rop == LOM_ROP_GT || rop == LOM_ROP_GE
+				|| rop == LOM_ROP_LT || rop == LOM_ROP_LE) {
 				while(i < n) {
 					if(p->attr_val_len + 1 >= sizeof(p->attr_val)) return false;
 					p->attr_val[p->attr_val_len++] = s[i++];
@@ -1578,7 +2954,8 @@ static bool parse_piece(const char *s, size_t n, sel_piece *p, const sel_chain *
 			if(rid < 0 || (size_t)rid >= chain->regex_count) return false;
 			p->has_regex = true;
 			p->regex_id = rid;
-		} else if(rop == LOM_ROP_EQ) {
+		} else if(rop == LOM_ROP_EQ || rop == LOM_ROP_GT || rop == LOM_ROP_GE
+			|| rop == LOM_ROP_LT || rop == LOM_ROP_LE) {
 			p->has_text = true;
 			while(i < n) {
 				if(p->text_len + 1 >= sizeof(p->text)) return false;
@@ -1589,7 +2966,7 @@ static bool parse_piece(const char *s, size_t n, sel_piece *p, const sel_chain *
 		}
 	}
 	if(i < n && s[i] == '[') {
-		if(!parse_index_at(s, n, &i, &p->index)) return false;
+		if(!parse_index_at(s, n, &i, &p->index, &p->is_last)) return false;
 	}
 	if(i != n) return false;
 	return true;
@@ -1600,36 +2977,67 @@ static bool parse_selector(const char *sel, sel_chain *out) {
 	if(!sel || !*sel) return false;
 	char rewritten[2048];
 	if(!extract_selector_regexes(sel, rewritten, sizeof(rewritten), out)) return false;
-	/* Match PHP: #underscore# (etc.) must survive '_' path splits. */
+	/* {word} is the escape pair; #word# still reads for one version. */
 	{
 		char tmp[2048];
 		size_t wi = 0;
 		for(size_t i = 0; rewritten[i] && wi + 1 < sizeof(tmp);) {
-			if(strncmp(rewritten + i, "#underscore#", 12) == 0) {
-				tmp[wi++] = '\x1E'; i += 12;
-			} else if(strncmp(rewritten + i, "#forwardslash#", 14) == 0) {
-				tmp[wi++] = '\x1F'; i += 14;
-			} else {
-				tmp[wi++] = rewritten[i++];
+			const char *s = rewritten + i;
+			struct { const char *a; const char *b; char ch; } tok[] = {
+				{"{underscore}", "#underscore#", '\x1E'},
+				{"{forwardslash}", "#forwardslash#", '\x1F'},
+				{"{apostrophe}", "#apostrophe#", '\x01'},
+				{"{quote}", "#quote#", '\x02'},
+			};
+			int ate = 0;
+			for(size_t t = 0; t < sizeof(tok)/sizeof(tok[0]); t++) {
+				size_t la = strlen(tok[t].a), lb = strlen(tok[t].b);
+				if(strncmp(s, tok[t].a, la) == 0) { tmp[wi++] = tok[t].ch; i += la; ate = 1; break; }
+				if(strncmp(s, tok[t].b, lb) == 0) { tmp[wi++] = tok[t].ch; i += lb; ate = 1; break; }
 			}
+			if(!ate) tmp[wi++] = rewritten[i++];
 		}
 		tmp[wi] = 0;
 		memcpy(rewritten, tmp, wi + 1);
 	}
+	/* Leading ' / " is an up-axis from every node. */
+	if(rewritten[0] == '\'' || rewritten[0] == '"') {
+		char tmp[2048];
+		size_t n = strlen(rewritten);
+		if(n + 2 >= sizeof(tmp)) return false;
+		tmp[0] = '*';
+		memcpy(tmp + 1, rewritten, n + 1);
+		memcpy(rewritten, tmp, n + 2);
+	}
 	const char *p = rewritten;
 	int first = 1;
 	while(*p) {
-		int desc = 0;
+		int axis = LOM_AXIS_CHILD;
 		if(!first) {
-			if(p[0] == '_' && p[1] == '_') { desc = 1; p += 2; }
-			else if(p[0] == '_') { p += 1; }
+			if(p[0] == '_' && p[1] == '_') { axis = LOM_AXIS_DESC; p += 2; }
+			else if(p[0] == '_') { axis = LOM_AXIS_CHILD; p += 1; }
+			else if(p[0] == '\'') { axis = LOM_AXIS_PARENT; p += 1; }
+			else if(p[0] == '"') { axis = LOM_AXIS_ANC; p += 1; }
 			else break;
 		}
 		first = 0;
 		while(*p == '_') p++; /* ignore stray underscores */
-		if(!*p) break;
+		if(!*p) {
+			/* Trailing axis: name' / name" means parent/ancestor of any tag. */
+			if(axis == LOM_AXIS_PARENT || axis == LOM_AXIS_ANC) {
+				if(out->count >= 32) return false;
+				memset(&out->pieces[out->count], 0, sizeof(out->pieces[0]));
+				out->pieces[out->count].name[0] = '*';
+				out->pieces[out->count].name_len = 1;
+				out->pieces[out->count].regex_id = -1;
+				out->pieces[out->count].axis = axis;
+				out->pieces[out->count].descendant = false;
+				out->count++;
+			}
+			break;
+		}
 		const char *start = p;
-		while(*p && *p != '_') p++;
+		while(*p && *p != '_' && *p != '\'' && *p != '"') p++;
 		size_t n = (size_t)(p - start);
 		if(n == 0) continue;
 		if(out->count >= 32) return false;
@@ -1640,9 +3048,12 @@ static bool parse_selector(const char *sel, sel_chain *out) {
 		for(size_t i = 0; i < n; i++) {
 			if(piecebuf[i] == '\x1E') piecebuf[i] = '_';
 			else if(piecebuf[i] == '\x1F') piecebuf[i] = '/';
+			else if(piecebuf[i] == '\x01') piecebuf[i] = '\'';
+			else if(piecebuf[i] == '\x02') piecebuf[i] = '"';
 		}
 		if(!parse_piece(piecebuf, n, &out->pieces[out->count], out)) return false;
-		out->pieces[out->count].descendant = desc != 0;
+		out->pieces[out->count].axis = axis;
+		out->pieces[out->count].descendant = axis == LOM_AXIS_DESC;
 		out->count++;
 	}
 	return out->count > 0;
@@ -1707,11 +3118,12 @@ static bool tag_span_has_attr(const char *tag, size_t tlen, const sel_piece *pie
 }
 
 static bool row_has_attr_oi(const lom_doc *d, size_t oi, const sel_piece *piece) {
-	if(!piece || piece->attr_len == 0 || oi >= d->scan.open_count) return false;
-	const lom_open_row *row = &d->scan.opens[oi];
-	if(row_is_dead(row)) return false;
+	if(!piece || piece->attr_len == 0) return false;
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at((lom_doc *)d, oi, &scratch);
+	if(!row || row_is_dead(row)) return false;
 	int64_t open_off = row_open_off(d, row);
-	if(d->scan.attr_count) {
+	if(d->scan.attr_count && !doc_has_recipe(d) && oi < d->scan.open_count) {
 		for(size_t i = 0; i < d->scan.attr_count; i++) {
 			const lom_attr_row *a = &d->scan.attrs[i];
 			if(a->open_off != open_off) continue;
@@ -1726,8 +3138,8 @@ static bool row_has_attr_oi(const lom_doc *d, size_t oi, const sel_piece *piece)
 	if(tend < open_off) return false;
 	size_t tlen = (size_t)(tend - open_off + 1);
 	if(open_off < 0 || (size_t)open_off + tlen > d->code_len) return false;
-	char scratch[8192];
-	const char *span = doc_span(d, (size_t)open_off, tlen, scratch, sizeof(scratch));
+	char spanbuf[8192];
+	const char *span = doc_span(d, (size_t)open_off, tlen, spanbuf, sizeof(spanbuf));
 	if(!span) {
 		char *big = malloc(tlen);
 		if(!big) return false;
@@ -1741,7 +3153,9 @@ static bool row_has_attr_oi(const lom_doc *d, size_t oi, const sel_piece *piece)
 
 /* Raw bytes between open-tag end and close-tag start (may include nested markup). */
 static bool raw_inner_bounds(const lom_doc *d, size_t open_idx, size_t *start_out, size_t *len_out) {
-	const lom_open_row *row = &d->scan.opens[open_idx];
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at((lom_doc *)d, open_idx, &scratch);
+	if(!row) return false;
 	if(row_is_sc(row) || row_is_dead(row)) {
 		*start_out = 0;
 		*len_out = 0;
@@ -1797,9 +3211,19 @@ static bool tagvalue_text_span(const lom_doc *d, size_t open_idx, const char **o
 	}
 	if(!has_lt) {
 		if(!d->code_overlay) {
-			*out = d->code + start;
-			*out_len = raw_len;
-			return true;
+			if(d->code) {
+				*out = d->code + start;
+				*out_len = raw_len;
+				return true;
+			}
+			{
+				const char *hp = doc_hot_ptr(d, start, raw_len);
+				if(hp) {
+					*out = hp;
+					*out_len = raw_len;
+					return true;
+				}
+			}
 		}
 		if((size_t)start >= d->ov_at && start + raw_len <= d->ov_at + d->ov_ins_len) {
 			*out = d->ov_ins + (start - d->ov_at);
@@ -1842,6 +3266,29 @@ static bool inner_text_eq(const lom_doc *d, size_t open_idx, const char *text, s
 	return tagvalue_text_eq(d, open_idx, text, tlen);
 }
 
+static bool piece_text_ok(const lom_doc *d, size_t open_idx, const sel_piece *piece) {
+	if(!piece || !piece->has_text) return true;
+	if(piece->rop == LOM_ROP_NONE || piece->rop == LOM_ROP_EQ)
+		return inner_text_eq(d, open_idx, piece->text, piece->text_len);
+	if(piece->rop != LOM_ROP_GT && piece->rop != LOM_ROP_GE &&
+	   piece->rop != LOM_ROP_LT && piece->rop != LOM_ROP_LE)
+		return inner_text_eq(d, open_idx, piece->text, piece->text_len);
+	char buf[128];
+	size_t is = 0, il = 0;
+	if(!raw_inner_bounds(d, open_idx, &is, &il)) return false;
+	if(il >= sizeof(buf)) il = sizeof(buf) - 1;
+	for(size_t i = 0; i < il; i++) buf[i] = doc_byte(d, is + i);
+	buf[il] = 0;
+	char *end = NULL;
+	double have = strtod(buf, &end);
+	double want = strtod(piece->text, NULL);
+	if(end == buf) return false;
+	if(piece->rop == LOM_ROP_GT) return have > want;
+	if(piece->rop == LOM_ROP_GE) return have >= want;
+	if(piece->rop == LOM_ROP_LT) return have < want;
+	return have <= want;
+}
+
 static pcre2_match_context *sel_regex_match_ctx(void) {
 	pcre2_match_context *ctx = pcre2_match_context_create(NULL);
 	if(!ctx) return NULL;
@@ -1866,8 +3313,15 @@ static pcre2_code *compile_sel_regex(const sel_regex_slot *slot) {
 	return pcre2_compile((PCRE2_SPTR)slot->pattern, slot->pattern_len, options, &errcode, &erroff, NULL);
 }
 
+static int regex_caret_prefix_only(const sel_regex_slot *slot) {
+	if(!slot || slot->pattern_len < 2 || slot->pattern[0] != '^') return 0;
+	size_t n = slot->pattern_len;
+	if(slot->pattern[n - 1] == '$' && (n < 3 || slot->pattern[n - 2] != '\\')) return 0;
+	return 1;
+}
+
 static bool regex_keeps(int rop, pcre2_code *re, pcre2_match_data *md, pcre2_match_context *mctx,
-	const char *text, size_t tlen) {
+	const char *text, size_t tlen, int caret_prefix) {
 	if(!re || !md) return false;
 	if(rop == LOM_ROP_PCT || rop == LOM_ROP_NE) {
 		int rc = pcre2_match(re, (PCRE2_SPTR)text, tlen, 0, 0, md, mctx);
@@ -1880,7 +3334,7 @@ static bool regex_keeps(int rop, pcre2_code *re, pcre2_match_data *md, pcre2_mat
 		if(rc < 0) break;
 		PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
 		PCRE2_SIZE ms = ov[0], me = ov[1];
-		if(rop == LOM_ROP_EQ && ms == 0 && me == tlen) return true;
+		if(rop == LOM_ROP_EQ && ms == 0 && (me == tlen || caret_prefix)) return true;
 		if(rop == LOM_ROP_CARET && ms == 0) return true;
 		if(rop == LOM_ROP_DOLLAR && me == tlen) return true;
 		if(rop == LOM_ROP_TILDE) {
@@ -1916,7 +3370,9 @@ static void chain_resolve_nids(const lom_doc *d, const sel_chain *chain, int32_t
 
 static bool piece_matches_open(const lom_doc *d, size_t oi, const sel_piece *piece, const sel_chain *chain,
 	pcre2_code *re, pcre2_match_data *md, pcre2_match_context *mctx) {
-	const lom_open_row *row = &d->scan.opens[oi];
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at((lom_doc *)d, oi, &scratch);
+	if(!row) return false;
 	if(piece->has_regex) {
 		if(piece->regex_id < 0 || (size_t)piece->regex_id >= chain->regex_count) return false;
 		const sel_regex_slot *slot = &chain->regexes[piece->regex_id];
@@ -1926,21 +3382,23 @@ static bool piece_matches_open(const lom_doc *d, size_t oi, const sel_piece *pie
 			if(!row_attr_value(d, row->open_off, piece->attr, piece->attr_len, &val, &vlen)) {
 				return rop == LOM_ROP_NE;
 			}
-			return regex_keeps(rop, re, md, mctx, val, vlen);
+			return regex_keeps(rop, re, md, mctx, val, vlen, regex_caret_prefix_only(slot));
 		}
 		const char *text = NULL; size_t tlen = 0; char *heap = NULL;
 		if(!tagvalue_text_span(d, oi, &text, &tlen, &heap)) return false;
-		bool keep = regex_keeps(rop, re, md, mctx, text, tlen);
+		bool keep = regex_keeps(rop, re, md, mctx, text, tlen, regex_caret_prefix_only(slot));
 		free(heap);
 		return keep;
 	}
 	if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) return false;
-	if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) return false;
+	if(!piece_text_ok(d, oi, piece)) return false;
 	return true;
 }
 
 /* Among doc-ordered tag-rows for nid: advance row cursor to covering open (amortised O(1)). */
 static size_t tag_row_covering_hit_adv(const lom_doc *d, int32_t nid, int64_t hit_off, size_t *row_cursor) {
+	if(doc_has_recipe(d))
+		return recipe_covering_oi((lom_doc *)d, nid, hit_off);
 	if(nid < 0 || (size_t)nid >= d->tag_row_slots || !d->tag_rows[nid]) return (size_t)-1;
 	uint32_t *rows = d->tag_rows[nid];
 	size_t rc = d->tag_row_counts[nid];
@@ -1984,9 +3442,154 @@ static int pattern_exact_literal(const sel_regex_slot *slot, char *lit, size_t l
 	return 1;
 }
 
+typedef struct {
+	const char *hay;
+	size_t claim_lo, claim_hi, hay_n;
+	const char *needle;
+	size_t nlen;
+	size_t *hits;
+	size_t n, cap;
+} doc_lit_job;
+
+static void *doc_lit_job_main(void *arg) {
+	doc_lit_job *j = (doc_lit_job *)arg;
+	if(!j->nlen || j->claim_lo >= j->hay_n) return NULL;
+	size_t search = j->claim_lo;
+	size_t search_end = j->claim_hi + j->nlen - 1;
+	if(search_end > j->hay_n) search_end = j->hay_n;
+	while(search + j->nlen <= search_end) {
+		const void *h = lom_fss_memmem(j->hay + search, search_end - search, j->needle, j->nlen);
+		if(!h) break;
+		size_t off = (size_t)((const char *)h - j->hay);
+		if(off >= j->claim_hi) break;
+		search = off + 1;
+		if(off < j->claim_lo) continue;
+		if(j->n >= j->cap) {
+			size_t ncap = j->cap ? j->cap * 2 : 64;
+			size_t *nh = realloc(j->hits, ncap * sizeof(size_t));
+			if(!nh) { free(j->hits); j->hits = NULL; j->n = 0; return NULL; }
+			j->hits = nh;
+			j->cap = ncap;
+		}
+		j->hits[j->n++] = off;
+	}
+	return NULL;
+}
+
+/* Parallel memmem on ≥64 MiB (respects LOM_PARALLEL=0). Hits are document-ordered. */
+static size_t *doc_memmem_hits(const char *hay, size_t hay_n, const char *needle, size_t nlen, size_t *out_n) {
+	*out_n = 0;
+	if(!hay || !needle || !nlen || hay_n < nlen) return NULL;
+	long jobs = 1;
+	if(hay_n >= ((size_t)64 << 20) && env_flag_on("LOM_PARALLEL", 1)) {
+		long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+		if(ncpu >= 2) {
+			jobs = ncpu > 16 ? 16 : ncpu;
+			if(hay_n / (size_t)jobs < ((size_t)16 << 20)) jobs = 1;
+		}
+	}
+	if(jobs < 2) {
+		doc_lit_job j;
+		memset(&j, 0, sizeof(j));
+		j.hay = hay;
+		j.hay_n = hay_n;
+		j.claim_lo = 0;
+		j.claim_hi = hay_n;
+		j.needle = needle;
+		j.nlen = nlen;
+		doc_lit_job_main(&j);
+		*out_n = j.n;
+		return j.hits;
+	}
+	doc_lit_job *js = calloc((size_t)jobs, sizeof(doc_lit_job));
+	pthread_t *th = calloc((size_t)jobs, sizeof(pthread_t));
+	if(!js || !th) { free(js); free(th); return NULL; }
+	size_t chunk = hay_n / (size_t)jobs;
+	for(long i = 0; i < jobs; i++) {
+		js[i].hay = hay;
+		js[i].hay_n = hay_n;
+		js[i].claim_lo = (size_t)i * chunk;
+		js[i].claim_hi = (i + 1 == jobs) ? hay_n : (size_t)(i + 1) * chunk;
+		js[i].needle = needle;
+		js[i].nlen = nlen;
+		if(pthread_create(&th[i], NULL, doc_lit_job_main, &js[i]) != 0) {
+			for(long k = 0; k < i; k++) pthread_join(th[k], NULL);
+			for(long k = 0; k < i; k++) free(js[k].hits);
+			free(js); free(th);
+			return NULL;
+		}
+	}
+	for(long i = 0; i < jobs; i++) pthread_join(th[i], NULL);
+	size_t total = 0;
+	for(long i = 0; i < jobs; i++) total += js[i].n;
+	size_t *hits = NULL;
+	if(total) {
+		hits = malloc(total * sizeof(size_t));
+		if(hits) {
+			size_t w = 0;
+			for(long i = 0; i < jobs; i++) {
+				if(js[i].n) memcpy(hits + w, js[i].hits, js[i].n * sizeof(size_t));
+				w += js[i].n;
+			}
+		}
+	}
+	for(long i = 0; i < jobs; i++) free(js[i].hits);
+	free(js);
+	free(th);
+	*out_n = hits ? total : 0;
+	return hits;
+}
+
+static int hits_push_off(size_t **hits, size_t *n, size_t *cap, size_t v) {
+	if(*n >= *cap) {
+		size_t nc = *cap ? *cap * 2 : 32;
+		size_t *p = realloc(*hits, nc * sizeof(size_t));
+		if(!p) return 0;
+		*hits = p;
+		*cap = nc;
+	}
+	(*hits)[(*n)++] = v;
+	return 1;
+}
+
+/* memmem in logical document bytes (overlay window + base). */
+static size_t *doc_memmem_hits_logical(lom_doc *d, const char *needle, size_t nlen, size_t *out_n) {
+	*out_n = 0;
+	if(!d || !needle || !nlen) return NULL;
+	if(d->code_overlay && d->code) {
+		size_t *acc = NULL, cap = 0, n = 0;
+		size_t n1 = 0;
+		size_t *h1 = doc_memmem_hits(d->code, d->ov_at, needle, nlen, &n1);
+		for(size_t i = 0; i < n1; i++) {
+			if(!hits_push_off(&acc, &n, &cap, h1[i])) { free(h1); free(acc); return NULL; }
+		}
+		free(h1);
+		size_t n2 = 0;
+		size_t *h2 = doc_memmem_hits(d->ov_ins, d->ov_ins_len, needle, nlen, &n2);
+		for(size_t i = 0; i < n2; i++) {
+			if(!hits_push_off(&acc, &n, &cap, d->ov_at + h2[i])) { free(h2); free(acc); return NULL; }
+		}
+		free(h2);
+		size_t tphys = d->ov_at + d->ov_remove;
+		size_t tlen = d->code_base_len > tphys ? d->code_base_len - tphys : 0;
+		size_t n3 = 0;
+		size_t *h3 = tlen ? doc_memmem_hits(d->code + tphys, tlen, needle, nlen, &n3) : NULL;
+		size_t lbase = d->ov_at + d->ov_ins_len;
+		for(size_t i = 0; i < n3; i++) {
+			if(!hits_push_off(&acc, &n, &cap, lbase + h3[i])) { free(h3); free(acc); return NULL; }
+		}
+		free(h3);
+		*out_n = n;
+		return acc;
+	}
+	if(!d->code && !doc_ensure_code(d)) return NULL;
+	return doc_memmem_hits(d->code, d->code_len, needle, nlen, out_n);
+}
+
 static int query_regex_via_literal_hits(lom_doc *d, const sel_chain *chain, const sel_piece *piece,
-	pcre2_code *re, pcre2_match_data *md, pcre2_match_context *mctx, lom_match_list *out) {
-	if(d->code_overlay || !d->code || d->code_len == 0) return 0;
+	pcre2_code *re, pcre2_match_data *md, pcre2_match_context *mctx, lom_oi_list *out) {
+	if(d->code_len == 0) return 0;
+	if(!d->code && !doc_has_recipe(d)) return 0;
 	if(piece->name_len == 1 && piece->name[0] == '*') return 0;
 	const sel_regex_slot *slot = &chain->regexes[piece->regex_id];
 	if(slot->rop == LOM_ROP_NE) return 0; /* need full scan to find non-matches */
@@ -2016,36 +3619,73 @@ static int query_regex_via_literal_hits(lom_doc *d, const sel_chain *chain, cons
 	if(nid < 0) return 1; /* handled; no tags */
 
 	size_t last_oi = (size_t)-1;
-	const char *hay = d->code;
 	int32_t anids[32];
 	int have_anids = 0;
-	if(chain->count >= 2 && chain->count <= 32) {
+	if(chain->count >= 1 && chain->count <= 32) {
 		chain_resolve_nids(d, chain, anids);
-		have_anids = 1;
+		have_anids = (chain->count >= 2);
 	}
-	size_t hay_n = d->code_len;
-	size_t pos = 0;
+	if(doc_has_recipe(d) && used_bracketed && exact_n) {
+		size_t guess = 0;
+		if(recipe_text_guess_tile(d, chain, anids, exact, exact_n, &guess)) {
+			size_t ts[3];
+			size_t nt = 0;
+			ts[nt++] = guess;
+			if(guess > 0) ts[nt++] = guess - 1;
+			if(guess + 1 < d->scan.recipe_tile_n) ts[nt++] = guess + 1;
+			for(size_t ti = 0; ti < nt; ti++) {
+				if(recipe_instantiate_tile(d, ts[ti]) != LOM_OK) continue;
+				size_t lo = (size_t)recipe_range_start(d, ts[ti]);
+				size_t hi = (size_t)recipe_range_end(d, ts[ti]);
+				const char *base = NULL;
+				if(d->hot_bytes && d->hot_bytes_lo == lo && d->hot_bytes_n == hi - lo)
+					base = d->hot_bytes;
+				else if(d->code && hi <= d->code_len)
+					base = d->code + lo;
+				if(!base || hi <= lo || lo + pn > hi) continue;
+				size_t rel = 0, span = hi - lo;
+				while(rel + pn <= span) {
+					const void *hit = memmem(base + rel, span - rel, probe, pn);
+					if(!hit) break;
+					size_t hoff = lo + (size_t)((const char *)hit - base);
+					rel = (size_t)((const char *)hit - base) + 1;
+					int64_t cover_off = (int64_t)(used_bracketed ? hoff + 1 : hoff);
+					size_t oi = recipe_covering_oi(d, nid, cover_off);
+					if(oi == (size_t)-1 || oi == last_oi) continue;
+					last_oi = oi;
+					lom_open_row scratch;
+					const lom_open_row *row = doc_open_at(d, oi, &scratch);
+					if(!row || row_is_dead(row)) continue;
+					if(!piece_matches_open(d, oi, piece, chain, re, md, mctx)) continue;
+					if(chain->count >= 2 && !ancestor_chain_ok_oi(d, chain, oi, anids)) continue;
+					if(!oi_push(out, (uint32_t)oi))
+						return -1;
+				}
+			}
+			if(out->count) return 1;
+		}
+	}
+	size_t nhits = 0;
+	size_t *hits = doc_memmem_hits_logical(d, probe, pn, &nhits);
 	size_t row_cursor = 0;
-	size_t rc_hint = ((size_t)nid < d->tag_row_slots) ? d->tag_row_counts[nid] : 0;
-	if(rc_hint > 1024 &&
-	   !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, rc_hint / 4 + 64))
-		return -1;
-	while(pos + pn <= hay_n) {
-		const void *hit = lom_fss_memmem(hay + pos, hay_n - pos, probe, pn);
-		if(!hit) break;
-		size_t hoff = (size_t)((const char *)hit - hay);
+	for(size_t hi = 0; hi < nhits; hi++) {
+		size_t hoff = hits[hi];
 		/* For ">lit<" hits, point inside the text (skip '>'). */
 		int64_t cover_off = (int64_t)(used_bracketed ? hoff + 1 : hoff);
 		size_t oi = tag_row_covering_hit_adv(d, nid, cover_off, &row_cursor);
-		pos = hoff + 1;
 		if(oi == (size_t)-1 || oi == last_oi) continue;
 		last_oi = oi;
-		if(row_is_dead(&d->scan.opens[oi])) continue;
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at(d, oi, &scratch);
+		if(!row || row_is_dead(row)) continue;
 		if(!piece_matches_open(d, oi, piece, chain, re, md, mctx)) continue;
 		if(chain->count >= 2 && !ancestor_chain_ok_oi(d, chain, oi, have_anids ? anids : NULL)) continue;
-		const lom_open_row *row = &d->scan.opens[oi];
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return -1;
+		if(!oi_push(out, (uint32_t)oi)) {
+			free(hits);
+			return -1;
+		}
 	}
+	free(hits);
 	/* Pending appends: cheap to check fully. */
 	for(size_t pi = 0; pi < d->tag_pend_n; pi++) {
 		if(d->tag_pend_name[pi] != (uint32_t)nid) continue;
@@ -2053,16 +3693,15 @@ static int query_regex_via_literal_hits(lom_doc *d, const sel_chain *chain, cons
 		if(oi == last_oi) continue;
 		if(!piece_matches_open(d, oi, piece, chain, re, md, mctx)) continue;
 		if(chain->count >= 2 && !ancestor_chain_ok_oi(d, chain, oi, have_anids ? anids : NULL)) continue;
-		const lom_open_row *row = &d->scan.opens[oi];
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return -1;
+		if(!oi_push(out, (uint32_t)oi)) return -1;
 	}
 	return 1;
 }
 
-static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
+static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_oi_list *out) {
 	/* Keep growth overlay: tagvalue_text_span / doc_byte handle seams. */
-	lom_match_list_free(out);
-	lom_match_list_init(out);
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
 	const sel_piece *piece = &chain->pieces[chain->count - 1];
 	if(!piece->has_regex || piece->regex_id < 0) return LOM_ERR_PARSE;
 	const sel_regex_slot *slot = &chain->regexes[piece->regex_id];
@@ -2088,13 +3727,13 @@ static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match
 		if(piece->index > 0 && out->count > 0) {
 			size_t pick = (size_t)piece->index - 1;
 			if(pick >= out->count) {
-				lom_match_list_free(out);
-				lom_match_list_init(out);
+				lom_oi_list_free(out);
+				lom_oi_list_init(out);
 			} else {
-				lom_match keep = out->items[pick];
-				lom_match_list_free(out);
-				lom_match_list_init(out);
-				match_push(out, keep.offset, keep.end_off);
+				uint32_t keep = out->items[pick];
+				lom_oi_list_free(out);
+				lom_oi_list_init(out);
+				oi_push(out, keep);
 			}
 		}
 		pcre2_match_context_free(mctx);
@@ -2116,8 +3755,8 @@ static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match
 	if(piece->name_len == 1 && piece->name[0] == '*') {
 		k = d->scan.open_count;
 	} else {
-		rows = d->tag_rows[nid];
-		k = d->tag_row_counts[nid];
+		rows = ((size_t)nid < d->tag_row_slots) ? d->tag_rows[nid] : NULL;
+		k = (rows && (size_t)nid < d->tag_row_slots) ? d->tag_row_counts[nid] : 0;
 	}
 
 	int32_t anids[32];
@@ -2136,8 +3775,7 @@ static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match
 		if(chain->count >= 2) {
 			if(!ancestor_chain_ok_oi(d, chain, oi, have_anids ? anids : NULL)) continue;
 		}
-		const lom_open_row *row = &d->scan.opens[oi];
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) {
+		if(!oi_push(out, (uint32_t)oi)) {
 			pcre2_match_context_free(mctx);
 			pcre2_match_data_free(md);
 			pcre2_code_free(re);
@@ -2150,8 +3788,7 @@ static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match
 			size_t oi = d->tag_pend_oi[pi];
 			if(!piece_matches_open(d, oi, piece, chain, re, md, mctx)) continue;
 			if(chain->count >= 2 && !ancestor_chain_ok_oi(d, chain, oi, have_anids ? anids : NULL)) continue;
-			const lom_open_row *row = &d->scan.opens[oi];
-			if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) {
+			if(!oi_push(out, (uint32_t)oi)) {
 				pcre2_match_context_free(mctx);
 				pcre2_match_data_free(md);
 				pcre2_code_free(re);
@@ -2162,13 +3799,13 @@ static lom_status query_regex_leaf(lom_doc *d, const sel_chain *chain, lom_match
 	if(piece->index > 0 && out->count > 0) {
 		size_t pick = (size_t)piece->index - 1;
 		if(pick >= out->count) {
-			lom_match_list_free(out);
-			lom_match_list_init(out);
+			lom_oi_list_free(out);
+			lom_oi_list_init(out);
 		} else {
-			lom_match keep = out->items[pick];
-			lom_match_list_free(out);
-			lom_match_list_init(out);
-			match_push(out, keep.offset, keep.end_off);
+			uint32_t keep = out->items[pick];
+			lom_oi_list_free(out);
+			lom_oi_list_init(out);
+			oi_push(out, keep);
 		}
 	}
 	pcre2_match_context_free(mctx);
@@ -2188,7 +3825,7 @@ static void collect_named_children(const lom_doc *d, const uint32_t *kids, size_
 			continue;
 		}
 		if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-		if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+		if(!piece_text_ok(d, oi, piece)) continue;
 		if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 		(*out)[(*out_n)++] = oi;
 	}
@@ -2246,7 +3883,7 @@ static void collect_named_descendants_span(lom_doc *d, size_t parent_i, const se
 				if(ooff > pend) break;
 				if(ooff <= poff) continue;
 				if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-				if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+				if(!piece_text_ok(d, oi, piece)) continue;
 				if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 				(*out)[(*out_n)++] = oi;
 				opens_scan_drop_behind(&d->scan, &last_drop, oi);
@@ -2262,7 +3899,7 @@ static void collect_named_descendants_span(lom_doc *d, size_t parent_i, const se
 				int64_t ooff = row_open_off(d, row);
 				if(ooff <= poff || ooff > pend) continue;
 				if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-				if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+				if(!piece_text_ok(d, oi, piece)) continue;
 				if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 				(*out)[(*out_n)++] = oi;
 				if(stop_early && *out_n >= want_n) return;
@@ -2279,7 +3916,7 @@ static void collect_named_descendants_span(lom_doc *d, size_t parent_i, const se
 		if(row_is_dead(row)) continue;
 		if(row_open_off(d, row) > pend) break;
 		if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-		if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+		if(!piece_text_ok(d, oi, piece)) continue;
 		if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 		(*out)[(*out_n)++] = oi;
 		opens_scan_drop_behind(&d->scan, &last_drop, oi);
@@ -2291,7 +3928,7 @@ static void collect_named_descendants_span(lom_doc *d, size_t parent_i, const se
 		int64_t ooff = row_open_off(d, row);
 		if(ooff <= poff || ooff > pend) continue;
 		if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-		if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+		if(!piece_text_ok(d, oi, piece)) continue;
 		if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 		(*out)[(*out_n)++] = oi;
 		if(stop_early && *out_n >= want_n) return;
@@ -2331,7 +3968,7 @@ static void collect_named_children_span(lom_doc *d, size_t parent_i, const sel_p
 			continue;
 		}
 		if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-		if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+		if(!piece_text_ok(d, oi, piece)) continue;
 		if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 		(*out)[(*out_n)++] = oi;
 		opens_scan_drop_behind(&d->scan, &last_drop, oi);
@@ -2350,7 +3987,7 @@ static void collect_named_children_span(lom_doc *d, size_t parent_i, const sel_p
 			continue;
 		}
 		if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-		if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+		if(!piece_text_ok(d, oi, piece)) continue;
 		if(!grow_cap((void **)out, sizeof(size_t), out_cap, *out_n + 1)) return;
 		(*out)[(*out_n)++] = oi;
 		if(stop_early && *out_n >= want_n) return;
@@ -2359,19 +3996,68 @@ static void collect_named_children_span(lom_doc *d, size_t parent_i, const sel_p
 
 /* When CSR is absent (huge docs), expand children via in-span walk (not global tag rows). */
 
-static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
-	lom_match_list_free(out);
-	lom_match_list_init(out);
+/* Last same-name sibling under each parent. Document order: later oi wins. */
+static int keep_last_siblings(lom_doc *d, size_t *xs, size_t *n) {
+	if(!xs || !n || *n <= 1) return 1;
+	size_t cap = 16;
+	while(cap < *n * 2) cap *= 2;
+	int32_t *keys = calloc(cap, sizeof(int32_t));
+	size_t *vals = calloc(cap, sizeof(size_t));
+	uint8_t *used = calloc(cap, 1);
+	if(!keys || !vals || !used) {
+		free(keys); free(vals); free(used);
+		return 0;
+	}
+	for(size_t i = 0; i < *n; i++) {
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at(d, xs[i], &scratch);
+		int32_t p = -1;
+		if(row) {
+			if(row == &scratch) p = scratch.parent_idx;
+			else p = row_parent(d, row);
+		}
+		uint32_t h = ((uint32_t)p * 2654435761u) & (uint32_t)(cap - 1);
+		while(used[h] && keys[h] != p) h = (h + 1) & (uint32_t)(cap - 1);
+		used[h] = 1;
+		keys[h] = p;
+		vals[h] = i;
+	}
+	uint8_t *keep = calloc(*n, 1);
+	if(!keep) { free(keys); free(vals); free(used); return 0; }
+	for(size_t h = 0; h < cap; h++) if(used[h]) keep[vals[h]] = 1;
+	size_t w = 0;
+	for(size_t i = 0; i < *n; i++) if(keep[i]) xs[w++] = xs[i];
+	*n = w;
+	free(keep); free(keys); free(vals); free(used);
+	return 1;
+}
 
-	/* Single tag / '*': emit matches in one pass (no oi staging array). */
+static int nxt_contains(const size_t *xs, size_t n, size_t oi) {
+	for(size_t i = 0; i < n; i++) if(xs[i] == oi) return 1;
+	return 0;
+}
+
+static int piece_name_ok_oi(lom_doc *d, size_t oi, const sel_piece *piece) {
+	if(piece->name_len == 1 && piece->name[0] == '*') return 1;
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at(d, oi, &scratch);
+	if(!row || row_is_dead(row)) return 0;
+	return name_eq(d, row->name_id, piece->name, piece->name_len);
+}
+
+static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_oi_list *out) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
+
+	/* Single tag / '*': emit ois in one pass. */
 	if(chain->count == 1) {
 		const sel_piece *piece = &chain->pieces[0];
-		if(piece->index <= 0 && !piece->has_text && !piece->has_regex) {
+		if(!piece->is_last && piece->index <= 0 && !piece->has_text && !piece->has_regex) {
 			size_t last_drop = 0;
 			if(piece->name_len == 1 && piece->name[0] == '*') {
 				size_t n = d->scan.open_count;
 				if(!piece->has_attr) {
-					if(n > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, n))
+					if(n > 0 && !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, n))
 						return LOM_ERR_NOMEM;
 					/* Fresh docs: no bias / almost no DEAD — tight emit. */
 					if(!d->off_bias_delta) {
@@ -2379,13 +4065,11 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 							const lom_open_row *row = &d->scan.opens[i];
 							if(row->self_closing & (LOM_OPEN_DEAD | LOM_OPEN_ABS | LOM_OPEN_NE_OVF)) {
 								if(row_is_dead(row)) continue;
-								if(!match_push_fast(out, row_open_off(d, row), row_node_end(d, row)))
+								if(!oi_push_fast(out, (uint32_t)i))
 									return LOM_ERR_NOMEM;
 								continue;
 							}
-							out->items[out->count].offset = row->open_off;
-							out->items[out->count].end_off = row->open_off + (int64_t)row->node_end_rel;
-							out->count++;
+							out->items[out->count++] = (uint32_t)i;
 						}
 						return LOM_OK;
 					}
@@ -2394,7 +4078,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 					const lom_open_row *row = &d->scan.opens[i];
 					if(row_is_dead(row)) continue;
 					if(piece->has_attr && !row_has_attr_oi(d, i, piece)) continue;
-					if(!match_push_fast(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+					if(!oi_push_fast(out, (uint32_t)i)) return LOM_ERR_NOMEM;
 					opens_scan_drop_behind(&d->scan, &last_drop, i);
 				}
 				return LOM_OK;
@@ -2404,12 +4088,12 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 			uint32_t *rows = d->tag_rows[nid];
 			size_t rc = d->tag_row_counts[nid];
 			if(rc > 0 && !piece->has_attr &&
-			   !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, rc + d->tag_pend_n))
+			   !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, rc + d->tag_pend_n))
 				return LOM_ERR_NOMEM;
 			if(rc > 0 && piece->has_attr) {
 				/* Presence usually matches most of the tag row; equality is sparser. */
 				size_t hint = piece->attr_eq ? (rc / 4 + 64) : (rc + d->tag_pend_n);
-				(void)grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, hint);
+				(void)grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, hint);
 			}
 			int nobias = !d->off_bias_delta;
 			for(size_t i = 0; i < rc; i++) {
@@ -2428,14 +4112,14 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 							continue;
 						if((size_t)ooff + tlen > d->code_len && !row_has_attr_oi(d, oi, piece))
 							continue;
-						if(!match_push_fast(out, ooff, ooff + (int64_t)row->node_end_rel))
+						if(!oi_push_fast(out, (uint32_t)oi))
 							return LOM_ERR_NOMEM;
 						opens_scan_drop_behind(&d->scan, &last_drop, oi);
 						continue;
 					}
 					if(!row_has_attr_oi(d, oi, piece)) continue;
 				}
-				if(!match_push_fast(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+				if(!oi_push_fast(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 				opens_scan_drop_behind(&d->scan, &last_drop, oi);
 			}
 			for(size_t pi = 0; pi < d->tag_pend_n; pi++) {
@@ -2444,7 +4128,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 				const lom_open_row *row = &d->scan.opens[oi];
 				if(row_is_dead(row)) continue;
 				if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-				if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+				if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 			}
 			return LOM_OK;
 		}
@@ -2473,7 +4157,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 						if(row_is_dead(&d->scan.opens[oi])) {
 							/* skip — fall through without match */
 						} else if(!(piece->has_attr && !row_has_attr_oi(d, oi, piece)) &&
-						   !(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len))) {
+						   !(!piece_text_ok(d, oi, piece))) {
 							grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, 1);
 							nxt[nxt_n++] = oi;
 						}
@@ -2496,7 +4180,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 				if(piece->name_len == 1 && piece->name[0] == '*') {
 					for(size_t i = 0; i < d->scan.open_count; i++) {
 						if(piece->has_attr && !row_has_attr_oi(d, i, piece)) continue;
-						if(piece->has_text && !inner_text_eq(d, i, piece->text, piece->text_len)) continue;
+						if(!piece_text_ok(d, i, piece)) continue;
 						grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
 						nxt[nxt_n++] = i;
 					}
@@ -2510,7 +4194,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 						size_t oi = decode_open_idx(d, rows[i]);
 						if(row_is_dead(&d->scan.opens[oi])) continue;
 						if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-						if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+						if(!piece_text_ok(d, oi, piece)) continue;
 						grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
 						nxt[nxt_n++] = oi;
 					}
@@ -2519,7 +4203,7 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 						size_t oi = d->tag_pend_oi[pi];
 						if(row_is_dead(&d->scan.opens[oi])) continue;
 						if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) continue;
-						if(piece->has_text && !inner_text_eq(d, oi, piece->text, piece->text_len)) continue;
+						if(!piece_text_ok(d, oi, piece)) continue;
 						grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
 						nxt[nxt_n++] = oi;
 					}
@@ -2529,6 +4213,36 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 			for(size_t ci = 0; ci < cur_n; ci++) {
 				size_t parent_i = cur[ci];
 				size_t tmp_n = 0, tmp_cap = 0; size_t *tmp = NULL;
+				if(piece->axis == LOM_AXIS_PARENT || piece->axis == LOM_AXIS_ANC) {
+					size_t oi = parent_i;
+					int guard = 0;
+					while(guard++ < 4096) {
+						lom_open_row scratch;
+						const lom_open_row *row = doc_open_at(d, oi, &scratch);
+						if(!row) break;
+						int32_t p = (row == &scratch) ? scratch.parent_idx : row_parent(d, row);
+						if(p < 0) break;
+						oi = (size_t)p;
+						if(!piece_name_ok_oi(d, oi, piece)) {
+							if(piece->axis == LOM_AXIS_PARENT) break;
+							continue;
+						}
+						if(piece->has_attr && !row_has_attr_oi(d, oi, piece)) {
+							if(piece->axis == LOM_AXIS_PARENT) break;
+							continue;
+						}
+						if(!piece_text_ok(d, oi, piece)) {
+							if(piece->axis == LOM_AXIS_PARENT) break;
+							continue;
+						}
+						if(!nxt_contains(nxt, nxt_n, oi)) {
+							grow_cap((void **)&nxt, sizeof(size_t), &nxt_cap, nxt_n + 1);
+							nxt[nxt_n++] = oi;
+						}
+						break;
+					}
+					continue;
+				}
 				if(piece->descendant) {
 					collect_named_descendants_span(d, parent_i, piece, &tmp, &tmp_n, &tmp_cap);
 				} else if(d->child_at && d->child_start) {
@@ -2553,6 +4267,11 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 				free(tmp);
 			}
 		}
+		if(piece->is_last && !keep_last_siblings(d, nxt, &nxt_n)) {
+			free(cur);
+			free(nxt);
+			return LOM_ERR_NOMEM;
+		}
 		free(cur);
 		cur = nxt; cur_n = nxt_n; cur_cap = nxt_cap;
 		(void)cur_cap;
@@ -2564,14 +4283,13 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 	   When first piece had no index and count>1, first branch used global tag list — that
 	   matches PHP simple direct chain when no indices. When indices present, children walk matches indexed path. */
 
-	if(cur_n > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, cur_n)) {
+	if(cur_n > 0 && !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, cur_n)) {
 		free(cur);
 		return LOM_ERR_NOMEM;
 	}
 	size_t last_drop = 0;
 	for(size_t i = 0; i < cur_n; i++) {
-		const lom_open_row *row = &d->scan.opens[cur[i]];
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) {
+		if(!oi_push_fast(out, (uint32_t)cur[i])) {
 			free(cur);
 			return LOM_ERR_NOMEM;
 		}
@@ -2583,13 +4301,23 @@ static lom_status query_chain(lom_doc *d, const sel_chain *chain, lom_match_list
 
 /* Unindexed multi-piece: PHP walks from leaf candidates via parents. Prefer that when no indices. */
 static bool chain_has_index(const sel_chain *c) {
-	for(size_t i = 0; i < c->count; i++) if(c->pieces[i].index > 0) return true;
+	for(size_t i = 0; i < c->count; i++)
+		if(c->pieces[i].index > 0 || c->pieces[i].is_last) return true;
 	return false;
 }
 
 static bool chain_has_descendant(const sel_chain *c) {
 	for(size_t i = 0; i < c->count; i++) if(c->pieces[i].descendant) return true;
 	return false;
+}
+
+static int chain_has_up(const sel_chain *c) {
+	if(!c) return 0;
+	for(size_t i = 0; i < c->count; i++) {
+		if(c->pieces[i].axis == LOM_AXIS_PARENT || c->pieces[i].axis == LOM_AXIS_ANC)
+			return 1;
+	}
+	return 0;
 }
 
 static size_t tag_row_count_for(const lom_doc *d, const sel_piece *piece) {
@@ -2603,17 +4331,22 @@ static size_t tag_row_count_for(const lom_doc *d, const sel_piece *piece) {
  * nids[i] = resolved name_id for pieces[i], or -1 for '*'. Uses parent_idx only. */
 static bool ancestor_chain_ok_oi(const lom_doc *d, const sel_chain *chain, size_t leaf_oi,
 	const int32_t *nids) {
-	if(leaf_oi >= d->scan.open_count) return false;
+	if(leaf_oi >= doc_virt_opens(d)) return false;
+	lom_open_row scratch;
+	const lom_open_row *cur = doc_open_at((lom_doc *)d, leaf_oi, &scratch);
+	if(!cur) return false;
 	size_t cidx = leaf_oi;
 	for(ssize_t pi = (ssize_t)chain->count - 2; pi >= 0; pi--) {
 		const sel_piece *pp = &chain->pieces[pi];
 		const sel_piece *child_piece = &chain->pieces[pi + 1];
 		int32_t want = nids ? nids[pi] : -2; /* -2 => resolve via name_eq */
 		if(child_piece->descendant) {
-			int32_t p = row_parent(d, &d->scan.opens[cidx]);
+			int32_t p = row_parent(d, cur);
 			int found = 0;
 			while(p >= 0) {
-				const lom_open_row *prow = &d->scan.opens[(size_t)p];
+				lom_open_row pscratch;
+				const lom_open_row *prow = doc_open_at((lom_doc *)d, (size_t)p, &pscratch);
+				if(!prow) break;
 				int name_ok;
 				if(want == -1) name_ok = 1; /* '*' */
 				else if(want >= 0) name_ok = (prow->name_id == (uint32_t)want);
@@ -2622,6 +4355,8 @@ static bool ancestor_chain_ok_oi(const lom_doc *d, const sel_chain *chain, size_
 				   !(pp->has_attr && !row_has_attr_oi(d, (size_t)p, pp)) &&
 				   !(pp->has_text && !inner_text_eq(d, (size_t)p, pp->text, pp->text_len))) {
 					cidx = (size_t)p;
+					scratch = pscratch;
+					cur = &scratch;
 					found = 1;
 					break;
 				}
@@ -2629,21 +4364,27 @@ static bool ancestor_chain_ok_oi(const lom_doc *d, const sel_chain *chain, size_
 			}
 			if(!found) return false;
 		} else {
-			int32_t pidx32 = row_parent(d, &d->scan.opens[cidx]);
+			int32_t pidx32 = row_parent(d, cur);
 			if(pidx32 < 0) return false;
 			size_t pidx = (size_t)pidx32;
+			lom_open_row pscratch;
+			const lom_open_row *prow = doc_open_at((lom_doc *)d, pidx, &pscratch);
+			if(!prow) return false;
 			if(want == -1) {
 				/* '*' */
 			} else if(want >= 0) {
-				if(d->scan.opens[pidx].name_id != (uint32_t)want) return false;
-			} else if(!name_eq(d, d->scan.opens[pidx].name_id, pp->name, pp->name_len)) {
+				if(prow->name_id != (uint32_t)want) return false;
+			} else if(!name_eq(d, prow->name_id, pp->name, pp->name_len)) {
 				return false;
 			}
 			if(pp->has_attr && !row_has_attr_oi(d, pidx, pp)) return false;
 			if(pp->has_text && !inner_text_eq(d, pidx, pp->text, pp->text_len)) return false;
 			cidx = pidx;
+			scratch = pscratch;
+			cur = &scratch;
 		}
 	}
+	(void)cidx;
 	return true;
 }
 
@@ -2656,69 +4397,17 @@ static void chain_resolve_nids(const lom_doc *d, const sel_chain *chain, int32_t
 }
 
 /* Pure child chain A_B_C_… (no __): parent_idx hops with pre-resolved name_ids. */
-static lom_status query_pure_child_chain(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
-	lom_match_list_free(out);
-	lom_match_list_init(out);
-	if(chain->count < 2 || chain->count > 32) return LOM_ERR_ARG;
-	int32_t nids[32];
-	chain_resolve_nids(d, chain, nids);
-	for(size_t i = 0; i < chain->count; i++) {
-		if(nids[i] < 0) return LOM_ERR_ARG; /* '*' or missing */
-		if(chain->pieces[i].descendant) return LOM_ERR_ARG;
-	}
-	const sel_piece *leaf = &chain->pieces[chain->count - 1];
-	int32_t lnid = nids[chain->count - 1];
-	if((size_t)lnid >= d->tag_row_slots) return LOM_OK;
-	uint32_t *lrows = d->tag_rows[lnid];
-	size_t lrc = d->tag_row_counts[lnid];
-	if(lrc > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, lrc))
-		return LOM_ERR_NOMEM;
-	size_t last_drop = 0;
-	size_t hops = chain->count - 1;
-	for(size_t li = 0; li < lrc; li++) {
-		size_t loi = decode_open_idx(d, lrows[li]);
-		const lom_open_row *lrow = &d->scan.opens[loi];
-		if(row_is_dead(lrow)) continue;
-		if(leaf->has_attr && !row_has_attr_oi(d, loi, leaf)) continue;
-		if(leaf->has_text && !inner_text_eq(d, loi, leaf->text, leaf->text_len)) continue;
-		size_t cidx = loi;
-		int ok = 1;
-		for(size_t h = 0; h < hops; h++) {
-			ssize_t pi = (ssize_t)(chain->count - 2 - h);
-			int32_t pidx32 = row_parent(d, &d->scan.opens[cidx]);
-			if(pidx32 < 0) { ok = 0; break; }
-			size_t pidx = (size_t)pidx32;
-			if(d->scan.opens[pidx].name_id != (uint32_t)nids[pi]) { ok = 0; break; }
-			const sel_piece *pp = &chain->pieces[pi];
-			if(pp->has_attr && !row_has_attr_oi(d, pidx, pp)) { ok = 0; break; }
-			if(pp->has_text && !inner_text_eq(d, pidx, pp->text, pp->text_len)) { ok = 0; break; }
-			cidx = pidx;
-		}
-		if(!ok) {
-			opens_scan_drop_behind(&d->scan, &last_drop, loi);
-			continue;
-		}
-		if(!match_push(out, row_open_off(d, lrow), row_node_end(d, lrow))) return LOM_ERR_NOMEM;
-		opens_scan_drop_behind(&d->scan, &last_drop, loi);
-	}
-	for(size_t pi = 0; pi < d->tag_pend_n; pi++) {
-		if(d->tag_pend_name[pi] != (uint32_t)lnid) continue;
-		size_t oi = d->tag_pend_oi[pi];
-		const lom_open_row *row = &d->scan.opens[oi];
-		if(row_is_dead(row)) continue;
-		if(leaf->has_attr && !row_has_attr_oi(d, oi, leaf)) continue;
-		if(leaf->has_text && !inner_text_eq(d, oi, leaf->text, leaf->text_len)) continue;
-		if(!ancestor_chain_ok_oi(d, chain, oi, nids)) continue;
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
-	}
-	return LOM_OK;
+static lom_status query_pure_child_chain(lom_doc *d, const sel_chain *chain, lom_oi_list *out) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
+	return walk_pure_child_chain(d, chain, NULL, out);
 }
 
 /* Three-piece A__B_C: leaf's parent is B, and that pair sits under some A (doc-order merge). */
 static lom_status query_desc_child_merge(lom_doc *d, const sel_piece *root, const sel_piece *mid,
-	const sel_piece *leaf, lom_match_list *out) {
-	lom_match_list_free(out);
-	lom_match_list_init(out);
+	const sel_piece *leaf, lom_oi_list *out) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
 	if((root->name_len == 1 && root->name[0] == '*') ||
 	   (mid->name_len == 1 && mid->name[0] == '*') ||
 	   (leaf->name_len == 1 && leaf->name[0] == '*'))
@@ -2732,7 +4421,7 @@ static lom_status query_desc_child_merge(lom_doc *d, const sel_piece *root, cons
 	size_t rrc = d->tag_row_counts[rnid];
 	uint32_t *lrows = d->tag_rows[lnid];
 	size_t lrc = d->tag_row_counts[lnid];
-	if(lrc > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, lrc))
+	if(lrc > 0 && !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, lrc))
 		return LOM_ERR_NOMEM;
 
 	size_t ri = 0;
@@ -2770,7 +4459,7 @@ static lom_status query_desc_child_merge(lom_doc *d, const sel_piece *root, cons
 			break;
 		}
 		if(r_valid && r_off < loff && loff <= r_end) {
-			if(!match_push(out, loff, row_node_end(d, lrow))) return LOM_ERR_NOMEM;
+			if(!oi_push(out, (uint32_t)loi)) return LOM_ERR_NOMEM;
 		}
 		opens_scan_drop_behind(&d->scan, &last_drop, loi);
 	}
@@ -2792,16 +4481,16 @@ static lom_status query_desc_child_merge(lom_doc *d, const sel_piece *root, cons
 		if(leaf->has_attr && !row_has_attr_oi(d, oi, leaf)) continue;
 		if(leaf->has_text && !inner_text_eq(d, oi, leaf->text, leaf->text_len)) continue;
 		if(!ancestor_chain_ok_oi(d, &ch, oi, NULL)) continue;
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+		if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 	}
 	return LOM_OK;
 }
 
 /* Three-piece A__B__C: leaf under some B under some A (parent walk to B + A span merge). */
 static lom_status query_desc_desc_merge(lom_doc *d, const sel_piece *root, const sel_piece *mid,
-	const sel_piece *leaf, lom_match_list *out) {
-	lom_match_list_free(out);
-	lom_match_list_init(out);
+	const sel_piece *leaf, lom_oi_list *out) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
 	if((root->name_len == 1 && root->name[0] == '*') ||
 	   (mid->name_len == 1 && mid->name[0] == '*') ||
 	   (leaf->name_len == 1 && leaf->name[0] == '*'))
@@ -2815,7 +4504,7 @@ static lom_status query_desc_desc_merge(lom_doc *d, const sel_piece *root, const
 	size_t rrc = d->tag_row_counts[rnid];
 	uint32_t *lrows = d->tag_rows[lnid];
 	size_t lrc = d->tag_row_counts[lnid];
-	if(lrc > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, lrc))
+	if(lrc > 0 && !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, lrc))
 		return LOM_ERR_NOMEM;
 
 	size_t ri = 0;
@@ -2865,7 +4554,7 @@ static lom_status query_desc_desc_merge(lom_doc *d, const sel_piece *root, const
 		}
 		/* Root must contain both mid and leaf. */
 		if(r_valid && r_off < mid_off && mid_off <= r_end && r_off < loff && loff <= r_end) {
-			if(!match_push(out, loff, row_node_end(d, lrow))) return LOM_ERR_NOMEM;
+			if(!oi_push(out, (uint32_t)loi)) return LOM_ERR_NOMEM;
 		}
 		opens_scan_drop_behind(&d->scan, &last_drop, loi);
 	}
@@ -2887,7 +4576,7 @@ static lom_status query_desc_desc_merge(lom_doc *d, const sel_piece *root, const
 		if(leaf->has_attr && !row_has_attr_oi(d, oi, leaf)) continue;
 		if(leaf->has_text && !inner_text_eq(d, oi, leaf->text, leaf->text_len)) continue;
 		if(!ancestor_chain_ok_oi(d, &ch, oi, NULL)) continue;
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+		if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 	}
 	return LOM_OK;
 }
@@ -2895,81 +4584,15 @@ static lom_status query_desc_desc_merge(lom_doc *d, const sel_piece *root, const
 /* Two-piece A__B: merge ancestor + leaf tag rows in doc order (no parent-pointer walks).
  * O(nA + nL) sequential open faults — much lower RSS/latency than leaf parent-walk on huge docs. */
 static lom_status query_descendant_merge(lom_doc *d, const sel_piece *anc, const sel_piece *leaf,
-	lom_match_list *out) {
-	lom_match_list_free(out);
-	lom_match_list_init(out);
-	int32_t anid = find_name_id(d, anc->name, anc->name_len);
-	int32_t lnid = find_name_id(d, leaf->name, leaf->name_len);
-	if(lnid < 0 || anid < 0) return LOM_OK;
-	if((size_t)anid >= d->tag_row_slots || (size_t)lnid >= d->tag_row_slots) return LOM_OK;
-
-	uint32_t *arows = d->tag_rows[anid];
-	size_t arc = d->tag_row_counts[anid];
-	uint32_t *lrows = d->tag_rows[lnid];
-	size_t lrc = d->tag_row_counts[lnid];
-	if(lrc > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, lrc))
-		return LOM_ERR_NOMEM;
-
-	size_t ai = 0;
-	int64_t a_off = -1, a_end = -1;
-	int a_valid = 0;
-	size_t last_drop = 0;
-
-	for(size_t li = 0; li < lrc; li++) {
-		size_t loi = decode_open_idx(d, lrows[li]);
-		const lom_open_row *lrow = &d->scan.opens[loi];
-		if(row_is_dead(lrow)) continue;
-		int64_t loff = row_open_off(d, lrow);
-		if(leaf->has_attr && !row_has_attr_oi(d, loi, leaf)) continue;
-		if(leaf->has_text && !inner_text_eq(d, loi, leaf->text, leaf->text_len)) continue;
-
-		/* Advance ancestors that end before this leaf. */
-		while(ai < arc) {
-			if(!a_valid) {
-				size_t aoi = decode_open_idx(d, arows[ai]);
-				const lom_open_row *arow = &d->scan.opens[aoi];
-				if(row_is_dead(arow)) { ai++; continue; }
-				a_off = row_open_off(d, arow);
-				if(anc->has_attr && !row_has_attr_oi(d, aoi, anc)) { ai++; continue; }
-				if(anc->has_text && !inner_text_eq(d, aoi, anc->text, anc->text_len)) { ai++; continue; }
-				a_end = row_node_end(d, arow);
-				a_valid = 1;
-			}
-			if(a_end < loff) { ai++; a_valid = 0; continue; }
-			break;
-		}
-		if(a_valid && a_off < loff && loff <= a_end) {
-			if(!match_push(out, loff, row_node_end(d, lrow))) return LOM_ERR_NOMEM;
-		}
-		(void)last_drop;
-		/* drop-behind after match: sequential leaf scan, ancestors only move forward */
-		opens_scan_drop_behind(&d->scan, &last_drop, loi);
-	}
-
-	/* Pending leaf appends: parent-walk containment. */
-	sel_chain ch;
-	memset(&ch, 0, sizeof(ch));
-	ch.count = 2;
-	ch.pieces[0] = *anc;
-	ch.pieces[0].descendant = false;
-	ch.pieces[1] = *leaf;
-	ch.pieces[1].descendant = true;
-	for(size_t pi = 0; pi < d->tag_pend_n; pi++) {
-		if(d->tag_pend_name[pi] != (uint32_t)lnid) continue;
-		size_t oi = d->tag_pend_oi[pi];
-		const lom_open_row *row = &d->scan.opens[oi];
-		if(row_is_dead(row)) continue;
-		if(leaf->has_attr && !row_has_attr_oi(d, oi, leaf)) continue;
-		if(leaf->has_text && !inner_text_eq(d, oi, leaf->text, leaf->text_len)) continue;
-		if(!ancestor_chain_ok_oi(d, &ch, oi, NULL)) continue;
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
-	}
-	return LOM_OK;
+	lom_oi_list *out) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
+	return walk_descendant_merge(d, anc, leaf, NULL, out);
 }
 
-static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, lom_match_list *out) {
-	lom_match_list_free(out);
-	lom_match_list_init(out);
+static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, lom_oi_list *out) {
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
 	const sel_piece *last = &chain->pieces[chain->count - 1];
 	int32_t nid = find_name_id(d, last->name, last->name_len);
 	if(nid < 0) return LOM_OK;
@@ -2979,7 +4602,7 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 	int32_t anids[32];
 	int have_anids = (chain->count >= 2 && chain->count <= 32);
 	if(have_anids) chain_resolve_nids(d, chain, anids);
-	if(rc > 0 && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, rc))
+	if(rc > 0 && !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, rc))
 		return LOM_ERR_NOMEM;
 	for(size_t i = 0; i < rc; i++) {
 		size_t oi = decode_open_idx(d, rows[i]);
@@ -2988,7 +4611,7 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 		if(last->has_attr && !row_has_attr_oi(d, oi, last)) continue;
 		if(last->has_text && !inner_text_eq(d, oi, last->text, last->text_len)) continue;
 		if(!ancestor_chain_ok_oi(d, chain, oi, have_anids ? anids : NULL)) continue;
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+		if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 		/* Forward-only drop: parents may re-fault; peak RSS still stays lower. */
 		opens_scan_drop_behind(&d->scan, &last_drop, oi);
 	}
@@ -3000,7 +4623,7 @@ static lom_status query_direct_parent_walk(lom_doc *d, const sel_chain *chain, l
 		if(last->has_attr && !row_has_attr_oi(d, oi, last)) continue;
 		if(last->has_text && !inner_text_eq(d, oi, last->text, last->text_len)) continue;
 		if(!ancestor_chain_ok_oi(d, chain, oi, have_anids ? anids : NULL)) continue;
-		if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+		if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 	}
 	return LOM_OK;
 }
@@ -3021,7 +4644,7 @@ static size_t open_start_tag_contains_adv(const lom_doc *d, int64_t hit_off, siz
 }
 
 /* No attr index: find ` attr=` / ` attr="val"` in document bytes, map to covering open tags. */
-static lom_status query_attr_via_doc_hits(lom_doc *d, const sel_piece *piece, lom_match_list *out) {
+static lom_status query_attr_via_doc_hits(lom_doc *d, const sel_piece *piece, lom_oi_list *out) {
 	if(d->code_overlay || !d->code || d->code_len == 0) return LOM_ERR_ARG;
 	if(piece->attr_len == 0 || piece->attr_len > 120) return LOM_ERR_ARG;
 
@@ -3068,7 +4691,7 @@ static lom_status query_attr_via_doc_hits(lom_doc *d, const sel_piece *piece, lo
 	size_t open_cursor = 0;
 	/* Rough pre-size: common attrs appear on a few %% of opens. */
 	if(wild && d->scan.open_count > 1024 &&
-	   !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, d->scan.open_count / 8 + 64))
+	   !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, d->scan.open_count / 8 + 64))
 		return LOM_ERR_NOMEM;
 	for(int pi = 0; pi < nprobes; pi++) {
 		size_t pos = 0;
@@ -3084,17 +4707,18 @@ static lom_status query_attr_via_doc_hits(lom_doc *d, const sel_piece *piece, lo
 			if(!wild && d->scan.opens[oi].name_id != (uint32_t)tnid) continue;
 			last_oi = oi;
 			/* Probe already found attr[=val] inside the covering open tag. */
-			const lom_open_row *row = &d->scan.opens[oi];
-			if(!match_push(out, row_open_off(d, row), row_node_end(d, row))) return LOM_ERR_NOMEM;
+			if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 		}
 	}
 	return LOM_OK;
 }
 
-static lom_status query_structural(lom_doc *doc, const sel_chain *chain, lom_match_list *out) {
+static lom_status query_structural(lom_doc *doc, const sel_chain *chain, lom_oi_list *out) {
+	if(chain_has_up(chain))
+		return query_chain(doc, chain, out);
 	if(chain->count == 1 && chain->pieces[0].has_attr && !chain->pieces[0].has_text) {
-		lom_match_list_free(out);
-		lom_match_list_init(out);
+		lom_oi_list_free(out);
+		lom_oi_list_init(out);
 		const sel_piece *piece = &chain->pieces[0];
 		int32_t anid = find_name_id(doc, piece->attr, piece->attr_len);
 		int32_t tnid = find_name_id(doc, piece->name, piece->name_len);
@@ -3117,7 +4741,7 @@ static lom_status query_structural(lom_doc *doc, const sel_chain *chain, lom_mat
 					continue;
 				}
 				if(piece->attr_eq && !row_has_attr_oi(doc, oi, piece)) continue;
-				if(!match_push(out, ooff, row_node_end(doc, row))) return LOM_ERR_NOMEM;
+				if(!oi_push(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
 			}
 			return LOM_OK;
 		}
@@ -3129,8 +4753,8 @@ static lom_status query_structural(lom_doc *doc, const sel_chain *chain, lom_mat
 		    (piece->attr_eq && piece->attr_val_len >= 8))) {
 			lom_status st = query_attr_via_doc_hits(doc, piece, out);
 			if(st == LOM_OK) return LOM_OK;
-			lom_match_list_free(out);
-			lom_match_list_init(out);
+			lom_oi_list_free(out);
+			lom_oi_list_init(out);
 		}
 		return query_chain(doc, chain, out);
 	}
@@ -3197,75 +4821,74 @@ static lom_status query_structural(lom_doc *doc, const sel_chain *chain, lom_mat
 
 /* Regex on a path: resolve structure first when ancestors/indexes scope the leaf set
  * (e.g. region[1]__note%=/…), then verify tagvalue/attr regex only on survivors. */
-static lom_status query_regex_scoped(lom_doc *doc, const sel_chain *chain, lom_match_list *out) {
+static lom_status query_regex_scoped(lom_doc *doc, const sel_chain *chain, lom_oi_list *out) {
 	sel_chain st = *chain;
 	sel_piece *leaf = &st.pieces[st.count - 1];
 	int regex_id = leaf->regex_id;
 	leaf->has_regex = false;
 	leaf->regex_id = -1;
 
-	lom_match_list base;
-	lom_match_list_init(&base);
+	lom_oi_list base;
+	lom_oi_list_init(&base);
 	lom_status st_s = query_structural(doc, &st, &base);
 	if(st_s != LOM_OK) {
-		lom_match_list_free(&base);
+		lom_oi_list_free(&base);
 		return st_s;
 	}
 
-	lom_match_list_free(out);
-	lom_match_list_init(out);
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
 	if(base.count == 0) {
-		lom_match_list_free(&base);
+		lom_oi_list_free(&base);
 		return LOM_OK;
 	}
 
 	const sel_piece *piece = &chain->pieces[chain->count - 1];
 	if(regex_id < 0 || (size_t)regex_id >= chain->regex_count) {
-		lom_match_list_free(&base);
+		lom_oi_list_free(&base);
 		return LOM_ERR_PARSE;
 	}
 	pcre2_code *re = compile_sel_regex(&chain->regexes[regex_id]);
-	if(!re) { lom_match_list_free(&base); return LOM_ERR_PARSE; }
+	if(!re) { lom_oi_list_free(&base); return LOM_ERR_PARSE; }
 	pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
-	if(!md) { pcre2_code_free(re); lom_match_list_free(&base); return LOM_ERR_NOMEM; }
+	if(!md) { pcre2_code_free(re); lom_oi_list_free(&base); return LOM_ERR_NOMEM; }
 	pcre2_match_context *mctx = sel_regex_match_ctx();
 	if(!mctx) {
 		pcre2_match_data_free(md);
 		pcre2_code_free(re);
-		lom_match_list_free(&base);
+		lom_oi_list_free(&base);
 		return LOM_ERR_NOMEM;
 	}
 
-	if(!grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, base.count)) {
+	if(!grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, base.count)) {
 		pcre2_match_context_free(mctx);
 		pcre2_match_data_free(md);
 		pcre2_code_free(re);
-		lom_match_list_free(&base);
+		lom_oi_list_free(&base);
 		return LOM_ERR_NOMEM;
 	}
 	for(size_t i = 0; i < base.count; i++) {
-		size_t oi = find_open_index(doc, base.items[i].offset);
-		if(oi == (size_t)-1) continue;
+		uint32_t oi = base.items[i];
 		if(!piece_matches_open(doc, oi, piece, chain, re, md, mctx)) continue;
-		if(!match_push(out, base.items[i].offset, base.items[i].end_off)) {
+		if(!oi_push(out, oi)) {
 			pcre2_match_context_free(mctx);
 			pcre2_match_data_free(md);
 			pcre2_code_free(re);
-			lom_match_list_free(&base);
+			lom_oi_list_free(&base);
 			return LOM_ERR_NOMEM;
 		}
 	}
-	lom_match_list_free(&base);
+	lom_oi_list_free(&base);
 	if(piece->index > 0 && out->count > 0) {
 		size_t pick = (size_t)piece->index - 1;
 		if(pick >= out->count) {
-			lom_match_list_free(out);
-			lom_match_list_init(out);
+			lom_oi_list_free(out);
+			lom_oi_list_init(out);
 		} else {
-			lom_match keep = out->items[pick];
-			lom_match_list_free(out);
-			lom_match_list_init(out);
-			match_push(out, keep.offset, keep.end_off);
+			uint32_t keep = out->items[pick];
+			lom_oi_list_free(out);
+			lom_oi_list_init(out);
+			oi_push(out, keep);
 		}
 	}
 	pcre2_match_context_free(mctx);
@@ -3274,9 +4897,13 @@ static lom_status query_regex_scoped(lom_doc *doc, const sel_chain *chain, lom_m
 	return LOM_OK;
 }
 
-static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_match_list *out) {
+static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_oi_list *out) {
 	sel_chain chain;
 	if(!parse_selector(selector, &chain)) return LOM_ERR_PARSE;
+	if(doc_has_recipe(doc) && recipe_chain_supported(&chain)) {
+		lom_status rst = recipe_query(doc, &chain, NULL, out, NULL);
+		if(rst != LOM_ERR_ARG) return rst;
+	}
 
 	if(chain.count >= 1 && chain.pieces[chain.count - 1].has_regex) {
 		/* Indexed / rare-root paths: structure first (region[1]__note%=/… → 40, not all notes).
@@ -3296,39 +4923,1236 @@ static lom_status lom_doc_get_uncached(lom_doc *doc, const char *selector, lom_m
 	return query_structural(doc, &chain, out);
 }
 
+static int top_level_sep(const char *s, char sep) {
+	int depth = 0;
+	for(; *s; s++) {
+		if(*s == '[') depth++;
+		else if(*s == ']') { if(depth) depth--; }
+		else if(*s == '/' ) {
+			/* skip regex literal */
+			s++;
+			while(*s && *s != '/') {
+				if(*s == '\\' && s[1]) s++;
+				s++;
+			}
+			if(!*s) break;
+		} else if(depth == 0 && *s == sep) return 1;
+	}
+	return 0;
+}
+
+static lom_status get_union_or_and(lom_doc *doc, const char *selector, lom_oi_list *out, char sep) {
+	char left[1024], right[1024];
+	const char *p = selector;
+	int depth = 0;
+	const char *cut = NULL;
+	for(; *p; p++) {
+		if(*p == '[') depth++;
+		else if(*p == ']') { if(depth) depth--; }
+		else if(depth == 0 && *p == sep) { cut = p; break; }
+	}
+	if(!cut) return lom_doc_get_uncached(doc, selector, out);
+	size_t ln = (size_t)(cut - selector);
+	if(ln >= sizeof(left) || strlen(cut + 1) >= sizeof(right)) return LOM_ERR_PARSE;
+	memcpy(left, selector, ln);
+	left[ln] = 0;
+	snprintf(right, sizeof(right), "%s", cut + 1);
+	lom_oi_list a, b;
+	lom_oi_list_init(&a);
+	lom_oi_list_init(&b);
+	lom_status sa = lom_doc_get_ois(doc, left, &a);
+	lom_status sb = lom_doc_get_ois(doc, right, &b);
+	if(sa != LOM_OK && sb != LOM_OK) {
+		lom_oi_list_free(&a);
+		lom_oi_list_free(&b);
+		return sa != LOM_OK ? sa : sb;
+	}
+	if(sep == '|') {
+		for(size_t i = 0; i < a.count; i++) {
+			if(!oi_push(out, a.items[i])) break;
+		}
+		for(size_t i = 0; i < b.count; i++) {
+			int seen = 0;
+			for(size_t j = 0; j < out->count; j++)
+				if(out->items[j] == b.items[i]) { seen = 1; break; }
+			if(seen) continue;
+			if(!oi_push(out, b.items[i])) break;
+		}
+	} else {
+		for(size_t i = 0; i < a.count; i++) {
+			for(size_t j = 0; j < b.count; j++) {
+				if(a.items[i] == b.items[j]) {
+					if(!oi_push(out, a.items[i])) break;
+					break;
+				}
+			}
+		}
+	}
+	lom_oi_list_free(&a);
+	lom_oi_list_free(&b);
+	return LOM_OK;
+}
+
+void lom_doc_clear_context(lom_doc *doc) {
+	if(!doc) return;
+	lom_oi_list_free(&doc->ctx);
+	lom_oi_list_init(&doc->ctx);
+	doc->ctx_live = 0;
+}
+
+lom_status lom_doc_var_set(lom_doc *doc, const char *name, const char *selector) {
+	if(!doc || !name || !selector || !*name) return LOM_ERR_ARG;
+	int slot = -1;
+	for(int i = 0; i < doc->var_n; i++) {
+		if(strcmp(doc->var_name[i], name) == 0) { slot = i; break; }
+	}
+	if(slot < 0) {
+		if(doc->var_n >= 16) return LOM_ERR_NOMEM;
+		slot = doc->var_n++;
+		snprintf(doc->var_name[slot], sizeof(doc->var_name[slot]), "%s", name);
+	}
+	lom_oi_list_free(&doc->var_list[slot]);
+	lom_oi_list_init(&doc->var_list[slot]);
+	return lom_doc_get_ois(doc, selector, &doc->var_list[slot]);
+}
+
+lom_status lom_doc_var_get(lom_doc *doc, const char *name, lom_match_list *out) {
+	if(!doc || !name || !out) return LOM_ERR_ARG;
+	for(int i = 0; i < doc->var_n; i++) {
+		if(strcmp(doc->var_name[i], name) == 0)
+			return matches_from_ois_bytes(doc, doc->var_list[i].items, doc->var_list[i].count, out);
+	}
+	return LOM_ERR_NOTFOUND;
+}
+
+static int ois_memo_key(const char *sel, size_t slen, char *buf, size_t cap, size_t *klen) {
+	if(!sel || slen + 1 >= cap) return 0;
+	buf[0] = 1;
+	memcpy(buf + 1, sel, slen);
+	*klen = slen + 1;
+	return 1;
+}
+
+static void ois_memo_store(lom_doc *d, const char *sel, const lom_oi_list *ois) {
+	if(!d || !d->fcache || !d->use_fcache || !sel || !ois || !ois->items || !ois->count)
+		return;
+	if(ois->count > ((size_t)1 << 20)) return;
+	char ok[320];
+	size_t okl = 0;
+	if(ois_memo_key(sel, strlen(sel), ok, sizeof(ok), &okl))
+		(void)lom_fcache_put(d->fcache, ok, okl, ois->items, ois->count * sizeof(uint32_t));
+}
+
+static void ctx_seed_ois(lom_doc *d, const lom_oi_list *ois) {
+	if(!d || !ois || !ois->count || ois->count > 8192) return;
+	if(oi_list_assign_copy(&d->ctx, ois->items, ois->count))
+		d->ctx_live = 1;
+}
+
+/* Tile geometry from the template + tile start — no per-hit instantiate. */
+static int recipe_match_virtual(const lom_doc *d, uint32_t oi, lom_match *out) {
+	if(!doc_has_recipe(d) || !out) return 0;
+	size_t prefix = d->scan.open_count;
+	if((size_t)oi < prefix) {
+		const lom_open_row *r = &d->scan.opens[oi];
+		if(row_is_dead(r)) return -1;
+		out->offset = row_open_off(d, r);
+		out->end_off = row_node_end(d, r);
+		return 1;
+	}
+	size_t stride = recipe_stride_n(&d->scan);
+	if(!stride) return 0;
+	size_t virt = (size_t)oi - prefix;
+	size_t tile = virt / stride;
+	size_t local = virt % stride;
+	if(tile >= d->scan.recipe_tile_n) return -1;
+	size_t tn = 0;
+	const lom_open_row *ct = recipe_cls_rows(&d->scan, recipe_tile_cls_id(&d->scan, tile), &tn);
+	if(!ct || local >= tn) return -1;
+	int64_t ts = recipe_range_start(d, tile);
+	int64_t o = ts + (ct[local].open_off - ct[0].open_off);
+	int64_t rel;
+	if(ct[local].self_closing & LOM_OPEN_NE_OVF) {
+		uint32_t ix = ct[local].node_end_rel;
+		rel = (ix < d->scan.ne_ovf_n) ? d->scan.ne_ovf_rel[ix] : 0;
+	} else {
+		rel = (int64_t)ct[local].node_end_rel;
+	}
+	out->offset = o;
+	out->end_off = o + rel;
+	return 1;
+}
+
+static lom_status matches_from_ois_bytes(lom_doc *d, const uint32_t *ois, size_t n, lom_match_list *out) {
+	if(n && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, n))
+		return LOM_ERR_NOMEM;
+	if(!doc_has_recipe(d)) {
+		size_t w = 0;
+		for(size_t i = 0; i < n; i++) {
+			uint32_t oi = ois[i];
+			if((size_t)oi >= d->scan.open_count) continue;
+			const lom_open_row *r = &d->scan.opens[oi];
+			if(row_is_dead(r)) continue;
+			out->items[w].offset = row_open_off(d, r);
+			out->items[w].end_off = row_node_end(d, r);
+			w++;
+		}
+		out->count = w;
+		return LOM_OK;
+	}
+	size_t w = 0;
+	for(size_t i = 0; i < n; i++) {
+		lom_match m;
+		int vr = recipe_match_virtual(d, ois[i], &m);
+		if(vr < 0) continue;
+		if(vr == 0 && lom_doc_oi_match(d, ois[i], &m) != LOM_OK) continue;
+		out->items[w++] = m;
+	}
+	out->count = w;
+	return LOM_OK;
+}
+
 lom_status lom_doc_get(lom_doc *doc, const char *selector, lom_match_list *out) {
 	if(!doc || !selector || !out) return LOM_ERR_ARG;
-	if(doc->status != LOM_OK) return doc->status;
-	lom_status est = doc_ensure_aux(doc);
-	if(est != LOM_OK) return est;
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, selector, &ois);
+	if(st != LOM_OK) {
+		lom_oi_list_free(&ois);
+		return st;
+	}
+	lom_match_list_free(out);
+	lom_match_list_init(out);
+	st = matches_from_ois_bytes(doc, ois.items, ois.count, out);
+	lom_oi_list_free(&ois);
+	return st;
+}
 
-	size_t key_len = strlen(selector);
-	if(doc->fcache && doc->use_fcache && lom_fcache_roi_ok(doc->fcache, 0.05, 32)) {
-		size_t vlen = 0;
-		const void *v = lom_fcache_get(doc->fcache, selector, key_len, &vlen);
-		if(v && vlen % sizeof(lom_match) == 0) {
-			lom_match_list_free(out);
-			lom_match_list_init(out);
-			size_t n = vlen / sizeof(lom_match);
-			const lom_match *ms = (const lom_match *)v;
-			for(size_t i = 0; i < n; i++) {
-				if(!match_push(out, ms[i].offset, ms[i].end_off)) return LOM_ERR_NOMEM;
+/* Recipe handles structure + attrs; exact leaf text uses a document literal probe. */
+static int recipe_chain_supported(const sel_chain *c) {
+	if(!c) return 0;
+	for(size_t i = 0; i < c->count; i++) {
+		if(c->pieces[i].has_regex) return 0;
+	}
+	return 1;
+}
+
+static int recipe_chain_attr_eq(const sel_chain *c) {
+	for(size_t i = 0; i < c->count; i++) {
+		if(c->pieces[i].has_attr && c->pieces[i].attr_eq) return 1;
+	}
+	return 0;
+}
+
+static size_t recipe_filter_leaf_attr(lom_doc *d, size_t tile, uint32_t *locals, size_t nloc,
+	const sel_piece *leaf) {
+	if(!leaf || !leaf->has_attr) return nloc;
+	if(recipe_instantiate_tile(d, tile) != LOM_OK) return 0;
+	size_t w = 0;
+	for(size_t i = 0; i < nloc; i++) {
+		uint32_t voi = (uint32_t)recipe_voi_of(&d->scan, tile, locals[i]);
+		if(row_has_attr_oi(d, voi, leaf)) locals[w++] = locals[i];
+	}
+	return w;
+}
+
+static int recipe_tmpl_root_cls(const lom_scan_result *s, size_t c) {
+	size_t tn = 0;
+	const lom_open_row *tmpl = recipe_cls_rows(s, c, &tn);
+	if(!tmpl) return 0;
+	for(size_t i = 0; i < tn; i++) {
+		if(tmpl[i].parent_idx < 0) return (int)i;
+	}
+	return 0;
+}
+
+/* Collect template-local ois matching an unindexed child chain (or suffix). */
+static size_t recipe_cls_chain_locals(const lom_scan_result *s, size_t c,
+	const int32_t *nids, size_t n0, size_t nlen,
+	uint32_t *locals, size_t max_locals) {
+	size_t n = 0;
+	size_t hops = nlen - 1;
+	int32_t lnid = nids[n0 + nlen - 1];
+	size_t tn = 0;
+	const lom_open_row *tmpl = recipe_cls_rows(s, c, &tn);
+	if(!tmpl || !tn) return 0;
+	for(size_t li = 0; li < tn; li++) {
+		if(tmpl[li].name_id != (uint32_t)lnid) continue;
+		size_t cidx = li;
+		int ok = 1;
+		for(size_t h = 0; h < hops; h++) {
+			ssize_t pi = (ssize_t)(nlen - 2 - h);
+			int32_t pidx = tmpl[cidx].parent_idx;
+			if(pidx < 0) { ok = 0; break; }
+			if(tmpl[pidx].name_id != (uint32_t)nids[n0 + (size_t)pi]) {
+				ok = 0; break;
 			}
+			cidx = (size_t)pidx;
+		}
+		if(!ok) continue;
+		if(locals && n < max_locals) locals[n] = (uint32_t)li;
+		n++;
+	}
+	return n;
+}
+
+static size_t recipe_count_name(const lom_doc *d, uint32_t nid) {
+	size_t n = 0;
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		if(row_is_dead(&d->scan.opens[i])) continue;
+		if(d->scan.opens[i].name_id == nid) n++;
+	}
+	size_t k = recipe_k_n(&d->scan);
+	for(size_t c = 0; c < k; c++) {
+		size_t t = recipe_locals_nid(&d->scan, c, nid, NULL, 0);
+		size_t tiles = d->scan.recipe_k_tile_n[c];
+		if(!tiles && k == 1) tiles = d->scan.recipe_tile_n;
+		n += tiles * t;
+	}
+	return n;
+}
+
+static lom_status recipe_emit_tile_locals(lom_doc *d, size_t tile, const uint32_t *locals, size_t nloc,
+	lom_match_list *out) {
+	lom_status st = recipe_instantiate_tile(d, tile);
+	if(st != LOM_OK) return st;
+	if(out && nloc && !grow_cap((void **)&out->items, sizeof(lom_match), &out->cap, out->count + nloc))
+		return LOM_ERR_NOMEM;
+	for(size_t i = 0; i < nloc; i++) {
+		size_t local = locals[i];
+		if(local >= d->hot_scan.open_count) continue;
+		const lom_open_row *row = &d->hot_scan.opens[local];
+		if(out && !match_push_fast(out, row_open_off(d, row), row_node_end(d, row)))
+			return LOM_ERR_NOMEM;
+	}
+	return LOM_OK;
+}
+
+static int leftover_is_class_root(const lom_doc *d, size_t i, int32_t nid) {
+	const lom_open_row *r = &d->scan.opens[i];
+	if(row_is_dead(r) || (int32_t)r->name_id != nid) return 0;
+	int32_t p = r->parent_idx;
+	if(p < 0 || p == d->scan.recipe_root_parent) return 1;
+	if((size_t)p >= d->scan.open_count) return 0;
+	return (int32_t)d->scan.opens[p].name_id != nid;
+}
+
+static int recipe_tile_root_nid(const lom_doc *d, size_t tile, int32_t nid) {
+	size_t c = recipe_tile_cls_id(&d->scan, tile);
+	int root = recipe_tmpl_root_cls(&d->scan, c);
+	size_t tn = 0;
+	const lom_open_row *tmpl = recipe_cls_rows(&d->scan, c, &tn);
+	return tmpl && (size_t)root < tn && (int32_t)tmpl[root].name_id == nid;
+}
+
+/* nth same-name root in document order: leftover flattened tiles + remaining tiles. */
+static int recipe_nth_class(const lom_doc *d, int32_t nid, size_t want, int *is_tile, size_t *id) {
+	size_t li = 0, ti = 0, seen = 0;
+	size_t prefix = d->scan.open_count, tiles = d->scan.recipe_tile_n;
+	for(;;) {
+		while(li < prefix && !leftover_is_class_root(d, li, nid)) li++;
+		while(ti < tiles && !recipe_tile_root_nid(d, ti, nid)) ti++;
+		int64_t loff = (li < prefix) ? row_open_off(d, &d->scan.opens[li]) : INT64_MAX;
+		int64_t toff = (ti < tiles) ? recipe_range_start(d, ti) : INT64_MAX;
+		if(loff == INT64_MAX && toff == INT64_MAX) return 0;
+		int take_left = loff <= toff;
+		if(seen == want) {
+			*is_tile = take_left ? 0 : 1;
+			*id = take_left ? li : ti;
+			return 1;
+		}
+		seen++;
+		if(take_left) li++;
+		else ti++;
+	}
+}
+
+static size_t recipe_prefix_pick(const lom_doc *d, int32_t parent, int32_t nid, int idx) {
+	int seen = 0;
+	size_t pick = (size_t)-1;
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		const lom_open_row *r = &d->scan.opens[i];
+		if(row_is_dead(r)) continue;
+		if(r->parent_idx != parent) continue;
+		if((int32_t)r->name_id != nid) continue;
+		seen++;
+		if(idx <= 0 || seen == idx) pick = i;
+		if(idx > 0 && seen == idx) break;
+	}
+	return pick;
+}
+
+static lom_status recipe_walk_indexed_suffix(lom_doc *d, const sel_chain *chain, const int32_t *nids,
+	size_t tile, lom_oi_list *ois) {
+	size_t cls = recipe_tile_cls_id(&d->scan, tile);
+	size_t tn = 0;
+	const lom_open_row *tmpl = recipe_cls_rows(&d->scan, cls, &tn);
+	if(!tmpl) return LOM_ERR_PARSE;
+	size_t cur = (size_t)recipe_tmpl_root_cls(&d->scan, cls);
+	size_t p = 1;
+	for(; p < chain->count; p++) {
+		int32_t want = nids[p];
+		int idx = chain->pieces[p].index;
+		int seen = 0;
+		size_t pick = (size_t)-1;
+		for(size_t i = 0; i < tn; i++) {
+			if(tmpl[i].parent_idx != (int32_t)cur) continue;
+			if(tmpl[i].name_id != (uint32_t)want) continue;
+			seen++;
+			if(idx <= 0 || seen == idx) pick = i;
+			if(idx > 0 && seen == idx) break;
+		}
+		if(pick == (size_t)-1) break;
+		cur = pick;
+	}
+	if(p >= chain->count) {
+		if(ois && !oi_push(ois, (uint32_t)recipe_voi_of(&d->scan, tile, cur)))
+			return LOM_ERR_NOMEM;
+		return LOM_OK;
+	}
+	/* Remainder lives in leftover prefix (in-tile new_). */
+	uint32_t cur_voi = (uint32_t)recipe_voi_of(&d->scan, tile, cur);
+	for(; p < chain->count; p++) {
+		size_t pick = recipe_prefix_pick(d, (int32_t)cur_voi, nids[p], chain->pieces[p].index);
+		if(pick == (size_t)-1) return LOM_OK;
+		cur_voi = (uint32_t)pick;
+	}
+	if(ois && !oi_push(ois, cur_voi)) return LOM_ERR_NOMEM;
+	return LOM_OK;
+}
+
+static size_t recipe_prefix_desc(const lom_doc *d, uint32_t parent_oi, int32_t nid, int idx) {
+	if(parent_oi >= d->scan.open_count) return (size_t)-1;
+	int64_t lo = row_open_off(d, &d->scan.opens[parent_oi]);
+	int64_t hi = row_node_end(d, &d->scan.opens[parent_oi]);
+	int seen = 0;
+	size_t pick = (size_t)-1;
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		if(i == parent_oi) continue;
+		const lom_open_row *r = &d->scan.opens[i];
+		if(row_is_dead(r) || (int32_t)r->name_id != nid) continue;
+		int64_t o = row_open_off(d, r);
+		if(o <= lo || o >= hi) continue;
+		seen++;
+		if(idx <= 0 || seen == idx) pick = i;
+		if(idx > 0 && seen == idx) break;
+	}
+	return pick;
+}
+
+static int leftover_chain_ok(const lom_doc *d, const sel_chain *chain, const int32_t *nids, size_t leaf_oi) {
+	size_t cur = leaf_oi;
+	for(ssize_t p = (ssize_t)chain->count - 2; p >= 0; p--) {
+		if(chain->pieces[p + 1].descendant) {
+			int64_t loff = row_open_off(d, &d->scan.opens[cur]);
+			int found = 0;
+			for(size_t i = 0; i < d->scan.open_count; i++) {
+				if(row_is_dead(&d->scan.opens[i])) continue;
+				if((int32_t)d->scan.opens[i].name_id != nids[p]) continue;
+				int64_t o = row_open_off(d, &d->scan.opens[i]);
+				int64_t e = row_node_end(d, &d->scan.opens[i]);
+				if(o < loff && loff < e) { cur = i; found = 1; break; }
+			}
+			if(!found) return 0;
+		} else {
+			int32_t par = d->scan.opens[cur].parent_idx;
+			if(par < 0 || (size_t)par >= d->scan.open_count) return 0;
+			if((int32_t)d->scan.opens[par].name_id != nids[p]) return 0;
+			cur = (size_t)par;
+		}
+	}
+	return 1;
+}
+
+static size_t recipe_prefix_chain_hits(lom_doc *d, const sel_chain *chain, const int32_t *nids,
+	lom_oi_list *ois) {
+	size_t n = 0;
+	int32_t lnid = nids[chain->count - 1];
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		if(row_is_dead(&d->scan.opens[i])) continue;
+		if((int32_t)d->scan.opens[i].name_id != lnid) continue;
+		if(!leftover_chain_ok(d, chain, nids, i)) continue;
+		n++;
+		if(ois && !oi_push(ois, (uint32_t)i)) return (size_t)-1;
+	}
+	return n;
+}
+
+static lom_status recipe_leftover_indexed(lom_doc *d, const sel_chain *chain, const int32_t *nids,
+	size_t root_oi, size_t *out_n, lom_oi_list *ois, lom_match_list *matches) {
+	uint32_t cur = (uint32_t)root_oi;
+	for(size_t p = 1; p < chain->count; p++) {
+		size_t pick = chain->pieces[p].descendant
+			? recipe_prefix_desc(d, cur, nids[p], chain->pieces[p].index)
+			: recipe_prefix_pick(d, (int32_t)cur, nids[p], chain->pieces[p].index);
+		if(pick == (size_t)-1) {
+			if(out_n) *out_n = 0;
+			return LOM_OK;
+		}
+		cur = (uint32_t)pick;
+	}
+	if(out_n) *out_n = 1;
+	if(ois && !oi_push(ois, cur)) return LOM_ERR_NOMEM;
+	if(matches) return matches_from_ois_bytes(d, &cur, 1, matches);
+	return LOM_OK;
+}
+
+static int trailing_uint(const char *s, size_t n, size_t *pre, uint64_t *v) {
+	if(!s || n < 2) return 0;
+	size_t i = n;
+	while(i > 0 && s[i - 1] >= '0' && s[i - 1] <= '9') i--;
+	if(i == 0 || i == n) return 0;
+	uint64_t x = 0;
+	for(size_t k = i; k < n; k++) {
+		if(x > (UINT64_MAX - 9ull) / 10ull) return 0;
+		x = x * 10ull + (unsigned)(s[k] - '0');
+	}
+	*pre = i;
+	*v = x;
+	return 1;
+}
+
+/* Tiling fixtures often use Name_N with a constant stride per tile (Entity_0, Entity_40, …). */
+static int recipe_text_guess_tile(lom_doc *d, const sel_chain *chain, const int32_t *nids,
+	const char *text, size_t text_len, size_t *tile_out) {
+	size_t pre = 0;
+	uint64_t want = 0;
+	if(!trailing_uint(text, text_len, &pre, &want)) return 0;
+	if(d->recipe_jump_ok && pre == d->recipe_jump_pre_n && pre
+		&& pre <= sizeof(d->recipe_jump_pre)
+		&& memcmp(text, d->recipe_jump_pre, pre) == 0
+		&& d->recipe_jump_stride && want >= d->recipe_jump_v0) {
+		uint64_t t = (want - d->recipe_jump_v0) / d->recipe_jump_stride;
+		if(t < d->scan.recipe_tile_n) {
+			*tile_out = (size_t)t;
+			return 1;
+		}
+	}
+	if(d->scan.recipe_tile_n < 2) return 0;
+	uint32_t locals[512];
+	size_t nloc = 0;
+	if(chain->count == 1)
+		nloc = recipe_locals_nid(&d->scan, 0, (uint32_t)nids[0], locals, 512);
+	else
+		nloc = recipe_cls_chain_locals(&d->scan, 0, nids, 0, chain->count, locals, 512);
+	if(nloc == 0 || nloc >= 512) return 0;
+	size_t pick = (size_t)-1;
+	size_t p0 = 0;
+	uint64_t v0 = 0;
+	for(size_t k = 0; k < nloc; k++) {
+		char *h0 = NULL;
+		const char *t0 = NULL;
+		size_t n0 = 0;
+		size_t voi0 = recipe_voi_of(&d->scan, 0, locals[k]);
+		if(!tagvalue_text_span(d, voi0, &t0, &n0, &h0)) continue;
+		int ok = trailing_uint(t0, n0, &p0, &v0) && p0 == pre && n0 >= pre
+			&& memcmp(t0, text, pre) == 0;
+		free(h0);
+		if(ok) { pick = k; break; }
+	}
+	if(pick == (size_t)-1) return 0;
+	char *h1 = NULL;
+	const char *t1 = NULL;
+	size_t n1 = 0, p1 = 0;
+	uint64_t v1 = 0;
+	size_t voi1 = recipe_voi_of(&d->scan, 1, locals[pick]);
+	if(!tagvalue_text_span(d, voi1, &t1, &n1, &h1)) return 0;
+	int ok = trailing_uint(t1, n1, &p1, &v1) && p1 == pre && v1 > v0
+		&& n1 >= pre && memcmp(t1, text, pre) == 0;
+	free(h1);
+	if(!ok) return 0;
+	uint64_t stride = v1 - v0;
+	if(!stride || want < v0) return 0;
+	uint64_t t = (want - v0) / stride;
+	if(t >= d->scan.recipe_tile_n) return 0;
+	if(pre < sizeof(d->recipe_jump_pre)) {
+		memcpy(d->recipe_jump_pre, text, pre);
+		d->recipe_jump_pre_n = pre;
+		d->recipe_jump_v0 = v0;
+		d->recipe_jump_stride = stride;
+		d->recipe_jump_ok = 1;
+	}
+	*tile_out = (size_t)t;
+	return 1;
+}
+
+static lom_status recipe_text_scan_tile(lom_doc *d, const sel_chain *chain, const int32_t *nids,
+	size_t tile, const char *probe, size_t pn,
+	size_t *n, size_t *last_oi, lom_oi_list *ois, lom_match_list *matches) {
+	if(recipe_instantiate_tile(d, tile) != LOM_OK) return LOM_OK;
+	size_t lo = (size_t)recipe_range_start(d, tile);
+	size_t hi = (size_t)recipe_range_end(d, tile);
+	const char *base = NULL;
+	if(d->hot_bytes && d->hot_bytes_lo == lo && d->hot_bytes_n == hi - lo)
+		base = d->hot_bytes;
+	else if(d->code && hi <= d->code_len)
+		base = d->code + lo;
+	if(!base || hi <= lo || lo + pn > hi) return LOM_OK;
+	size_t rel = 0;
+	size_t span = hi - lo;
+	while(rel + pn <= span) {
+		const void *hit = memmem(base + rel, span - rel, probe, pn);
+		if(!hit) break;
+		size_t hoff = lo + (size_t)((const char *)hit - base);
+		rel = (size_t)((const char *)hit - base) + 1;
+		size_t oi = recipe_covering_oi(d, nids[chain->count - 1], (int64_t)(hoff + 1));
+		if(oi == (size_t)-1 || oi == *last_oi) continue;
+		*last_oi = oi;
+		if(chain->count >= 2 && !ancestor_chain_ok_oi(d, chain, oi, nids)) continue;
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at(d, oi, &scratch);
+		if(!row) continue;
+		(*n)++;
+		if(matches && !match_push(matches, row_open_off(d, row), row_node_end(d, row)))
+			return LOM_ERR_NOMEM;
+		if(ois && !oi_push(ois, (uint32_t)oi)) return LOM_ERR_NOMEM;
+	}
+	return LOM_OK;
+}
+
+static lom_status recipe_text_query(lom_doc *d, const sel_chain *chain,
+	size_t *out_n, lom_oi_list *ois, lom_match_list *matches) {
+	const sel_piece *leaf = &chain->pieces[chain->count - 1];
+	if(!leaf->has_text || leaf->text_len == 0)
+		return LOM_ERR_ARG;
+	int32_t nids[32];
+	chain_resolve_nids(d, chain, nids);
+	if(nids[chain->count - 1] < 0) {
+		if(out_n) *out_n = 0;
+		return LOM_OK;
+	}
+	char probe[260];
+	if(leaf->text_len + 2 > sizeof(probe)) return LOM_ERR_ARG;
+	probe[0] = '>';
+	memcpy(probe + 1, leaf->text, leaf->text_len);
+	probe[1 + leaf->text_len] = '<';
+	size_t pn = leaf->text_len + 2;
+	size_t n = 0;
+	size_t last_oi = (size_t)-1;
+	size_t guess = 0;
+	if(!d->code_overlay && recipe_text_guess_tile(d, chain, nids, leaf->text, leaf->text_len, &guess)) {
+		size_t ts[3];
+		size_t nt = 0;
+		ts[nt++] = guess;
+		if(guess > 0) ts[nt++] = guess - 1;
+		if(guess + 1 < d->scan.recipe_tile_n) ts[nt++] = guess + 1;
+		for(size_t i = 0; i < nt; i++) {
+			lom_status st = recipe_text_scan_tile(d, chain, nids, ts[i], probe, pn,
+				&n, &last_oi, ois, matches);
+			if(st != LOM_OK) return st;
+			if(n) {
+				if(out_n) *out_n = n;
+				return LOM_OK;
+			}
+		}
+	}
+	size_t nhits = 0;
+	size_t *hits = doc_memmem_hits_logical(d, probe, pn, &nhits);
+	for(size_t hi = 0; hi < nhits; hi++) {
+		size_t hoff = hits[hi];
+		size_t oi = recipe_covering_oi(d, nids[chain->count - 1], (int64_t)(hoff + 1));
+		if(oi == (size_t)-1 || oi == last_oi) continue;
+		last_oi = oi;
+		if(chain->count >= 2 && !ancestor_chain_ok_oi(d, chain, oi, nids)) continue;
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at(d, oi, &scratch);
+		if(!row) continue;
+		n++;
+		if(matches && !match_push(matches, row_open_off(d, row), row_node_end(d, row))) {
+			free(hits);
+			return LOM_ERR_NOMEM;
+		}
+		if(ois && !oi_push(ois, (uint32_t)oi)) {
+			free(hits);
+			return LOM_ERR_NOMEM;
+		}
+	}
+	free(hits);
+	if(out_n) *out_n = n;
+	return LOM_OK;
+}
+
+static int piece_name_ok_row(const lom_doc *d, const lom_open_row *row, const sel_piece *piece) {
+	if(!row || !piece) return 0;
+	if(piece->name_len == 1 && piece->name[0] == '*') return 1;
+	return name_eq(d, row->name_id, piece->name, piece->name_len);
+}
+
+static int chain_has_up_or_last(const sel_chain *c) {
+	if(!c) return 0;
+	for(size_t i = 0; i < c->count; i++) {
+		if(c->pieces[i].is_last) return 1;
+		if(c->pieces[i].axis == LOM_AXIS_PARENT || c->pieces[i].axis == LOM_AXIS_ANC)
+			return 1;
+	}
+	return 0;
+}
+
+static size_t tmpl_keep_last(const lom_open_row *tmpl, uint32_t *loc, size_t n) {
+	if(n <= 1) return n;
+	uint8_t drop[256];
+	if(n > 256) n = 256;
+	memset(drop, 0, n);
+	for(size_t i = 0; i < n; i++) {
+		int32_t p = tmpl[loc[i]].parent_idx;
+		for(size_t j = i + 1; j < n; j++) {
+			if(tmpl[loc[j]].parent_idx == p) { drop[i] = 1; break; }
+		}
+	}
+	size_t w = 0;
+	for(size_t i = 0; i < n; i++) if(!drop[i]) loc[w++] = loc[i];
+	return w;
+}
+
+static int oi_list_has(const lom_oi_list *o, uint32_t oi) {
+	for(size_t i = 0; i < o->count; i++) if(o->items[i] == oi) return 1;
+	return 0;
+}
+
+static lom_status recipe_up_query(lom_doc *d, const sel_chain *chain,
+	size_t *out_n, lom_oi_list *ois, lom_match_list *matches) {
+	if(!chain || chain->regex_count) return LOM_ERR_ARG;
+	for(size_t i = 0; i < chain->count; i++) {
+		if(chain->pieces[i].has_text || chain->pieces[i].has_regex || chain->pieces[i].has_attr)
+			return LOM_ERR_ARG;
+		if(chain->pieces[i].descendant) return LOM_ERR_ARG;
+	}
+	lom_oi_list acc;
+	lom_oi_list_init(&acc);
+	size_t kn = recipe_k_n(&d->scan);
+	for(size_t c = 0; c < kn; c++) {
+		size_t tn = 0;
+		const lom_open_row *tmpl = recipe_cls_rows(&d->scan, c, &tn);
+		if(!tmpl || !tn) continue;
+		uint32_t base[256];
+		size_t nb = 0;
+		for(size_t i = 0; i < tn && nb < 256; i++) {
+			if(piece_name_ok_row(d, &tmpl[i], &chain->pieces[0]))
+				base[nb++] = (uint32_t)i;
+		}
+		if(chain->pieces[0].is_last) nb = tmpl_keep_last(tmpl, base, nb);
+		for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+			if(recipe_tile_cls_id(&d->scan, t) != c) continue;
+			uint32_t cur[256];
+			size_t nc = nb;
+			if(nc) memcpy(cur, base, nc * sizeof(uint32_t));
+			int stop = 0;
+			int emitted_prefix = 0;
+			for(size_t step = 1; step < chain->count && !stop; step++) {
+				const sel_piece *piece = &chain->pieces[step];
+				uint32_t nxt[256];
+				size_t nn = 0;
+				int prefix_hit = 0;
+				for(size_t k = 0; k < nc; k++) {
+					uint32_t loc = cur[k];
+					if(piece->axis == LOM_AXIS_PARENT || piece->axis == LOM_AXIS_ANC) {
+						int guard = 0;
+						while(guard++ < 64) {
+							if(loc >= tn) break;
+							int32_t p = tmpl[loc].parent_idx;
+							if(p < 0) {
+								int32_t root = d->scan.recipe_root_parent;
+								if(root >= 0) {
+									lom_open_row scratch;
+									const lom_open_row *rr = doc_open_at(d, (size_t)root, &scratch);
+									if(rr && piece_name_ok_row(d, rr, piece)) prefix_hit = 1;
+								}
+								break;
+							}
+							loc = (uint32_t)p;
+							if(!piece_name_ok_row(d, &tmpl[loc], piece)) {
+								if(piece->axis == LOM_AXIS_PARENT) break;
+								continue;
+							}
+							if(nn < 256) nxt[nn++] = loc;
+							break;
+						}
+					} else {
+						for(size_t i = 0; i < tn && nn < 256; i++) {
+							if(tmpl[i].parent_idx != (int32_t)loc) continue;
+							if(!piece_name_ok_row(d, &tmpl[i], piece)) continue;
+							nxt[nn++] = (uint32_t)i;
+						}
+					}
+				}
+				if(prefix_hit) {
+					if(step + 1 < chain->count) {
+						lom_oi_list_free(&acc);
+						return LOM_ERR_ARG;
+					}
+					uint32_t roi = (uint32_t)d->scan.recipe_root_parent;
+					if(!oi_list_has(&acc, roi) && !oi_push(&acc, roi)) {
+						lom_oi_list_free(&acc);
+						return LOM_ERR_NOMEM;
+					}
+					emitted_prefix = 1;
+				}
+				if(piece->is_last) nn = tmpl_keep_last(tmpl, nxt, nn);
+				nc = nn;
+				if(nc) memcpy(cur, nxt, nc * sizeof(uint32_t));
+				if(nc == 0 && !prefix_hit) stop = 1;
+			}
+			if(!stop || emitted_prefix) {
+				for(size_t k = 0; k < nc; k++) {
+					uint32_t voi = (uint32_t)recipe_voi_of(&d->scan, t, cur[k]);
+					if(oi_list_has(&acc, voi)) continue;
+					if(!oi_push(&acc, voi)) {
+						lom_oi_list_free(&acc);
+						return LOM_ERR_NOMEM;
+					}
+				}
+			}
+		}
+	}
+	if(chain->count && chain->pieces[chain->count - 1].is_last && acc.count) {
+		size_t *xs = malloc(sizeof(size_t) * acc.count);
+		if(!xs) { lom_oi_list_free(&acc); return LOM_ERR_NOMEM; }
+		for(size_t i = 0; i < acc.count; i++) xs[i] = acc.items[i];
+		size_t n = acc.count;
+		if(!keep_last_siblings(d, xs, &n)) {
+			free(xs); lom_oi_list_free(&acc); return LOM_ERR_NOMEM;
+		}
+		lom_oi_list_free(&acc);
+		lom_oi_list_init(&acc);
+		for(size_t i = 0; i < n; i++) {
+			if(!oi_push(&acc, (uint32_t)xs[i])) {
+				free(xs); lom_oi_list_free(&acc); return LOM_ERR_NOMEM;
+			}
+		}
+		free(xs);
+	}
+	if(out_n) *out_n = acc.count;
+	lom_status st = LOM_OK;
+	if(ois) st = oi_list_assign_copy(ois, acc.items, acc.count) ? LOM_OK : LOM_ERR_NOMEM;
+	if(st == LOM_OK && matches && acc.count)
+		st = matches_from_ois_bytes(d, acc.items, acc.count, matches);
+	lom_oi_list_free(&acc);
+	return st;
+}
+
+static lom_status recipe_query(lom_doc *d, const sel_chain *chain,
+	size_t *out_n, lom_oi_list *ois, lom_match_list *matches) {
+	if(!doc_has_recipe(d) || !recipe_chain_supported(chain) || chain->count < 1)
+		return LOM_ERR_ARG;
+	if(chain_has_up_or_last(chain))
+		return recipe_up_query(d, chain, out_n, ois, matches);
+	for(size_t i = 0; i < chain->count; i++) {
+		if(chain->pieces[i].has_text)
+			return recipe_text_query(d, chain, out_n, ois, matches);
+	}
+	int32_t nids[32];
+	chain_resolve_nids(d, chain, nids);
+	for(size_t i = 0; i < chain->count; i++) {
+		if(nids[i] < 0) {
+			if(out_n) *out_n = 0;
 			return LOM_OK;
 		}
 	}
-
-	lom_status st = lom_doc_get_uncached(doc, selector, out);
-	if(st == LOM_OK && doc->fcache && doc->use_fcache && out->count > 0 && out->items) {
-		(void)lom_fcache_put(doc->fcache, selector, key_len, out->items, out->count * sizeof(lom_match));
+	size_t kn = recipe_k_n(&d->scan);
+	if(chain->pieces[0].index > 0) {
+		int is_tile = 0;
+		size_t id = 0;
+		if(!recipe_nth_class(d, nids[0], (size_t)chain->pieces[0].index - 1, &is_tile, &id)) {
+			if(out_n) *out_n = 0;
+			return LOM_OK;
+		}
+		if(!is_tile)
+			return recipe_leftover_indexed(d, chain, nids, id, out_n, ois, matches);
+		size_t tile = id;
+		size_t cls = recipe_tile_cls_id(&d->scan, tile);
+		if(chain->count == 2 && chain->pieces[1].descendant) {
+			uint32_t locals[256];
+			size_t nloc = recipe_locals_nid(&d->scan, cls, (uint32_t)nids[1], locals, 256);
+			nloc = recipe_filter_leaf_attr(d, tile, locals, nloc, &chain->pieces[1]);
+			if(out_n) *out_n = nloc;
+			if(matches) return recipe_emit_tile_locals(d, tile, locals, nloc, matches);
+			if(ois) {
+				for(size_t k = 0; k < nloc; k++) {
+					if(!oi_push(ois, (uint32_t)recipe_voi_of(&d->scan, tile, locals[k])))
+						return LOM_ERR_NOMEM;
+				}
+			}
+			return LOM_OK;
+		}
+		{
+			lom_oi_list tmp;
+			lom_oi_list *dst = ois ? ois : &tmp;
+			if(!ois) lom_oi_list_init(&tmp);
+			lom_status st = recipe_walk_indexed_suffix(d, chain, nids, tile, dst);
+			if(st == LOM_OK && matches && dst->count)
+				st = matches_from_ois_bytes(d, dst->items, dst->count, matches);
+			if(out_n && st == LOM_OK)
+				*out_n = matches ? matches->count : dst->count;
+			if(!ois) lom_oi_list_free(&tmp);
+			return st;
+		}
 	}
-	return st;
+	if(chain_has_index(chain)) return LOM_ERR_ARG;
+	if(chain->count == 2 && chain->pieces[1].descendant) {
+		uint32_t loc[LOM_RECIPE_KMAX][256];
+		size_t nloc[LOM_RECIPE_KMAX];
+		size_t n = 0;
+		uint32_t lnid = (uint32_t)nids[1];
+		for(size_t c = 0; c < kn; c++) {
+			nloc[c] = recipe_locals_nid(&d->scan, c, lnid, loc[c], 256);
+			if(!recipe_chain_attr_eq(chain) && nloc[c] && d->scan.recipe_tile_n) {
+				size_t sample = 0;
+				while(sample < d->scan.recipe_tile_n && recipe_tile_cls_id(&d->scan, sample) != c)
+					sample++;
+				if(sample < d->scan.recipe_tile_n)
+					nloc[c] = recipe_filter_leaf_attr(d, sample, loc[c], nloc[c], &chain->pieces[1]);
+			}
+			size_t tiles = d->scan.recipe_k_tile_n[c];
+			if(!tiles && kn == 1) tiles = d->scan.recipe_tile_n;
+			n += tiles * nloc[c];
+		}
+		n += recipe_prefix_chain_hits(d, chain, nids, NULL);
+		if(out_n) *out_n = n;
+		if(!ois && !matches) return LOM_OK;
+		if(ois && n && !grow_cap((void **)&ois->items, sizeof(uint32_t), &ois->cap, n))
+			return LOM_ERR_NOMEM;
+		for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+			size_t c = recipe_tile_cls_id(&d->scan, t);
+			size_t tn = nloc[c];
+			uint32_t *tl = loc[c];
+			if(matches) {
+				lom_status st = recipe_emit_tile_locals(d, t, tl, tn, matches);
+				if(st != LOM_OK) return st;
+			}
+			if(ois) {
+				for(size_t k = 0; k < tn; k++) {
+					if(!oi_push_fast(ois, (uint32_t)recipe_voi_of(&d->scan, t, tl[k])))
+						return LOM_ERR_NOMEM;
+				}
+			}
+		}
+		{
+			lom_oi_list pre;
+			lom_oi_list_init(&pre);
+			if(recipe_prefix_chain_hits(d, chain, nids, &pre) == (size_t)-1) {
+				lom_oi_list_free(&pre);
+				return LOM_ERR_NOMEM;
+			}
+			if(ois) {
+				for(size_t k = 0; k < pre.count; k++) {
+					if(!oi_push(ois, pre.items[k])) {
+						lom_oi_list_free(&pre);
+						return LOM_ERR_NOMEM;
+					}
+				}
+			}
+			if(matches) {
+				for(size_t k = 0; k < pre.count; k++) {
+					lom_match m;
+					int vr = recipe_match_virtual(d, pre.items[k], &m);
+					if(vr < 0) continue;
+					if(vr == 0 && lom_doc_oi_match(d, pre.items[k], &m) != LOM_OK) continue;
+					if(!match_push(matches, m.offset, m.end_off)) {
+						lom_oi_list_free(&pre);
+						return LOM_ERR_NOMEM;
+					}
+				}
+			}
+			lom_oi_list_free(&pre);
+		}
+		return LOM_OK;
+	}
+
+	if(chain->count == 1) {
+		uint32_t nid = (uint32_t)nids[0];
+		const sel_piece *leaf = &chain->pieces[0];
+		uint32_t loc[LOM_RECIPE_KMAX][256];
+		size_t nloc[LOM_RECIPE_KMAX];
+		size_t prefix = d->scan.open_count;
+		size_t prefix_hits = 0;
+		for(size_t i = 0; i < prefix; i++) {
+			if(row_is_dead(&d->scan.opens[i])) continue;
+			if(d->scan.opens[i].name_id != nid) continue;
+			if(leaf->has_attr && !row_has_attr_oi(d, i, leaf)) continue;
+			prefix_hits++;
+		}
+		size_t n = prefix_hits;
+		for(size_t c = 0; c < kn; c++) {
+			nloc[c] = recipe_locals_nid(&d->scan, c, nid, loc[c], 256);
+			if(leaf->has_attr && !recipe_chain_attr_eq(chain) && nloc[c] && d->scan.recipe_tile_n) {
+				size_t sample = 0;
+				while(sample < d->scan.recipe_tile_n && recipe_tile_cls_id(&d->scan, sample) != c)
+					sample++;
+				if(sample < d->scan.recipe_tile_n)
+					nloc[c] = recipe_filter_leaf_attr(d, sample, loc[c], nloc[c], leaf);
+			}
+			size_t tiles = d->scan.recipe_k_tile_n[c];
+			if(!tiles && kn == 1) tiles = d->scan.recipe_tile_n;
+			if(!(leaf->has_attr && recipe_chain_attr_eq(chain)))
+				n += tiles * nloc[c];
+		}
+		if(leaf->has_attr && recipe_chain_attr_eq(chain)) {
+			n = prefix_hits;
+			for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+				size_t c = recipe_tile_cls_id(&d->scan, t);
+				uint32_t tmp[256];
+				size_t k = nloc[c];
+				if(k > 256) k = 256;
+				memcpy(tmp, loc[c], k * sizeof(uint32_t));
+				n += recipe_filter_leaf_attr(d, t, tmp, k, leaf);
+			}
+		}
+		if(out_n) *out_n = n;
+		if(!ois && !matches) return LOM_OK;
+		if(ois && n && !grow_cap((void **)&ois->items, sizeof(uint32_t), &ois->cap, n))
+			return LOM_ERR_NOMEM;
+		for(size_t i = 0; i < prefix; i++) {
+			if(row_is_dead(&d->scan.opens[i])) continue;
+			if(d->scan.opens[i].name_id != nid) continue;
+			if(leaf->has_attr && !row_has_attr_oi(d, i, leaf)) continue;
+			if(matches && !match_push(matches, row_open_off(d, &d->scan.opens[i]),
+				row_node_end(d, &d->scan.opens[i])))
+				return LOM_ERR_NOMEM;
+			if(ois && !oi_push_fast(ois, (uint32_t)i)) return LOM_ERR_NOMEM;
+		}
+		for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+			size_t c = recipe_tile_cls_id(&d->scan, t);
+			uint32_t tl[256];
+			size_t tn = nloc[c];
+			if(tn > 256) tn = 256;
+			memcpy(tl, loc[c], tn * sizeof(uint32_t));
+			if(leaf->has_attr && recipe_chain_attr_eq(chain))
+				tn = recipe_filter_leaf_attr(d, t, tl, tn, leaf);
+			if(matches) {
+				lom_status st = recipe_emit_tile_locals(d, t, tl, tn, matches);
+				if(st != LOM_OK) return st;
+			}
+			if(ois) {
+				for(size_t k = 0; k < tn; k++) {
+					if(!oi_push_fast(ois, (uint32_t)recipe_voi_of(&d->scan, t, tl[k])))
+						return LOM_ERR_NOMEM;
+				}
+			}
+		}
+		return LOM_OK;
+	}
+
+	size_t n = 0;
+	uint32_t loc[LOM_RECIPE_KMAX][512];
+	size_t nloc[LOM_RECIPE_KMAX];
+	for(size_t c = 0; c < kn; c++) {
+		nloc[c] = recipe_cls_chain_locals(&d->scan, c, nids, 0, chain->count, loc[c], 512);
+		if(nloc[c] >= 512) return LOM_ERR_ARG;
+		if(!recipe_chain_attr_eq(chain) && nloc[c] && d->scan.recipe_tile_n) {
+			size_t sample = 0;
+			while(sample < d->scan.recipe_tile_n && recipe_tile_cls_id(&d->scan, sample) != c)
+				sample++;
+			if(sample < d->scan.recipe_tile_n)
+				nloc[c] = recipe_filter_leaf_attr(d, sample, loc[c], nloc[c],
+					&chain->pieces[chain->count - 1]);
+		}
+		size_t tiles = d->scan.recipe_k_tile_n[c];
+		if(!tiles && kn == 1) tiles = d->scan.recipe_tile_n;
+		n += tiles * nloc[c];
+	}
+	n += recipe_prefix_chain_hits(d, chain, nids, NULL);
+	if(out_n) *out_n = n;
+	if(!ois && !matches) return LOM_OK;
+	if(ois && n && !grow_cap((void **)&ois->items, sizeof(uint32_t), &ois->cap, n))
+		return LOM_ERR_NOMEM;
+	for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+		size_t c = recipe_tile_cls_id(&d->scan, t);
+		if(matches) {
+			lom_status st = recipe_emit_tile_locals(d, t, loc[c], nloc[c], matches);
+			if(st != LOM_OK) return st;
+		}
+		if(ois) {
+			for(size_t k = 0; k < nloc[c]; k++) {
+				if(!oi_push_fast(ois, (uint32_t)recipe_voi_of(&d->scan, t, loc[c][k])))
+					return LOM_ERR_NOMEM;
+			}
+		}
+	}
+	{
+		lom_oi_list pre;
+		lom_oi_list_init(&pre);
+		if(recipe_prefix_chain_hits(d, chain, nids, &pre) == (size_t)-1) {
+			lom_oi_list_free(&pre);
+			return LOM_ERR_NOMEM;
+		}
+		if(ois) {
+			for(size_t k = 0; k < pre.count; k++) {
+				if(!oi_push(ois, pre.items[k])) {
+					lom_oi_list_free(&pre);
+					return LOM_ERR_NOMEM;
+				}
+			}
+		}
+		if(matches) {
+			for(size_t k = 0; k < pre.count; k++) {
+				lom_match m;
+				int vr = recipe_match_virtual(d, pre.items[k], &m);
+				if(vr < 0) continue;
+				if(vr == 0 && lom_doc_oi_match(d, pre.items[k], &m) != LOM_OK) continue;
+				if(!match_push(matches, m.offset, m.end_off)) {
+					lom_oi_list_free(&pre);
+					return LOM_ERR_NOMEM;
+				}
+			}
+		}
+		lom_oi_list_free(&pre);
+	}
+	return LOM_OK;
+}
+
+/* Shared child-chain walk: count, ois, or both. matches==NULL && ois==NULL => count only. */
+static lom_status walk_pure_child_chain(lom_doc *d, const sel_chain *chain,
+	size_t *out_n, lom_oi_list *ois) {
+	if(doc_has_recipe(d) && recipe_chain_supported(chain)) {
+		lom_status rst = recipe_query(d, chain, out_n, ois, NULL);
+		if(rst != LOM_ERR_ARG) return rst;
+	}
+	if(chain->count < 2 || chain->count > 32) return LOM_ERR_ARG;
+	int32_t nids[32];
+	chain_resolve_nids(d, chain, nids);
+	for(size_t i = 0; i < chain->count; i++) {
+		if(nids[i] < 0) return LOM_ERR_ARG;
+		if(chain->pieces[i].descendant) return LOM_ERR_ARG;
+	}
+	const sel_piece *leaf = &chain->pieces[chain->count - 1];
+	int32_t lnid = nids[chain->count - 1];
+	if((size_t)lnid >= d->tag_row_slots) {
+		if(out_n) *out_n = 0;
+		return LOM_OK;
+	}
+	uint32_t *lrows = d->tag_rows[lnid];
+	size_t lrc = d->tag_row_counts[lnid];
+	if(ois && lrc > 0 && !grow_cap((void **)&ois->items, sizeof(uint32_t), &ois->cap, lrc))
+		return LOM_ERR_NOMEM;
+	size_t n = 0;
+	size_t hops = chain->count - 1;
+	for(size_t li = 0; li < lrc; li++) {
+		size_t loi = decode_open_idx(d, lrows[li]);
+		const lom_open_row *lrow = &d->scan.opens[loi];
+		if(row_is_dead(lrow)) continue;
+		if(leaf->has_attr && !row_has_attr_oi(d, loi, leaf)) continue;
+		if(leaf->has_text && !inner_text_eq(d, loi, leaf->text, leaf->text_len)) continue;
+		size_t cidx = loi;
+		int ok = 1;
+		for(size_t h = 0; h < hops; h++) {
+			ssize_t pi = (ssize_t)(chain->count - 2 - h);
+			int32_t pidx32 = row_parent(d, &d->scan.opens[cidx]);
+			if(pidx32 < 0) { ok = 0; break; }
+			size_t pidx = (size_t)pidx32;
+			if(d->scan.opens[pidx].name_id != (uint32_t)nids[pi]) { ok = 0; break; }
+			const sel_piece *pp = &chain->pieces[pi];
+			if(pp->has_attr && !row_has_attr_oi(d, pidx, pp)) { ok = 0; break; }
+			if(pp->has_text && !inner_text_eq(d, pidx, pp->text, pp->text_len)) { ok = 0; break; }
+			cidx = pidx;
+		}
+		if(!ok) continue;
+		n++;
+		if(ois && !oi_push_fast(ois, (uint32_t)loi)) return LOM_ERR_NOMEM;
+	}
+	for(size_t pi = 0; pi < d->tag_pend_n; pi++) {
+		if(d->tag_pend_name[pi] != (uint32_t)lnid) continue;
+		size_t oi = d->tag_pend_oi[pi];
+		const lom_open_row *row = &d->scan.opens[oi];
+		if(row_is_dead(row)) continue;
+		if(leaf->has_attr && !row_has_attr_oi(d, oi, leaf)) continue;
+		if(leaf->has_text && !inner_text_eq(d, oi, leaf->text, leaf->text_len)) continue;
+		if(!ancestor_chain_ok_oi(d, chain, oi, nids)) continue;
+		n++;
+		if(ois && !oi_push(ois, (uint32_t)oi)) return LOM_ERR_NOMEM;
+	}
+	if(out_n) *out_n = n;
+	return LOM_OK;
+}
+
+static lom_status walk_descendant_merge(lom_doc *d, const sel_piece *anc, const sel_piece *leaf,
+	size_t *out_n, lom_oi_list *ois) {
+	int32_t anid = find_name_id(d, anc->name, anc->name_len);
+	int32_t lnid = find_name_id(d, leaf->name, leaf->name_len);
+	if(lnid < 0 || anid < 0) {
+		if(out_n) *out_n = 0;
+		return LOM_OK;
+	}
+	if((size_t)anid >= d->tag_row_slots || (size_t)lnid >= d->tag_row_slots) {
+		if(out_n) *out_n = 0;
+		return LOM_OK;
+	}
+	uint32_t *arows = d->tag_rows[anid];
+	size_t arc = d->tag_row_counts[anid];
+	uint32_t *lrows = d->tag_rows[lnid];
+	size_t lrc = d->tag_row_counts[lnid];
+	if(ois && lrc > 0 && !grow_cap((void **)&ois->items, sizeof(uint32_t), &ois->cap, lrc))
+		return LOM_ERR_NOMEM;
+	size_t n = 0;
+	size_t ai = 0;
+	int64_t a_off = -1, a_end = -1;
+	int a_valid = 0;
+	for(size_t li = 0; li < lrc; li++) {
+		size_t loi = decode_open_idx(d, lrows[li]);
+		const lom_open_row *lrow = &d->scan.opens[loi];
+		if(row_is_dead(lrow)) continue;
+		int64_t loff = row_open_off(d, lrow);
+		if(leaf->has_attr && !row_has_attr_oi(d, loi, leaf)) continue;
+		if(leaf->has_text && !inner_text_eq(d, loi, leaf->text, leaf->text_len)) continue;
+		while(ai < arc) {
+			if(!a_valid) {
+				size_t aoi = decode_open_idx(d, arows[ai]);
+				const lom_open_row *arow = &d->scan.opens[aoi];
+				if(row_is_dead(arow)) { ai++; continue; }
+				a_off = row_open_off(d, arow);
+				if(anc->has_attr && !row_has_attr_oi(d, aoi, anc)) { ai++; continue; }
+				if(anc->has_text && !inner_text_eq(d, aoi, anc->text, anc->text_len)) { ai++; continue; }
+				a_end = row_node_end(d, arow);
+				a_valid = 1;
+			}
+			if(a_end < loff) { ai++; a_valid = 0; continue; }
+			break;
+		}
+		if(a_valid && a_off < loff && loff <= a_end) {
+			n++;
+			if(ois && !oi_push_fast(ois, (uint32_t)loi)) return LOM_ERR_NOMEM;
+		}
+	}
+	if(out_n) *out_n = n;
+	return LOM_OK;
+}
+
+static int chain_is_pure_child(const sel_chain *chain) {
+	if(chain->count < 2 || chain_has_index(chain) || chain->pieces[0].has_attr)
+		return 0;
+	if(chain_has_descendant(chain) || chain_has_up(chain)) return 0;
+	for(size_t i = 0; i < chain->count; i++) {
+		if(chain->pieces[i].has_regex) return 0;
+		if(chain->pieces[i].name_len == 1 && chain->pieces[i].name[0] == '*') return 0;
+		if(i + 1 < chain->count && chain->pieces[i].has_text) return 0;
+	}
+	return 1;
+}
+
+static int chain_is_desc_pair(const sel_chain *chain) {
+	if(chain->count != 2 || chain_has_index(chain) || chain->pieces[0].has_attr)
+		return 0;
+	if(!chain->pieces[1].descendant) return 0;
+	if(chain->pieces[0].has_regex || chain->pieces[1].has_regex) return 0;
+	if((chain->pieces[0].name_len == 1 && chain->pieces[0].name[0] == '*') ||
+	   (chain->pieces[1].name_len == 1 && chain->pieces[1].name[0] == '*'))
+		return 0;
+	return 1;
 }
 
 /* Count live opens for a simple single-tag / '*' / tag@attr selector without building matches. */
 static int count_simple_tag(lom_doc *d, const sel_piece *piece, size_t *out_n) {
-	if(piece->index > 0 || piece->has_text || piece->has_regex)
+	if(piece->index > 0 || piece->is_last || piece->has_text || piece->has_regex)
 		return 0;
+	if(doc_has_recipe(d) && !piece->has_attr) {
+		if(piece->name_len == 1 && piece->name[0] == '*') {
+			*out_n = doc_virt_opens(d);
+			return 1;
+		}
+		int32_t nid = find_name_id(d, piece->name, piece->name_len);
+		if(nid < 0) { *out_n = 0; return 1; }
+		*out_n = recipe_count_name(d, (uint32_t)nid);
+		return 1;
+	}
 	size_t n = 0;
 	if(piece->name_len == 1 && piece->name[0] == '*') {
 		if(piece->has_attr) return 0; /* *@attr uses doc-hit path via fallback */
@@ -3387,61 +6211,263 @@ lom_status lom_doc_count(lom_doc *doc, const char *selector, size_t *out_count) 
 	lom_status est = doc_ensure_aux(doc);
 	if(est != LOM_OK) return est;
 
+	if(selector[0] == '#' && selector[1]) {
+		const char *p = selector + 1;
+		int word = isalnum((unsigned char)*p);
+		while(isalnum((unsigned char)*p)) p++;
+		if(!(word && *p == '#'))
+			return lom_doc_count(doc, selector + 1, out_count);
+	}
+
+	if(selector[0] == '$' || selector[0] == '.' ||
+	   top_level_sep(selector, '|') || top_level_sep(selector, '&')) {
+		lom_oi_list ois;
+		lom_oi_list_init(&ois);
+		lom_status st = lom_doc_get_ois(doc, selector, &ois);
+		if(st == LOM_OK) *out_count = ois.count;
+		lom_oi_list_free(&ois);
+		return st;
+	}
+
 	sel_chain chain;
 	if(!parse_selector(selector, &chain)) return LOM_ERR_PARSE;
+	if(doc_has_recipe(doc) && recipe_chain_supported(&chain)) {
+		lom_status rst = recipe_query(doc, &chain, out_count, NULL, NULL);
+		if(rst != LOM_ERR_ARG) return rst;
+	}
 	if(chain.count == 1 && count_simple_tag(doc, &chain.pieces[0], out_count))
 		return LOM_OK;
+	if(chain_is_pure_child(&chain))
+		return walk_pure_child_chain(doc, &chain, out_count, NULL);
+	if(chain_is_desc_pair(&chain))
+		return walk_descendant_merge(doc, &chain.pieces[0], &chain.pieces[1], out_count, NULL);
 
-	lom_match_list m;
-	lom_match_list_init(&m);
-	lom_status st = lom_doc_get_uncached(doc, selector, &m);
-	if(st == LOM_OK) *out_count = m.count;
-	lom_match_list_free(&m);
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_uncached(doc, selector, &ois);
+	if(st == LOM_OK) *out_count = ois.count;
+	lom_oi_list_free(&ois);
 	return st;
 }
 
+static double oi_tagless_number(lom_doc *doc, size_t oi) {
+	const char *txt = NULL;
+	size_t n = 0;
+	char *heap = NULL;
+	if(!tagvalue_text_span(doc, oi, &txt, &n, &heap) || !txt || n == 0) {
+		free(heap);
+		return 0;
+	}
+	char buf[128];
+	size_t c = n < sizeof(buf) - 1 ? n : sizeof(buf) - 1;
+	memcpy(buf, txt, c);
+	buf[c] = 0;
+	free(heap);
+	char *end = NULL;
+	double v = strtod(buf, &end);
+	if(end == buf) return 0;
+	return v;
+}
+
+lom_status lom_doc_sum(lom_doc *doc, const char *selector, double *out) {
+	if(!doc || !selector || !out) return LOM_ERR_ARG;
+	*out = 0;
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, selector, &ois);
+	if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
+	double s = 0;
+	for(size_t i = 0; i < ois.count; i++)
+		s += oi_tagless_number(doc, ois.items[i]);
+	*out = s;
+	lom_oi_list_free(&ois);
+	return LOM_OK;
+}
+
+lom_status lom_doc_average(lom_doc *doc, const char *selector, double *out) {
+	if(!doc || !selector || !out) return LOM_ERR_ARG;
+	*out = 0;
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, selector, &ois);
+	if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
+	if(ois.count == 0) { lom_oi_list_free(&ois); return LOM_ERR_NOTFOUND; }
+	double s = 0;
+	for(size_t i = 0; i < ois.count; i++)
+		s += oi_tagless_number(doc, ois.items[i]);
+	*out = s / (double)ois.count;
+	lom_oi_list_free(&ois);
+	return LOM_OK;
+}
+
+lom_status lom_doc_get_ois(lom_doc *doc, const char *selector, lom_oi_list *out) {
+	if(!doc || !selector || !out) return LOM_ERR_ARG;
+	if(doc->status != LOM_OK) return doc->status;
+	lom_status est = doc_ensure_aux(doc);
+	if(est != LOM_OK) return est;
+	lom_oi_list_free(out);
+	lom_oi_list_init(out);
+
+	if(selector[0] == '$' && selector[1]) {
+		for(int i = 0; i < doc->var_n; i++) {
+			if(strcmp(doc->var_name[i], selector + 1) == 0) {
+				return oi_list_assign_copy(out, doc->var_list[i].items, doc->var_list[i].count)
+					? LOM_OK : LOM_ERR_NOMEM;
+			}
+		}
+	}
+	if(selector[0] == '.' && doc->ctx_live && doc->ctx.count) {
+		lom_oi_list raw;
+		lom_oi_list_init(&raw);
+		lom_status st = lom_doc_get_ois(doc, selector + 1, &raw);
+		if(st != LOM_OK) { lom_oi_list_free(&raw); return st; }
+		for(size_t i = 0; i < raw.count; i++) {
+			if(!oi_in_ctx(doc, raw.items[i])) continue;
+			if(!oi_push(out, raw.items[i])) break;
+		}
+		lom_oi_list_free(&raw);
+		return LOM_OK;
+	}
+	if(top_level_sep(selector, '|'))
+		return get_union_or_and(doc, selector, out, '|');
+	if(top_level_sep(selector, '&'))
+		return get_union_or_and(doc, selector, out, '&');
+
+	size_t key_len = strlen(selector);
+	if(doc->fcache && doc->use_fcache) {
+		char ok[320];
+		size_t okl = 0;
+		if(ois_memo_key(selector, key_len, ok, sizeof(ok), &okl)) {
+			size_t vlen = 0;
+			const void *v = lom_fcache_get(doc->fcache, ok, okl, &vlen);
+			if(v && vlen >= sizeof(uint32_t) && vlen % sizeof(uint32_t) == 0) {
+				size_t n = vlen / sizeof(uint32_t);
+				const uint32_t *src = (const uint32_t *)v;
+				if(!grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, n))
+					return LOM_ERR_NOMEM;
+				size_t w = 0;
+				for(size_t i = 0; i < n; i++) {
+					uint32_t oi = src[i];
+					if(doc_has_recipe(doc) && oi < doc->scan.open_count
+						&& row_is_dead(&doc->scan.opens[oi]))
+						continue;
+					out->items[w++] = oi;
+				}
+				out->count = w;
+				if(w == n) {
+					ctx_seed_ois(doc, out);
+					return LOM_OK;
+				}
+				/* Stale memo after leftover tombstone — fall through and rewalk. */
+				out->count = 0;
+			}
+		}
+	}
+
+	sel_chain chain;
+	if(!parse_selector(selector, &chain)) return LOM_ERR_PARSE;
+	lom_status st = LOM_OK;
+	if(doc_has_recipe(doc) && recipe_chain_supported(&chain)) {
+		st = recipe_query(doc, &chain, NULL, out, NULL);
+		if(st != LOM_ERR_ARG) {
+			if(st == LOM_OK) {
+				ois_memo_store(doc, selector, out);
+				ctx_seed_ois(doc, out);
+			}
+			return st;
+		}
+		st = LOM_OK;
+	}
+	if(chain.count == 1 && !chain.pieces[0].has_regex && !chain.pieces[0].is_last &&
+	   chain.pieces[0].index <= 0 &&
+	   !(chain.pieces[0].name_len == 1 && chain.pieces[0].name[0] == '*')) {
+		int32_t nid = find_name_id(doc, chain.pieces[0].name, chain.pieces[0].name_len);
+		if(nid < 0) return LOM_OK;
+		uint32_t *rows = doc->tag_rows[nid];
+		size_t rc = doc->tag_row_counts[nid];
+		if(rc && !grow_cap((void **)&out->items, sizeof(uint32_t), &out->cap, rc))
+			return LOM_ERR_NOMEM;
+		for(size_t i = 0; i < rc; i++) {
+			size_t oi = decode_open_idx(doc, rows[i]);
+			if(oi >= doc->scan.open_count || row_is_dead(&doc->scan.opens[oi])) continue;
+			if(chain.pieces[0].has_attr && !row_has_attr_oi(doc, oi, &chain.pieces[0])) continue;
+			if(chain.pieces[0].has_text && !inner_text_eq(doc, oi, chain.pieces[0].text, chain.pieces[0].text_len))
+				continue;
+			if(!oi_push_fast(out, (uint32_t)oi)) return LOM_ERR_NOMEM;
+		}
+		ois_memo_store(doc, selector, out);
+		ctx_seed_ois(doc, out);
+		return LOM_OK;
+	}
+	if(chain_is_pure_child(&chain))
+		st = walk_pure_child_chain(doc, &chain, NULL, out);
+	else if(chain_is_desc_pair(&chain))
+		st = walk_descendant_merge(doc, &chain.pieces[0], &chain.pieces[1], NULL, out);
+	else
+		st = lom_doc_get_uncached(doc, selector, out);
+	if(st == LOM_OK) {
+		ois_memo_store(doc, selector, out);
+		ctx_seed_ois(doc, out);
+	}
+	return st;
+}
+
+lom_status lom_doc_oi_match(const lom_doc *doc, uint32_t oi, lom_match *out) {
+	if(!doc || !out) return LOM_ERR_ARG;
+	if((size_t)oi >= doc_virt_opens(doc)) return LOM_ERR_NOTFOUND;
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at((lom_doc *)doc, (size_t)oi, &scratch);
+	if(!row) return LOM_ERR_NOTFOUND;
+	if(row_is_dead(row)) return LOM_ERR_NOTFOUND;
+	out->offset = row_open_off(doc, row);
+	out->end_off = row_node_end(doc, row);
+	return LOM_OK;
+}
+
 lom_status lom_doc_get_parent(lom_doc *doc, const char *selector, lom_match_list *out) {
-	lom_match_list tmp;
-	lom_match_list_init(&tmp);
-	lom_status st = lom_doc_get(doc, selector, &tmp);
-	if(st != LOM_OK) { lom_match_list_free(&tmp); return st; }
+	lom_oi_list tmp;
+	lom_oi_list_init(&tmp);
+	lom_status st = lom_doc_get_ois(doc, selector, &tmp);
+	if(st != LOM_OK) { lom_oi_list_free(&tmp); return st; }
 	lom_match_list_free(out);
 	lom_match_list_init(out);
-	/* Open-addressing set of parent offsets — O(n) instead of O(n²) linear scan. */
 	size_t nb = 1024;
 	while(nb < tmp.count * 2 + 16) nb *= 2;
-	int64_t *seen = calloc(nb, sizeof(int64_t));
+	uint32_t *seen = calloc(nb, sizeof(uint32_t));
 	uint8_t *used = calloc(nb, 1);
 	if(!seen || !used) {
 		free(seen);
 		free(used);
-		lom_match_list_free(&tmp);
+		lom_oi_list_free(&tmp);
 		return LOM_ERR_NOMEM;
 	}
 	for(size_t i = 0; i < tmp.count; i++) {
-		size_t idx = find_open_index(doc, tmp.items[i].offset);
-		if(idx == (size_t)-1) continue;
-		int32_t pidx32 = row_parent(doc, &doc->scan.opens[idx]);
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at(doc, tmp.items[i], &scratch);
+		if(!row) continue;
+		int32_t pidx32 = row_parent(doc, row);
 		if(pidx32 < 0) continue;
-		int64_t parent = row_open_off(doc, &doc->scan.opens[pidx32]);
-		uint64_t h = (uint64_t)parent;
+		uint32_t poi = (uint32_t)pidx32;
+		uint64_t h = (uint64_t)poi;
 		size_t slot = (size_t)(h % nb);
 		int found = 0;
 		for(size_t probe = 0; probe < nb; probe++) {
 			size_t j = (slot + probe) % nb;
 			if(!used[j]) {
 				used[j] = 1;
-				seen[j] = parent;
+				seen[j] = poi;
 				break;
 			}
-			if(seen[j] == parent) { found = 1; break; }
+			if(seen[j] == poi) { found = 1; break; }
 		}
 		if(found) continue;
-		match_push(out, parent, row_node_end(doc, &doc->scan.opens[pidx32]));
+		lom_match m;
+		if(lom_doc_oi_match(doc, poi, &m) != LOM_OK) continue;
+		if(!match_push(out, m.offset, m.end_off)) break;
 	}
 	free(seen);
 	free(used);
-	lom_match_list_free(&tmp);
+	lom_oi_list_free(&tmp);
 	return LOM_OK;
 }
 
@@ -3553,15 +6579,139 @@ static bool scan_string_intern(lom_scan_result *r, const char *s, size_t n, uint
 	return true;
 }
 
+/* Irregular analogue of “scan the insert fragment”: rescan dirty pieces only. */
+static lom_status doc_reindex_dirty_pieces(lom_doc *d) {
+	if(!d || !d->code || d->code_overlay || doc_has_recipe(d) || d->piece_count < 2)
+		return LOM_ERR_ARG;
+	size_t lo = d->code_len, hi = 0;
+	int dirty_n = 0;
+	for(size_t i = 0; i < d->piece_count; i++) {
+		if(!d->piece_dirty[i]) continue;
+		dirty_n++;
+		size_t a = d->piece_starts[i];
+		size_t b = (i + 1 < d->piece_count) ? d->piece_starts[i + 1] : d->code_len;
+		if(a < lo) lo = a;
+		if(b > hi) hi = b;
+	}
+	if(dirty_n == 0 || hi <= lo || (hi - lo) * 2 > d->code_len)
+		return LOM_ERR_ARG;
+	if(!doc_opens_to_heap(d)) return LOM_ERR_NOMEM;
+
+	lom_scan_result frag;
+	lom_scan_result_init(&frag);
+	int capture = env_flag_on("LOM_ATTRS", d->code_len < (size_t)512 * 1024 * 1024);
+	lom_status st = lom_scan_indexes(d->code + lo, hi - lo, &frag, capture != 0);
+	if(st != LOM_OK) {
+		lom_scan_result_free(&frag);
+		return LOM_ERR_ARG;
+	}
+
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		int64_t o = d->scan.opens[i].open_off;
+		if(o >= (int64_t)lo && o < (int64_t)hi)
+			d->scan.opens[i].self_closing = (uint8_t)(d->scan.opens[i].self_closing | LOM_OPEN_DEAD);
+	}
+
+	if(frag.open_count &&
+	   !grow_cap((void **)&d->scan.opens, sizeof(lom_open_row), &d->scan.open_cap,
+		     d->scan.open_count + frag.open_count)) {
+		lom_scan_result_free(&frag);
+		return LOM_ERR_NOMEM;
+	}
+
+	int32_t base = (int32_t)d->scan.open_count;
+	for(size_t i = 0; i < frag.open_count; i++) {
+		lom_open_row row = frag.opens[i];
+		const char *nm = lom_scan_string(&frag, row.name_id);
+		uint32_t nid;
+		if(!nm || !scan_string_intern(&d->scan, nm, strlen(nm), &nid)) {
+			lom_scan_result_free(&frag);
+			return LOM_ERR_NOMEM;
+		}
+		row.name_id = nid;
+		row.open_off += (int64_t)lo;
+		if(row.parent_idx >= 0)
+			row.parent_idx += base;
+		else {
+			int32_t best = -1;
+			int64_t best_o = -1;
+			for(size_t j = 0; j < d->scan.open_count; j++) {
+				lom_open_row *cand = &d->scan.opens[j];
+				if(row_is_dead(cand)) continue;
+				int64_t co = cand->open_off;
+				int64_t ce = lom_open_node_end(&d->scan, cand);
+				if(co <= row.open_off && ce > row.open_off && co >= best_o) {
+					best = (int32_t)j;
+					best_o = co;
+				}
+			}
+			row.parent_idx = best;
+		}
+		d->scan.opens[d->scan.open_count++] = row;
+	}
+
+	if(frag.attr_count) {
+		if(!grow_cap((void **)&d->scan.attrs, sizeof(lom_attr_row), &d->scan.attr_cap,
+			     d->scan.attr_count + frag.attr_count)) {
+			lom_scan_result_free(&frag);
+			return LOM_ERR_NOMEM;
+		}
+		for(size_t i = 0; i < frag.attr_count; i++) {
+			lom_attr_row a = frag.attrs[i];
+			const char *an = lom_scan_string(&frag, a.name_id);
+			const char *av = lom_scan_string(&frag, a.value_id);
+			uint32_t nid, vid;
+			if(!an || !av ||
+			   !scan_string_intern(&d->scan, an, strlen(an), &nid) ||
+			   !scan_string_intern(&d->scan, av, strlen(av), &vid)) {
+				lom_scan_result_free(&frag);
+				return LOM_ERR_NOMEM;
+			}
+			a.name_id = nid;
+			a.value_id = vid;
+			a.open_off += (int64_t)lo;
+			a.open_idx = (uint32_t)(base + (size_t)a.open_idx);
+			d->scan.attrs[d->scan.attr_count++] = a;
+		}
+	}
+
+	lom_scan_result_free(&frag);
+	d->aux_dirty = 1;
+	d->open_sorted_n = d->scan.open_count;
+	doc_rebuild_pieces(d);
+	doc_rebuild_fstr(d);
+	if(d->fcache) lom_fcache_clear(d->fcache);
+	d->status = LOM_OK;
+	d->error[0] = 0;
+	return LOM_OK;
+}
+
 /* Complete-subtree remove: deleting exactly one element's [open, node_end] span. */
 static int splice_remove_is_complete(const lom_doc *d, int64_t lo, int64_t hi) {
 	if(hi <= lo) return 0;
 	size_t idx = find_open_index(d, lo);
-	if(idx == (size_t)-1) return 0;
-	const lom_open_row *row = &d->scan.opens[idx];
-	if(row_is_dead(row)) return 0;
-	if(row_open_off(d, row) != lo) return 0;
-	if(row_node_end(d, row) != hi - 1) return 0;
+	if(idx != (size_t)-1) {
+		const lom_open_row *row = &d->scan.opens[idx];
+		if(!row_is_dead(row) && row_open_off(d, row) == lo && row_node_end(d, row) == hi - 1)
+			return 1;
+	}
+	/* Inner-text replace: [lo,hi) is between a parent's `>` and `<`. Children
+	 * that start in the span must also end in it — O(log n + kids), not O(n). */
+	if(doc_has_recipe(d)) return 0;
+	size_t n = opens_sorted_count(d);
+	size_t L = 0, R = n;
+	while(L < R) {
+		size_t mid = L + (R - L) / 2;
+		if(row_open_off(d, &d->scan.opens[mid]) < lo) L = mid + 1;
+		else R = mid;
+	}
+	for(size_t i = L; i < n; i++) {
+		const lom_open_row *row = &d->scan.opens[i];
+		if(row_is_dead(row)) continue;
+		int64_t o = row_open_off(d, row);
+		if(o >= hi) break;
+		if(row_node_end(d, row) >= hi) return 0;
+	}
 	return 1;
 }
 
@@ -3836,15 +6986,17 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 	}
 	size_t n_rm = found_rm ? (rm_hi - rm_lo) : 0;
 
-	/* Large-doc delete of a complete subtree: tombstone opens + byte bias.
-	 * Avoids rewriting / faulting the entire open table (was ~10s on 1GB). */
-	if(n_rm && !insert_len && d->scan.open_count >= (size_t)1000000) {
+	/* Tombstone a complete child span + byte bias. Text-only insert (no new
+	 * opens) uses the same path — OSM node inner→"x" was a 43 K-row memmove. */
+	if(n_rm && !(insert_len && span_has_lt(insert, insert_len)) &&
+	   d->scan.open_count >= (size_t)10000) {
 		for(size_t i = rm_lo; i < rm_hi; i++)
 			d->scan.opens[i].self_closing = LOM_OPEN_DEAD;
-		if(!doc_code_splice_bytes(d, at, remove_len, "", 0)) return LOM_ERR_NOMEM;
-		int64_t delta = -(int64_t)remove_len;
-		if(delta && d->scan.opens_is_mmap) {
-			/* Compose with existing byte bias — never full flush on tombstone delete. */
+		if(!doc_code_splice_bytes(d, at, remove_len, insert ? insert : "", insert_len))
+			return LOM_ERR_NOMEM;
+		int64_t delta = (int64_t)insert_len - (int64_t)remove_len;
+		if(delta) {
+			/* Heap or mmap: bias logical offs — do not memmove / walk 43 K rows. */
 			if(d->off_bias_delta && d->off_bias_from != (int64_t)at) {
 				int64_t T = d->off_bias_from;
 				int64_t raw_at = (int64_t)at;
@@ -3871,9 +7023,6 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 			}
 			if(!d->off_bias_delta) d->off_bias_from = (int64_t)at;
 			d->off_bias_delta += delta;
-		} else if(delta) {
-			if(d->off_bias_delta) doc_flush_off_bias(d);
-			shift_scan_offsets(&d->scan, (int64_t)at, delta);
 		}
 		if(!doc_aux_patch_tombstones(d, rm_lo, rm_hi))
 			d->aux_dirty = 1;
@@ -4056,17 +7205,337 @@ static lom_status doc_splice_local_structure(lom_doc *d, size_t at, size_t remov
 	free(new_rows);
 	doc_rebuild_pieces(d);
 	if(d->fcache) lom_fcache_clear(d->fcache);
+	doc_sidecar_invalidate(d);
 	d->status = LOM_OK;
 	d->error[0] = 0;
 	return LOM_OK;
 }
 
+static int recipe_ensure_owned(lom_doc *d) {
+	if(!doc_has_recipe(d)) return 0;
+	if(d->scan.recipe_owned) return 1;
+	size_t tn = d->scan.recipe_tmpl_n;
+	size_t tiles = d->scan.recipe_tile_n;
+	lom_open_row *tmpl = malloc(tn * sizeof(lom_open_row));
+	uint64_t *st = malloc(tiles * sizeof(uint64_t));
+	uint64_t *en = malloc(tiles * sizeof(uint64_t));
+	if(!tmpl || !st || !en) {
+		free(tmpl); free(st); free(en);
+		return 0;
+	}
+	memcpy(tmpl, d->scan.recipe_tmpl, tn * sizeof(lom_open_row));
+	memcpy(st, d->scan.recipe_starts, tiles * sizeof(uint64_t));
+	memcpy(en, d->scan.recipe_ends, tiles * sizeof(uint64_t));
+	uint8_t *cls = NULL;
+	if(d->scan.recipe_tile_cls) {
+		cls = malloc(tiles);
+		if(!cls) { free(tmpl); free(st); free(en); return 0; }
+		memcpy(cls, d->scan.recipe_tile_cls, tiles);
+	}
+	d->scan.recipe_tmpl = tmpl;
+	d->scan.recipe_starts = st;
+	d->scan.recipe_ends = en;
+	d->scan.recipe_tile_cls = cls;
+	d->scan.recipe_owned = 1;
+	return 1;
+}
+
+static int64_t recipe_logical_to_raw(const lom_doc *d, int64_t logical) {
+	if(!d->off_bias_delta) return logical;
+	if(logical >= d->off_bias_from + d->off_bias_delta)
+		return logical - d->off_bias_delta;
+	return logical;
+}
+
+static int recipe_span_hits_tile(const lom_doc *d, int64_t lo, int64_t hi) {
+	if(!doc_has_recipe(d)) return 0;
+	if(hi <= lo) hi = lo + 1;
+	size_t L = 0, R = d->scan.recipe_tile_n;
+	while(L < R) {
+		size_t mid = L + (R - L) / 2;
+		if(recipe_range_end(d, mid) <= lo) L = mid + 1;
+		else R = mid;
+	}
+	if(L >= d->scan.recipe_tile_n) return 0;
+	return recipe_range_start(d, L) < hi;
+}
+
+static int recipe_remove_tile(lom_doc *d, size_t tile) {
+	if(!recipe_ensure_owned(d) || tile >= d->scan.recipe_tile_n) return 0;
+	size_t cls = recipe_tile_cls_id(&d->scan, tile);
+	if(cls < LOM_RECIPE_KMAX && d->scan.recipe_k_tile_n[cls])
+		d->scan.recipe_k_tile_n[cls]--;
+	size_t n = d->scan.recipe_tile_n;
+	if(tile + 1 < n) {
+		memmove(d->scan.recipe_starts + tile, d->scan.recipe_starts + tile + 1,
+			(n - tile - 1) * sizeof(uint64_t));
+		memmove(d->scan.recipe_ends + tile, d->scan.recipe_ends + tile + 1,
+			(n - tile - 1) * sizeof(uint64_t));
+		if(d->scan.recipe_tile_cls)
+			memmove(d->scan.recipe_tile_cls + tile, d->scan.recipe_tile_cls + tile + 1,
+				n - tile - 1);
+	}
+	d->scan.recipe_tile_n--;
+	recipe_invalidate_hot(d);
+	return 1;
+}
+
+/* Dirty tile → leftover prefix. Remaining tiles keep virtual geometry. */
+static int recipe_flatten_tile(lom_doc *d, size_t tile) {
+	if(!doc_has_recipe(d) || tile >= d->scan.recipe_tile_n) return 0;
+	int64_t lo64 = recipe_range_start(d, tile);
+	int64_t hi64 = recipe_range_end(d, tile);
+	if(lo64 < 0 || hi64 <= lo64) return 0;
+	size_t lo = (size_t)lo64, hi = (size_t)hi64, len = hi - lo;
+	char *buf = NULL;
+	int heap = 0;
+	if(d->code_overlay) {
+		buf = malloc(len);
+		if(!buf) return 0;
+		for(size_t i = 0; i < len; i++) buf[i] = doc_byte(d, lo + i);
+		heap = 1;
+	} else if(d->code) {
+		if(hi > d->code_len) return 0;
+		buf = d->code + lo;
+	} else {
+		if(d->mmap_fd < 0) return 0;
+		buf = malloc(len);
+		if(!buf) return 0;
+		if(pread(d->mmap_fd, buf, len, (off_t)lo) < (ssize_t)len) {
+			free(buf);
+			return 0;
+		}
+		heap = 1;
+	}
+	lom_scan_result fr;
+	lom_scan_result_init(&fr);
+	if(lom_scan_indexes(buf, len, &fr, false) != LOM_OK || !fr.open_count) {
+		lom_scan_result_free(&fr);
+		if(heap) free(buf);
+		return 0;
+	}
+	if(!doc_opens_to_heap(d) || !doc_strings_to_heap(d)) {
+		lom_scan_result_free(&fr);
+		if(heap) free(buf);
+		return 0;
+	}
+	if(!grow_cap((void **)&d->scan.opens, sizeof(lom_open_row), &d->scan.open_cap,
+		     d->scan.open_count + fr.open_count)) {
+		lom_scan_result_free(&fr);
+		if(heap) free(buf);
+		return 0;
+	}
+	size_t base = d->scan.open_count;
+	int32_t outer = d->scan.recipe_root_parent;
+	for(size_t i = 0; i < fr.open_count; i++) {
+		lom_open_row row = fr.opens[i];
+		const char *nm = lom_scan_string(&fr, row.name_id);
+		uint32_t nid;
+		if(!nm || !scan_string_intern(&d->scan, nm, strlen(nm), &nid)) {
+			lom_scan_result_free(&fr);
+			if(heap) free(buf);
+			return 0;
+		}
+		row.name_id = nid;
+		int64_t logical = row.open_off + (int64_t)lo;
+		row.open_off = recipe_logical_to_raw(d, logical);
+		row.self_closing = (uint8_t)(row.self_closing & ~LOM_OPEN_ABS);
+		if(row.parent_idx >= 0) row.parent_idx += (int32_t)base;
+		else row.parent_idx = outer;
+		d->scan.opens[d->scan.open_count++] = row;
+	}
+	lom_scan_result_free(&fr);
+	if(heap) free(buf);
+	return recipe_remove_tile(d, tile);
+}
+
+static int recipe_flatten_intersecting(lom_doc *d, int64_t lo, int64_t hi) {
+	if(!doc_has_recipe(d)) return 1;
+	if(hi <= lo) hi = lo + 1;
+	for(size_t t = d->scan.recipe_tile_n; t > 0; ) {
+		t--;
+		int64_t rs = recipe_range_start(d, t);
+		int64_t re = recipe_range_end(d, t);
+		if(hi <= rs || lo >= re) continue;
+		if(!recipe_flatten_tile(d, t)) return 0;
+	}
+	return 1;
+}
+
+/* Streaming emit: a new_ sibling that matches a class template is another tile. */
+static void recipe_try_append_tile(lom_doc *d, size_t at, const char *frag, size_t flen) {
+	if(!doc_has_recipe(d) || !frag || !flen || frag[0] != '<') return;
+	for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+		int64_t rs = recipe_range_start(d, t), re = recipe_range_end(d, t);
+		if((int64_t)at > rs && (int64_t)at < re) return;
+	}
+	lom_scan_result fr;
+	lom_scan_result_init(&fr);
+	if(lom_scan_indexes(frag, flen, &fr, false) != LOM_OK || !fr.open_count) {
+		lom_scan_result_free(&fr);
+		return;
+	}
+	int cls = -1;
+	size_t kn = recipe_k_n(&d->scan);
+	for(size_t c = 0; c < kn; c++) {
+		size_t tn = 0;
+		const lom_open_row *tmpl = recipe_cls_rows(&d->scan, c, &tn);
+		if(!tmpl || fr.open_count != tn) continue;
+		int ok = 1;
+		for(size_t i = 0; i < tn; i++) {
+			const char *na = lom_scan_string(&fr, fr.opens[i].name_id);
+			const char *nb = lom_scan_string(&d->scan, tmpl[i].name_id);
+			if(strcmp(na, nb) != 0) { ok = 0; break; }
+		}
+		if(ok) { cls = (int)c; break; }
+	}
+	if(cls < 0) { lom_scan_result_free(&fr); return; }
+	if(!recipe_ensure_owned(d)) { lom_scan_result_free(&fr); return; }
+	size_t n = d->scan.recipe_tile_n + 1;
+	uint64_t *st = realloc(d->scan.recipe_starts, n * sizeof(uint64_t));
+	uint64_t *en = realloc(d->scan.recipe_ends, n * sizeof(uint64_t));
+	if(!st || !en) {
+		if(st) d->scan.recipe_starts = st;
+		if(en) d->scan.recipe_ends = en;
+		lom_scan_result_free(&fr);
+		return;
+	}
+	d->scan.recipe_starts = st;
+	d->scan.recipe_ends = en;
+	st[n - 1] = at;
+	en[n - 1] = at + flen;
+	if(d->scan.recipe_tile_cls) {
+		uint8_t *tc = realloc(d->scan.recipe_tile_cls, n);
+		if(!tc) { lom_scan_result_free(&fr); return; }
+		d->scan.recipe_tile_cls = tc;
+		tc[n - 1] = (uint8_t)cls;
+	}
+	d->scan.recipe_tile_n = n;
+	d->scan.recipe_k_tile_n[cls]++;
+	lom_scan_result_free(&fr);
+}
+
+/* Innermost covering virtual oi at a logical byte (prefix leftover or one tile). */
+static size_t recipe_innermost_voi(lom_doc *d, int64_t off) {
+	size_t best = (size_t)-1;
+	int64_t best_o = -1;
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		const lom_open_row *r = &d->scan.opens[i];
+		if(row_is_dead(r)) continue;
+		int64_t o = row_open_off(d, r), e = row_node_end(d, r);
+		if(o <= off && off <= e && o >= best_o) {
+			best = i;
+			best_o = o;
+		}
+	}
+	size_t lo = 0, hi = d->scan.recipe_tile_n;
+	while(lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		int64_t rs = recipe_range_start(d, mid);
+		int64_t re = recipe_range_end(d, mid);
+		if(off < rs) hi = mid;
+		else if(off >= re) lo = mid + 1;
+		else {
+			if(recipe_instantiate_tile(d, mid) != LOM_OK) break;
+			for(size_t i = 0; i < d->hot_scan.open_count; i++) {
+				const lom_open_row *r = &d->hot_scan.opens[i];
+				int64_t o = row_open_off(d, r), e = row_node_end(d, r);
+				if(o <= off && off <= e && o >= best_o) {
+					best = recipe_voi_of(&d->scan, mid, i);
+					best_o = o;
+				}
+			}
+			break;
+		}
+	}
+	return best;
+}
+
+/* In-tile markup insert: fragment opens join the leftover prefix so later get/delete see them. */
+static void recipe_merge_irregular_frag(lom_doc *d, size_t at, const char *frag, size_t flen) {
+	if(!doc_has_recipe(d) || !frag || !flen || frag[0] != '<') return;
+	lom_scan_result fr;
+	lom_scan_result_init(&fr);
+	if(lom_scan_indexes(frag, flen, &fr, false) != LOM_OK || !fr.open_count) {
+		lom_scan_result_free(&fr);
+		return;
+	}
+	if(!doc_opens_to_heap(d) || !doc_strings_to_heap(d)) {
+		lom_scan_result_free(&fr);
+		return;
+	}
+	if(!grow_cap((void **)&d->scan.opens, sizeof(lom_open_row), &d->scan.open_cap,
+		     d->scan.open_count + fr.open_count)) {
+		lom_scan_result_free(&fr);
+		return;
+	}
+	size_t old_prefix = d->scan.open_count;
+	size_t parent = recipe_innermost_voi(d, (int64_t)at);
+	/* Appending leftover rows shifts tile vois by +fr.open_count. */
+	if(parent != (size_t)-1 && parent >= old_prefix)
+		parent += fr.open_count;
+	int32_t base = (int32_t)old_prefix;
+	for(size_t i = 0; i < fr.open_count; i++) {
+		lom_open_row row = fr.opens[i];
+		const char *nm = lom_scan_string(&fr, row.name_id);
+		uint32_t nid;
+		if(!nm || !scan_string_intern(&d->scan, nm, strlen(nm), &nid)) {
+			lom_scan_result_free(&fr);
+			return;
+		}
+		row.name_id = nid;
+		row.open_off += (int64_t)at;
+		row.self_closing = (uint8_t)((row.self_closing & LOM_OPEN_SC) | LOM_OPEN_ABS);
+		if(row.parent_idx >= 0) row.parent_idx += base;
+		else row.parent_idx = (parent == (size_t)-1) ? -1 : (int32_t)parent;
+		d->scan.opens[d->scan.open_count++] = row;
+	}
+	lom_scan_result_free(&fr);
+	recipe_invalidate_hot(d);
+}
+
+static void recipe_tombstone_prefix_span(lom_doc *d, size_t at, size_t remove_len) {
+	if(!remove_len || !d->scan.opens) return;
+	int64_t lo = (int64_t)at, hi = (int64_t)(at + remove_len);
+	for(size_t i = 0; i < d->scan.open_count; i++) {
+		lom_open_row *r = &d->scan.opens[i];
+		if(row_is_dead(r)) continue;
+		int64_t o = row_open_off(d, r);
+		if(o >= lo && o < hi)
+			r->self_closing = (uint8_t)(r->self_closing | LOM_OPEN_DEAD);
+	}
+}
+
+static void doc_maybe_pwrite(lom_doc *d, size_t at, const char *insert, size_t insert_len, size_t remove_len) {
+	d->wal_dirty = 1;
+	if(insert_len != remove_len || !insert || !d->source_path) return;
+	int fd = open(d->source_path, O_WRONLY);
+	if(fd < 0) return;
+	(void)pwrite(fd, insert, insert_len, (off_t)at);
+	close(fd);
+}
+
 static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const char *insert, size_t insert_len) {
+	if(d->slot_hits && (at != (size_t)d->slot_off || remove_len != d->slot_ilen || insert_len != d->slot_ilen))
+		d->slot_hits = 0;
 	int want_ov = splice_wants_overlay(d, at, remove_len, insert_len);
 	/* Overlay keeps the base mapping read-only — skip MAP_PRIVATE COW of the whole file. */
 	if(!want_ov && !doc_ensure_writable(d)) return LOM_ERR_NOMEM;
 	if(at > d->code_len || remove_len > d->code_len - at) return LOM_ERR_ARG;
 	doc_mark_dirty_at(d, at);
+
+	/* In-tile length change or markup: leftover that tile so virtual geometry stays true. */
+	if(doc_has_recipe(d)) {
+		int64_t delta0 = (int64_t)insert_len - (int64_t)remove_len;
+		int64_t hi = (int64_t)at + (int64_t)(remove_len ? remove_len : 0);
+		int hit = recipe_span_hits_tile(d, (int64_t)at, hi > (int64_t)at ? hi : (int64_t)at + 1);
+		int structural = !splice_is_structure_preserving(d, at, remove_len, insert, insert_len);
+		if(hit && (delta0 != 0 || structural)) {
+			if(!recipe_flatten_intersecting(d, (int64_t)at, hi > (int64_t)at ? hi : (int64_t)at + 1))
+				return LOM_ERR_NOMEM;
+			if(d->fcache) lom_fcache_clear(d->fcache);
+		}
+	}
 
 	if(splice_is_structure_preserving(d, at, remove_len, insert, insert_len)) {
 		if(!doc_code_splice_bytes(d, at, remove_len, insert, insert_len)) return LOM_ERR_NOMEM;
@@ -4074,7 +7543,12 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 		/* Large mmap open tables: defer the O(#opens) rewrite — only patch ancestors
 		 * and keep a byte bias for the rest (queries use row_open_off). Overlay optional. */
 		if(delta == 0) {
-			/* Same-size text: open offsets unchanged. */
+			if(doc_has_recipe(d)) recipe_invalidate_hot(d);
+		} else if(doc_has_recipe(d)) {
+			if(!d->off_bias_delta) d->off_bias_from = (int64_t)at;
+			d->off_bias_delta += delta;
+			recipe_invalidate_hot(d);
+			doc_sidecar_invalidate(d);
 		} else if(d->scan.opens_is_mmap && d->scan.open_count >= (size_t)1000000) {
 			if(d->off_bias_delta && d->off_bias_from != (int64_t)at)
 				doc_flush_off_bias(d);
@@ -4089,6 +7563,32 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 		}
 		doc_rebuild_pieces(d);
 		doc_rebuild_fstr(d);
+		doc_maybe_pwrite(d, at, insert, insert_len, remove_len);
+		d->status = LOM_OK;
+		d->error[0] = 0;
+		return LOM_OK;
+	}
+
+	/* Recipe docs: splice bytes + bias; do not expand a virtual open table. */
+	if(doc_has_recipe(d)) {
+		/* Tombstone against pre-splice logical offsets, then apply byte bias. */
+		if(remove_len) recipe_tombstone_prefix_span(d, at, remove_len);
+		if(!doc_code_splice_bytes(d, at, remove_len, insert, insert_len)) return LOM_ERR_NOMEM;
+		int64_t delta = (int64_t)insert_len - (int64_t)remove_len;
+		if(delta) {
+			if(!d->off_bias_delta) d->off_bias_from = (int64_t)at;
+			d->off_bias_delta += delta;
+		}
+		recipe_invalidate_hot(d);
+		doc_sidecar_invalidate(d);
+		if(d->fcache) lom_fcache_clear(d->fcache);
+		doc_maybe_pwrite(d, at, insert, insert_len, remove_len);
+		if(insert_len && insert && insert[0] == '<') {
+			size_t before = d->scan.recipe_tile_n;
+			recipe_try_append_tile(d, at, insert, insert_len);
+			if(d->scan.recipe_tile_n == before)
+				recipe_merge_irregular_frag(d, at, insert, insert_len);
+		}
 		d->status = LOM_OK;
 		d->error[0] = 0;
 		return LOM_OK;
@@ -4102,11 +7602,21 @@ static lom_status doc_splice(lom_doc *d, size_t at, size_t remove_len, const cha
 	}
 
 	if(!doc_code_splice_bytes(d, at, remove_len, insert, insert_len)) return LOM_ERR_NOMEM;
+	int64_t delta = (int64_t)insert_len - (int64_t)remove_len;
+	if(delta) {
+		for(size_t i = 0; i < d->piece_count; i++) {
+			if(d->piece_starts[i] > at)
+				d->piece_starts[i] = (size_t)((int64_t)d->piece_starts[i] + delta);
+		}
+	}
+	if(doc_reindex_dirty_pieces(d) == LOM_OK) return LOM_OK;
 	return doc_reindex(d);
 }
 
 static bool find_inner_range(const lom_doc *d, size_t open_idx, size_t *inner_start, size_t *inner_len, size_t *close_lt) {
-	const lom_open_row *row = &d->scan.opens[open_idx];
+	lom_open_row scratch;
+	const lom_open_row *row = doc_open_at((lom_doc *)d, open_idx, &scratch);
+	if(!row) return false;
 	size_t start = (size_t)row_tag_end(d, row) + 1;
 	size_t end = (size_t)row_node_end(d, row);
 	size_t cl = end;
@@ -4120,63 +7630,83 @@ static bool find_inner_range(const lom_doc *d, size_t open_idx, size_t *inner_st
 
 lom_status lom_doc_set_inner_text(lom_doc *doc, const char *selector, const char *text) {
 	if(!doc || !selector || !text) return LOM_ERR_ARG;
-	lom_match_list m;
-	lom_match_list_init(&m);
-	lom_status st = lom_doc_get(doc, selector, &m);
-	if(st != LOM_OK) { lom_match_list_free(&m); return st; }
-	if(m.count == 0) { lom_match_list_free(&m); return LOM_ERR_NOTFOUND; }
-	/* apply from highest offset to lowest */
-	for(ssize_t i = (ssize_t)m.count - 1; i >= 0; i--) {
-		size_t idx = find_open_index(doc, m.items[i].offset);
-		if(idx == (size_t)-1) continue;
+	size_t tlen = strlen(text);
+	if(doc->slot_hits >= 2 && doc->slot_sel[0] && strcmp(doc->slot_sel, selector) == 0
+		&& tlen == doc->slot_ilen && doc->slot_off >= 0) {
+		return doc_splice(doc, (size_t)doc->slot_off, tlen, text, tlen);
+	}
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, selector, &ois);
+	if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
+	if(ois.count == 0) { lom_oi_list_free(&ois); return LOM_ERR_NOTFOUND; }
+	for(ssize_t i = (ssize_t)ois.count - 1; i >= 0; i--) {
+		size_t idx = ois.items[i];
 		size_t is, il, cl;
 		if(!find_inner_range(doc, idx, &is, &il, &cl)) continue;
-		st = doc_splice(doc, is, il, text, strlen(text));
-		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
-		/* after splice, lower offsets still valid; higher already done */
+		st = doc_splice(doc, is, il, text, tlen);
+		if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
+		if(ois.count == 1 && tlen == il) {
+			if(doc->slot_sel[0] && strcmp(doc->slot_sel, selector) == 0) doc->slot_hits++;
+			else doc->slot_hits = 1;
+			snprintf(doc->slot_sel, sizeof(doc->slot_sel), "%s", selector);
+			doc->slot_off = (int64_t)is;
+			doc->slot_ilen = tlen;
+		} else {
+			doc->slot_hits = 0;
+			doc->slot_sel[0] = 0;
+		}
 	}
-	lom_match_list_free(&m);
+	lom_oi_list_free(&ois);
 	return LOM_OK;
 }
 
 lom_status lom_doc_new_before_close(lom_doc *doc, const char *parent_selector, const char *fragment) {
 	if(!doc || !parent_selector || !fragment) return LOM_ERR_ARG;
-	lom_match_list m;
-	lom_match_list_init(&m);
-	lom_status st = lom_doc_get(doc, parent_selector, &m);
-	if(st != LOM_OK) { lom_match_list_free(&m); return st; }
-	if(m.count == 0) { lom_match_list_free(&m); return LOM_ERR_NOTFOUND; }
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, parent_selector, &ois);
+	if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
+	if(ois.count == 0) { lom_oi_list_free(&ois); return LOM_ERR_NOTFOUND; }
 	size_t frag_len = strlen(fragment);
-	for(ssize_t i = (ssize_t)m.count - 1; i >= 0; i--) {
-		size_t idx = find_open_index(doc, m.items[i].offset);
-		if(idx == (size_t)-1) continue;
+	for(ssize_t i = (ssize_t)ois.count - 1; i >= 0; i--) {
 		size_t is, il, cl;
-		if(!find_inner_range(doc, idx, &is, &il, &cl)) continue;
+		if(!find_inner_range(doc, ois.items[i], &is, &il, &cl)) continue;
 		st = doc_splice(doc, cl, 0, fragment, frag_len);
-		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
+		if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
 	}
-	lom_match_list_free(&m);
+	lom_oi_list_free(&ois);
 	return LOM_OK;
 }
 
 lom_status lom_doc_delete(lom_doc *doc, const char *selector) {
 	if(!doc || !selector) return LOM_ERR_ARG;
-	lom_match_list m;
-	lom_match_list_init(&m);
-	lom_status st = lom_doc_get(doc, selector, &m);
-	if(st != LOM_OK) { lom_match_list_free(&m); return st; }
-	for(ssize_t i = (ssize_t)m.count - 1; i >= 0; i--) {
-		size_t idx = find_open_index(doc, m.items[i].offset);
-		if(idx == (size_t)-1) continue;
-		const lom_open_row *row = &doc->scan.opens[idx];
-		if(row_is_dead(row)) continue;
+	if(doc->fcache) lom_fcache_clear(doc->fcache);
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, selector, &ois);
+	if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
+	for(ssize_t i = (ssize_t)ois.count - 1; i >= 0; i--) {
+		size_t idx = ois.items[i];
+		lom_open_row scratch;
+		const lom_open_row *row = doc_open_at(doc, idx, &scratch);
+		if(!row || row_is_dead(row)) continue;
 		size_t start = (size_t)row_open_off(doc, row);
 		size_t end = (size_t)row_node_end(doc, row);
 		size_t len = end - start + 1;
+		if(doc_has_recipe(doc) && idx < doc->scan.open_count && doc->scan.opens) {
+			doc->scan.opens[idx].self_closing =
+				(uint8_t)(doc->scan.opens[idx].self_closing | LOM_OPEN_DEAD);
+			for(size_t j = 0; j < doc->scan.open_count; j++) {
+				if(doc->scan.opens[j].parent_idx == (int32_t)idx)
+					doc->scan.opens[j].self_closing =
+						(uint8_t)(doc->scan.opens[j].self_closing | LOM_OPEN_DEAD);
+			}
+		}
 		st = doc_splice(doc, start, len, "", 0);
-		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
+		if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
 	}
-	lom_match_list_free(&m);
+	lom_oi_list_free(&ois);
 	return LOM_OK;
 }
 
@@ -4277,44 +7807,296 @@ lom_status lom_doc_set_attr(lom_doc *doc, int64_t open_off, const char *attr, co
 
 lom_status lom_doc_ensure_ids(lom_doc *doc, const char *row_selector, const char *id_attr) {
 	if(!doc || !row_selector || !id_attr) return LOM_ERR_ARG;
-	lom_match_list m;
-	lom_match_list_init(&m);
-	lom_status st = lom_doc_get(doc, row_selector, &m);
-	if(st != LOM_OK) { lom_match_list_free(&m); return st; }
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	lom_status st = lom_doc_get_ois(doc, row_selector, &ois);
+	if(st != LOM_OK) { lom_oi_list_free(&ois); return st; }
 	char buf[128];
-	for(ssize_t pass = (ssize_t)m.count - 1; pass >= 0; pass--) {
-		lom_match_list m2;
-		lom_match_list_init(&m2);
-		st = lom_doc_get(doc, row_selector, &m2);
-		if(st != LOM_OK) { lom_match_list_free(&m2); lom_match_list_free(&m); return st; }
-		if((size_t)pass >= m2.count) { lom_match_list_free(&m2); continue; }
-		int64_t off = m2.items[pass].offset;
+	size_t n = ois.count;
+	lom_oi_list_free(&ois);
+	for(ssize_t pass = (ssize_t)n - 1; pass >= 0; pass--) {
+		lom_oi_list cur;
+		lom_oi_list_init(&cur);
+		st = lom_doc_get_ois(doc, row_selector, &cur);
+		if(st != LOM_OK) { lom_oi_list_free(&cur); return st; }
+		if((size_t)pass >= cur.count) { lom_oi_list_free(&cur); continue; }
+		lom_match m;
+		if(lom_doc_oi_match(doc, cur.items[pass], &m) != LOM_OK) {
+			lom_oi_list_free(&cur);
+			continue;
+		}
+		int64_t off = m.offset;
 		if(lom_doc_get_attr(doc, off, id_attr, buf, sizeof(buf)) == LOM_OK && buf[0]) {
-			lom_match_list_free(&m2);
+			lom_oi_list_free(&cur);
 			continue;
 		}
 		char idv[64];
 		snprintf(idv, sizeof(idv), "lom-%zu", (size_t)pass + 1);
 		st = lom_doc_set_attr(doc, off, id_attr, idv);
-		lom_match_list_free(&m2);
-		if(st != LOM_OK) { lom_match_list_free(&m); return st; }
+		lom_oi_list_free(&cur);
+		if(st != LOM_OK) return st;
 	}
-	lom_match_list_free(&m);
 	return LOM_OK;
+}
+
+static void wal_path_for(const char *xml_path, char *out, size_t cap) {
+	snprintf(out, cap, "%s.lomwal", xml_path);
+}
+
+int lom_doc_wal_pending(const lom_doc *doc) {
+	if(!doc) return 0;
+	if(doc->wal_dirty || doc->code_overlay) return 1;
+	if(!doc->source_path) return 0;
+	char path[4096];
+	wal_path_for(doc->source_path, path, sizeof(path));
+	return access(path, F_OK) == 0;
+}
+
+lom_status lom_doc_wal_persist(lom_doc *doc) {
+	if(!doc || !doc->source_path) return LOM_ERR_ARG;
+	if(!doc->code_overlay || !doc->ov_ins) {
+		/* Same-size in-place: nothing to journal if we already pwrite'd. */
+		if(doc->wal_dirty) doc->wal_dirty = 0;
+		return LOM_OK;
+	}
+	char path[4096];
+	wal_path_for(doc->source_path, path, sizeof(path));
+	char tmp[4104];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE *f = fopen(tmp, "wb");
+	if(!f) return LOM_ERR_PARSE;
+	uint64_t at = (uint64_t)doc->ov_at;
+	uint64_t rem = (uint64_t)doc->ov_remove;
+	uint64_t il = (uint64_t)doc->ov_ins_len;
+	int ok = fwrite("LOMWAL1\n", 1, 8, f) == 8
+		&& fwrite(&at, 1, 8, f) == 8
+		&& fwrite(&rem, 1, 8, f) == 8
+		&& fwrite(&il, 1, 8, f) == 8
+		&& (il == 0 || fwrite(doc->ov_ins, 1, (size_t)il, f) == (size_t)il);
+	fclose(f);
+	if(!ok) { remove(tmp); return LOM_ERR_PARSE; }
+	if(rename(tmp, path) != 0) { remove(tmp); return LOM_ERR_PARSE; }
+	doc->wal_dirty = 0;
+	return LOM_OK;
+}
+
+lom_status lom_doc_wal_load(lom_doc *doc) {
+	if(!doc || !doc->source_path) return LOM_OK;
+	char path[4096];
+	wal_path_for(doc->source_path, path, sizeof(path));
+	FILE *f = fopen(path, "rb");
+	if(!f) return LOM_OK;
+	char mag[8];
+	uint64_t at = 0, rem = 0, il = 0;
+	if(fread(mag, 1, 8, f) != 8 || memcmp(mag, "LOMWAL1\n", 8) != 0
+		|| fread(&at, 1, 8, f) != 8 || fread(&rem, 1, 8, f) != 8
+		|| fread(&il, 1, 8, f) != 8) {
+		fclose(f);
+		return LOM_ERR_PARSE;
+	}
+	char *buf = NULL;
+	if(il) {
+		buf = malloc((size_t)il + 1);
+		if(!buf) { fclose(f); return LOM_ERR_NOMEM; }
+		if(fread(buf, 1, (size_t)il, f) != (size_t)il) {
+			free(buf);
+			fclose(f);
+			return LOM_ERR_PARSE;
+		}
+		buf[il] = 0;
+	}
+	fclose(f);
+	if(doc->ov_ins) free(doc->ov_ins);
+	doc->code_overlay = 1;
+	doc->ov_at = (size_t)at;
+	doc->ov_remove = (size_t)rem;
+	doc->ov_ins = buf ? buf : calloc(1, 1);
+	doc->ov_ins_len = (size_t)il;
+	doc->ov_ins_cap = (size_t)il + 1;
+	doc->code_base_len = doc->code_len;
+	doc->code_len = doc->code_base_len - doc->ov_remove + doc->ov_ins_len;
+	doc->wal_dirty = 0;
+	return LOM_OK;
+}
+
+static int same_file_path(const char *a, const char *b) {
+	if(!a || !b) return 0;
+	if(strcmp(a, b) == 0) return 1;
+	struct stat sa, sb;
+	if(stat(a, &sa) != 0 || stat(b, &sb) != 0) return 0;
+	return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* Shift a copy of recipe tile ranges so they match a flattened dest (overlay applied). */
+static void recipe_shift_copy_for_overlay(const lom_doc *d, uint64_t *starts, uint64_t *ends) {
+	if(!d->code_overlay || !d->scan.recipe_tile_n) return;
+	int64_t delta = (int64_t)d->ov_ins_len - (int64_t)d->ov_remove;
+	if(!delta) return;
+	size_t cut = d->ov_at;
+	size_t cut_end = d->ov_at + d->ov_remove;
+	for(size_t t = 0; t < d->scan.recipe_tile_n; t++) {
+		if(starts[t] >= cut_end) {
+			starts[t] = (uint64_t)((int64_t)starts[t] + delta);
+			ends[t] = (uint64_t)((int64_t)ends[t] + delta);
+		} else if(ends[t] > cut) {
+			ends[t] = (uint64_t)((int64_t)ends[t] + delta);
+		}
+	}
+}
+
+/* Write dest.lomidx from the live recipe without mutating the source doc. */
+static int doc_sidecar_save_dest(lom_doc *d, const char *dest) {
+	if(!d || !dest || !sidecar_wanted() || !doc_has_recipe(d)) return -1;
+	char *saved_path = d->source_path;
+	uint64_t *os = d->scan.recipe_starts, *oe = d->scan.recipe_ends;
+	uint64_t *ns = NULL, *ne = NULL;
+	size_t tiles = d->scan.recipe_tile_n;
+	if(tiles && d->code_overlay) {
+		ns = malloc(tiles * sizeof(uint64_t));
+		ne = malloc(tiles * sizeof(uint64_t));
+		if(!ns || !ne) {
+			free(ns);
+			free(ne);
+			return -1;
+		}
+		memcpy(ns, os, tiles * sizeof(uint64_t));
+		memcpy(ne, oe, tiles * sizeof(uint64_t));
+		recipe_shift_copy_for_overlay(d, ns, ne);
+		d->scan.recipe_starts = ns;
+		d->scan.recipe_ends = ne;
+	}
+	int saved_ov = d->code_overlay;
+	int64_t saved_off = d->off_bias_delta, saved_idx = d->idx_bias_delta;
+	int saved_aux = d->aux_dirty;
+	size_t saved_pend = d->tag_pend_n;
+	d->source_path = (char *)dest;
+	d->code_overlay = 0;
+	d->off_bias_delta = 0;
+	d->idx_bias_delta = 0;
+	d->aux_dirty = 0;
+	d->tag_pend_n = 0;
+	int rc = doc_sidecar_save(d);
+	d->source_path = saved_path;
+	d->code_overlay = saved_ov;
+	d->off_bias_delta = saved_off;
+	d->idx_bias_delta = saved_idx;
+	d->aux_dirty = saved_aux;
+	d->tag_pend_n = saved_pend;
+	if(ns) {
+		d->scan.recipe_starts = os;
+		d->scan.recipe_ends = oe;
+		free(ns);
+		free(ne);
+	}
+	return rc;
+}
+
+lom_status lom_doc_checkpoint(lom_doc *doc, const char *path) {
+	if(!doc) return LOM_ERR_ARG;
+	const char *dest = path ? path : doc->source_path;
+	if(!dest) return LOM_ERR_ARG;
+	lom_status st = lom_doc_save_file(doc, dest);
+	if(st != LOM_OK) return st;
+	int in_place = doc->source_path && same_file_path(doc->source_path, dest);
+	if(in_place) {
+		char wpath[4096];
+		wal_path_for(doc->source_path, wpath, sizeof(wpath));
+		(void)unlink(wpath);
+		doc->wal_dirty = 0;
+		(void)doc_sidecar_save(doc);
+	} else {
+		(void)doc_sidecar_save_dest(doc, dest);
+	}
+	return LOM_OK;
+}
+
+static int write_fully_fd(int fd, const void *p, size_t n) {
+	const char *s = (const char *)p;
+	while(n) {
+		size_t chunk = n > (size_t)(1 << 20) ? (size_t)(1 << 20) : n;
+		ssize_t w = write(fd, s, chunk);
+		if(w <= 0) return -1;
+		s += (size_t)w;
+		n -= (size_t)w;
+	}
+	return 0;
+}
+
+/* Copy [off, off+n) from the on-disk / mapped *base* (ignore overlay).
+ * Prefer the original fd so a 21 GiB rewrite does not fault the mapping. */
+static int copy_base_range_fd(const lom_doc *d, int out, size_t off, size_t n) {
+	if(!n) return 0;
+	if(d->mmap_fd < 0 && d->code) {
+		size_t lim = d->code_overlay ? d->code_base_len : d->code_len;
+		if(off + n > lim) return -1;
+		return write_fully_fd(out, d->code + off, n);
+	}
+	if(d->mmap_fd < 0) return -1;
+#ifdef __linux__
+	{
+		loff_t inoff = (loff_t)off;
+		size_t left = n;
+		while(left) {
+			ssize_t c = copy_file_range(d->mmap_fd, &inoff, out, NULL, left, 0);
+			if(c <= 0) break;
+			left -= (size_t)c;
+		}
+		if(left == 0) return 0;
+	}
+#endif
+	{
+		char buf[1 << 20];
+		size_t done = 0;
+		while(done < n) {
+			size_t want = n - done;
+			if(want > sizeof(buf)) want = sizeof(buf);
+			ssize_t r = pread(d->mmap_fd, buf, want, (off_t)(off + done));
+			if(r <= 0) return -1;
+			if(write_fully_fd(out, buf, (size_t)r) != 0) return -1;
+			done += (size_t)r;
+		}
+	}
+	return 0;
 }
 
 lom_status lom_doc_save_file(const lom_doc *doc, const char *path) {
 	if(!doc || !path) return LOM_ERR_ARG;
 	lom_doc *d = (lom_doc *)doc;
-	if(d->code_overlay && !doc_overlay_flatten(d)) return LOM_ERR_NOMEM;
-	char tmp[1024];
+	char tmp[4096];
 	snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
-	FILE *f = fopen(tmp, "wb");
-	if(!f) return LOM_ERR_PARSE;
-	size_t n = fwrite(d->code, 1, d->code_len, f);
-	fclose(f);
-	if(n != d->code_len) { remove(tmp); return LOM_ERR_PARSE; }
-	if(rename(tmp, path) != 0) { remove(tmp); return LOM_ERR_PARSE; }
+	int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if(fd < 0) return LOM_ERR_PARSE;
+#ifdef POSIX_FADV_SEQUENTIAL
+	(void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+	if(d->mmap_fd >= 0) (void)posix_fadvise(d->mmap_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+	int ok = 0;
+	if(d->code_overlay) {
+		size_t left = d->ov_at;
+		size_t mid = d->ov_ins_len;
+		size_t right_off = d->ov_at + d->ov_remove;
+		size_t right = d->code_base_len >= right_off ? d->code_base_len - right_off : 0;
+		ok = copy_base_range_fd(d, fd, 0, left) == 0
+			&& (mid == 0 || write_fully_fd(fd, d->ov_ins, mid) == 0)
+			&& copy_base_range_fd(d, fd, right_off, right) == 0;
+	} else if(d->mmap_fd >= 0 || d->code) {
+		if(!d->code && d->mmap_fd < 0 && !doc_ensure_code(d)) {
+			close(fd);
+			unlink(tmp);
+			return LOM_ERR_NOMEM;
+		}
+		ok = copy_base_range_fd(d, fd, 0, d->code_len) == 0;
+	}
+	if(ok && fsync(fd) != 0) ok = 0;
+	if(close(fd) != 0) ok = 0;
+	if(!ok) {
+		unlink(tmp);
+		return LOM_ERR_PARSE;
+	}
+	if(rename(tmp, path) != 0) {
+		unlink(tmp);
+		return LOM_ERR_PARSE;
+	}
 	return LOM_OK;
 }
 

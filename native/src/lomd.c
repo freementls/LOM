@@ -45,6 +45,7 @@ typedef struct {
 typedef struct {
 	lom_doc *doc;
 	char data_path[1024];
+	char root_dir[1024];
 	char api_key[256];
 	char base_url[512];
 	int port;
@@ -316,17 +317,19 @@ static void append_row_json(entity_def *e, int64_t off, char **buf, size_t *len,
 static char *build_list_response(entity_def *e, const char *filter, int top, int skip, int want_count, const char *path_base) {
 	filter_clause clauses[8];
 	int nc = parse_filter(filter, clauses, 8);
-	lom_match_list m;
-	lom_match_list_init(&m);
-	if(lom_doc_get(g_svc.doc, e->row_selector, &m) != LOM_OK) {
-		lom_match_list_free(&m);
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	if(lom_doc_get_ois(g_svc.doc, e->row_selector, &ois) != LOM_OK) {
+		lom_oi_list_free(&ois);
 		return strdup("{\"error\":\"query failed\"}");
 	}
-	int64_t *matched = malloc(sizeof(int64_t) * (m.count ? m.count : 1));
+	int64_t *matched = malloc(sizeof(int64_t) * (ois.count ? ois.count : 1));
 	size_t matched_n = 0;
-	for(size_t i = 0; i < m.count; i++) {
-		if(row_matches_filter(e, m.items[i].offset, clauses, nc)) {
-			matched[matched_n++] = m.items[i].offset;
+	for(size_t i = 0; i < ois.count; i++) {
+		lom_match m;
+		if(lom_doc_oi_match(g_svc.doc, ois.items[i], &m) != LOM_OK) continue;
+		if(row_matches_filter(e, m.offset, clauses, nc)) {
+			matched[matched_n++] = m.offset;
 		}
 	}
 	size_t total = matched_n;
@@ -398,27 +401,29 @@ static char *build_list_response(entity_def *e, const char *filter, int top, int
 	body[len++] = '}';
 	body[len] = 0;
 	free(matched);
-	lom_match_list_free(&m);
+	lom_oi_list_free(&ois);
 	(void)prefix;
 	return body;
 }
 
 static int find_row_by_id(entity_def *e, const char *id, int64_t *out_off) {
-	lom_match_list m;
-	lom_match_list_init(&m);
-	if(lom_doc_get(g_svc.doc, e->row_selector, &m) != LOM_OK) {
-		lom_match_list_free(&m);
+	lom_oi_list ois;
+	lom_oi_list_init(&ois);
+	if(lom_doc_get_ois(g_svc.doc, e->row_selector, &ois) != LOM_OK) {
+		lom_oi_list_free(&ois);
 		return 0;
 	}
 	char buf[128];
-	for(size_t i = 0; i < m.count; i++) {
-		if(lom_doc_get_attr(g_svc.doc, m.items[i].offset, e->id_attr, buf, sizeof(buf)) == LOM_OK && strcmp(buf, id) == 0) {
-			*out_off = m.items[i].offset;
-			lom_match_list_free(&m);
+	for(size_t i = 0; i < ois.count; i++) {
+		lom_match m;
+		if(lom_doc_oi_match(g_svc.doc, ois.items[i], &m) != LOM_OK) continue;
+		if(lom_doc_get_attr(g_svc.doc, m.offset, e->id_attr, buf, sizeof(buf)) == LOM_OK && strcmp(buf, id) == 0) {
+			*out_off = m.offset;
+			lom_oi_list_free(&ois);
 			return 1;
 		}
 	}
-	lom_match_list_free(&m);
+	lom_oi_list_free(&ois);
 	return 0;
 }
 
@@ -542,6 +547,51 @@ static void handle_request(int fd, char *req, size_t req_len) {
 	}
 
 	pthread_mutex_lock(&g_svc.lock);
+
+	if(strcmp(path, "/lom/query") == 0) {
+		const char *body_pos = strstr(req, "\r\n\r\n");
+		const char *body_in = body_pos ? body_pos + 4 : "";
+		char sel[512], xp[512], css[512], file[512];
+		json_get_string(body_in, "selector", sel, sizeof(sel));
+		json_get_string(body_in, "xpath", xp, sizeof(xp));
+		json_get_string(body_in, "css", css, sizeof(css));
+		json_get_string(body_in, "file", file, sizeof(file));
+		if(file[0] && g_svc.root_dir[0]) {
+			if(strstr(file, "..")) {
+				pthread_mutex_unlock(&g_svc.lock);
+				http_send(fd, 400, "application/json", "{\"error\":\"bad file\"}");
+				return;
+			}
+			char full[2048];
+			snprintf(full, sizeof(full), "%s/%s", g_svc.root_dir, file);
+			lom_doc *nd = lom_doc_create_file(full);
+			if(nd && lom_doc_status(nd) == LOM_OK) {
+				lom_doc_free(g_svc.doc);
+				g_svc.doc = nd;
+				snprintf(g_svc.data_path, sizeof(g_svc.data_path), "%s", full);
+			} else if(nd) lom_doc_free(nd);
+		}
+		const char *use = sel[0] ? sel : NULL;
+		char compiled[1024];
+		if(!use && xp[0] && lom_xpath_to_lom(xp, compiled, sizeof(compiled)) == LOM_OK)
+			use = compiled;
+		if(!use && css[0] && lom_css_to_lom(css, compiled, sizeof(compiled)) == LOM_OK)
+			use = compiled;
+		if(!use) {
+			pthread_mutex_unlock(&g_svc.lock);
+			http_send(fd, 400, "application/json", "{\"error\":\"need selector, xpath, or css\"}");
+			return;
+		}
+		size_t n = 0;
+		lom_doc_count(g_svc.doc, use, &n);
+		char body[512];
+		snprintf(body, sizeof(body),
+			"{\"ok\":true,\"n\":%zu,\"selector\":\"%s\",\"recipe\":%d,\"opens\":%zu}",
+			n, use, lom_doc_recipe_active(g_svc.doc), lom_doc_open_count(g_svc.doc));
+		pthread_mutex_unlock(&g_svc.lock);
+		http_send(fd, 200, "application/json", body);
+		return;
+	}
 
 	if(strcmp(path, "/odata") == 0 || strcmp(path, "/odata/") == 0) {
 		char body[4096];
@@ -703,7 +753,8 @@ static void handle_request(int fd, char *req, size_t req_len) {
 		if(parent) st = lom_doc_new_before_close(g_svc.doc, parent, frag);
 		else st = LOM_ERR_ARG;
 		if(st == LOM_OK) {
-			lom_doc_save_file(g_svc.doc, g_svc.data_path);
+			if(lom_doc_wal_persist(g_svc.doc) != LOM_OK)
+				lom_doc_save_file(g_svc.doc, g_svc.data_path);
 		}
 		pthread_mutex_unlock(&g_svc.lock);
 		if(st != LOM_OK) {
@@ -741,7 +792,8 @@ static void handle_request(int fd, char *req, size_t req_len) {
 			/* refresh offset after mutations */
 			if(!find_row_by_id(e, id_buf, &off)) break;
 		}
-		lom_doc_save_file(g_svc.doc, g_svc.data_path);
+		if(lom_doc_wal_persist(g_svc.doc) != LOM_OK)
+			lom_doc_save_file(g_svc.doc, g_svc.data_path);
 		pthread_mutex_unlock(&g_svc.lock);
 		http_send(fd, 200, "application/json", "{\"ok\":true}");
 		return;
@@ -759,7 +811,8 @@ static void handle_request(int fd, char *req, size_t req_len) {
 			return;
 		}
 		lom_doc_delete_offset(g_svc.doc, off);
-		lom_doc_save_file(g_svc.doc, g_svc.data_path);
+		if(lom_doc_wal_persist(g_svc.doc) != LOM_OK)
+			lom_doc_save_file(g_svc.doc, g_svc.data_path);
 		pthread_mutex_unlock(&g_svc.lock);
 		http_send(fd, 204, "text/plain", "");
 		return;
@@ -799,7 +852,7 @@ static void *client_thread(void *arg) {
 
 static void usage(const char *a) {
 	fprintf(stderr,
-		"Usage: %s --file data.xml --entities entities.conf --port 8080 [--api-key SECRET] [--base-url URL]\n", a);
+		"Usage: %s --file data.xml --entities entities.conf --port 8080 [--api-key SECRET] [--base-url URL] [--root DIR]\n", a);
 }
 
 int main(int argc, char **argv) {
@@ -813,6 +866,7 @@ int main(int argc, char **argv) {
 		else if(!strcmp(argv[i], "--port") && i + 1 < argc) g_svc.port = atoi(argv[++i]);
 		else if(!strcmp(argv[i], "--api-key") && i + 1 < argc) snprintf(g_svc.api_key, sizeof(g_svc.api_key), "%s", argv[++i]);
 		else if(!strcmp(argv[i], "--base-url") && i + 1 < argc) snprintf(g_svc.base_url, sizeof(g_svc.base_url), "%s", argv[++i]);
+		else if(!strcmp(argv[i], "--root") && i + 1 < argc) snprintf(g_svc.root_dir, sizeof(g_svc.root_dir), "%s", argv[++i]);
 		else { usage(argv[0]); return 2; }
 	}
 	if(!file || !ents) { usage(argv[0]); return 2; }

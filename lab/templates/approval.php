@@ -52,45 +52,32 @@ $requestId = (isset($_GET['requestId']) && preg_match('/^[0-9]+$/', $_GET['reque
 } ?>
 
 <script>
+function ajap(xmlVar, action, query, write) {
+	return fetch('ajap.php', {
+		method: 'POST',
+		headers: {'Content-Type': 'application/json'},
+		body: JSON.stringify({app: LAB_APP, var: xmlVar, action: action, query: query || '', write: write || ''})
+	}).then(function (response) { return response.json(); }).then(function (data) {
+		if (parent !== window) parent.postMessage({type: 'lab-source', app: LAB_APP, var: xmlVar, xml: data.xml}, location.origin);
+		return data;
+	});
+}
 function go(screen, requestId) {
 	location = 'run.php?app=' + LAB_APP + '&screen=' + screen + (requestId ? '&requestId=' + requestId : '') + '&time=' + Date.now();
 }
 function add() {
 	var requestId = Date.now();
-	fetch('ajap.php', {
-		method: 'POST',
-		headers: {'Content-Type': 'application/json'},
-		body: JSON.stringify({app: LAB_APP, var: 'XMLrequests', action: 'new_', query: 'requests', write:
-			'<request id="' + requestId + '"><title>' + title.value + '</title><who>' + who.value + '</who><status>pending</status></request>'})
-	}).then(function (response) { return response.json(); }).then(function (data) {
-		if (parent !== window) parent.postMessage({type: 'lab-source', app: LAB_APP, var: 'XMLrequests', xml: data.xml}, location.origin);
-		return fetch('ajap.php', {
-			method: 'POST',
-			headers: {'Content-Type': 'application/json'},
-			body: JSON.stringify({app: LAB_APP, var: 'XMLapprovers', action: 'new_', query: 'approvers', write:
-				'<approver id="' + requestId + '"><requestId>' + requestId + '</requestId><name>Grace</name><decision></decision></approver>'})
-		});
-	}).then(function (response) { return response.json(); }).then(function (data) {
-		if (parent !== window) parent.postMessage({type: 'lab-source', app: LAB_APP, var: 'XMLapprovers', xml: data.xml}, location.origin);
-		go('requests');
-	});
+	ajap('XMLrequests', 'new_', 'requests',
+		'<request id="' + requestId + '"><title>' + title.value + '</title><who>' + who.value + '</who><status>pending</status></request>'
+	).then(function () {
+		return ajap('XMLapprovers', 'new_', 'approvers',
+			'<approver id="' + requestId + '"><requestId>' + requestId + '</requestId><name>Grace</name><decision></decision></approver>');
+	}).then(function () { go('requests'); });
 }
 function decide(approverId, requestId, decision) {
-	fetch('ajap.php', {
-		method: 'POST',
-		headers: {'Content-Type': 'application/json'},
-		body: JSON.stringify({app: LAB_APP, var: 'XMLapprovers', action: 'set', query: 'approver@id=' + approverId, write: 'decision=' + decision})
-	}).then(function (response) { return response.json(); }).then(function (data) {
-		if (parent !== window) parent.postMessage({type: 'lab-source', app: LAB_APP, var: 'XMLapprovers', xml: data.xml}, location.origin);
-		return fetch('ajap.php', {
-			method: 'POST',
-			headers: {'Content-Type': 'application/json'},
-			body: JSON.stringify({app: LAB_APP, var: 'XMLrequests', action: 'set', query: 'request@id=' + requestId, write: 'status=' + decision})
-		});
-	}).then(function (response) { return response.json(); }).then(function (data) {
-		if (parent !== window) parent.postMessage({type: 'lab-source', app: LAB_APP, var: 'XMLrequests', xml: data.xml}, location.origin);
-		go('item', requestId);
-	});
+	ajap('XMLapprovers', 'set', 'approver@id=' + approverId, 'decision=' + decision).then(function () {
+		return ajap('XMLrequests', 'set', 'request@id=' + requestId, 'status=' + decision);
+	}).then(function () { go('item', requestId); });
 }
 </script>
 <style>

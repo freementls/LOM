@@ -79,15 +79,15 @@ $default_query = 'hobby%=/s.*/i';
 					<button type="button" class="mode is-on" data-mode="tagged">Nodes</button>
 					<button type="button" class="mode" data-mode="values">Values</button>
 				</div>
-				<p class="tiny-hint">Query updates as you type. Regex values use <code>/pattern/flags</code> after any comparison op (<code>%=</code>, <code>^=</code>, …). <code>Write</code> applies <code>set</code> / <code>new_</code> / <code>delete</code>.</p>
+				<p class="tiny-hint">Query updates as you type. Regex values use <code>/pattern/flags</code> after an operator. <code>=</code> is a full-value match; use <code>^=</code> / <code>$=</code> / <code>%=</code> for prefix, suffix, or contains. <code>@name</code> is an attribute — this sample’s names are child tags (<code>name^=/sal/i</code>). <code>Write</code> applies <code>set</code> / <code>new_</code> / <code>delete</code>.</p>
 				<div class="chip-row">
 					<button type="button" class="chip is-on" data-query="hobby%=/s.*/i">hobby%=/s.*/i</button>
-					<button type="button" class="chip" data-query="hobby=/^ski/i">hobby=/^ski/i</button>
+					<button type="button" class="chip" data-query="hobby^=/ski/i">hobby^=/ski/i</button>
 					<button type="button" class="chip" data-query="hobby$=/ing$/">hobby$=/ing$/</button>
-					<button type="button" class="chip" data-query="hobby~=/ski|swim/">hobby~=/ski|swim/</button>
+					<button type="button" class="chip" data-query="hobby%=/ski|swim/">hobby%=/ski|swim/</button>
 					<button type="button" class="chip" data-query="hobby!=/sleep/i">hobby!=/sleep/i</button>
 					<button type="button" class="chip" data-query="*@age&gt;=/1[6-9]|[2-9]\d+/">*@age&gt;=/1[6-9]|…/</button>
-					<button type="button" class="chip" data-query="person@name=/^sal/i">person@name=/^sal/i</button>
+					<button type="button" class="chip" data-query="name^=/sal/i">name^=/sal/i</button>
 					<button type="button" class="chip" data-query=".person_name=sally">.person_name=sally</button>
 					<button type="button" class="chip" data-query="hobby">hobby</button>
 					<button type="button" class="chip" data-write-action="set" data-query=".person_lastname=mott" data-write="hobby=breathing">set mott hobby</button>
@@ -97,7 +97,7 @@ $default_query = 'hobby%=/s.*/i';
 					<button type="button" class="chip" data-query="*@age&gt;16">@age&gt;16</button>
 					<button type="button" class="chip" data-query=".person_hobby^=s">hobby ^= s</button>
 					<button type="button" class="chip" data-query=".tag2__name">.tag2__name</button>
-					<button type="button" class="chip" data-query="person@name!=sally">name != sally</button>
+					<button type="button" class="chip" data-query="name!=sally">name!=sally</button>
 					<button type="button" class="chip" data-query="a[0-3]">a[0-3]</button>
 					<button type="button" class="chip" data-query="a[0-2,4-6,8]">a[0-2,4-6,8]</button>
 					<button type="button" class="chip" data-query="a@id=1">a@id=1</button>
@@ -136,6 +136,6 @@ $default_query = 'hobby%=/s.*/i';
 			<li><code>~=</code> word</li>
 		</ul>
 	</main>
-	<script src="assets/demo.js?v=6"></script>
+	<script src="assets/demo.js?v=7"></script>
 </body>
 </html>

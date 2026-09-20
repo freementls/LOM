@@ -3,7 +3,7 @@
   "info": {
     "title": "LOM Data API",
     "description": "OData-style LOM service for Power Apps. Prefer List* actions with $filter/$top/$skip so filtering runs on the server — this avoids the Power Apps 500/2000 non-delegable row limit.",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "host": "127.0.0.1:8080",
   "basePath": "/",
@@ -24,6 +24,7 @@
         "responses": { "200": { "description": "OK" } }
       }
     },
+
     "/api/ListPeople": {
       "get": {
         "operationId": "ListPeople",
@@ -147,6 +148,629 @@
         ],
         "responses": { "204": { "description": "Deleted" } }
       }
+    },
+
+    "/api/ListTracking": {
+      "get": {
+        "operationId": "ListTracking",
+        "summary": "List Tracking with server-side filter and paging (avoids 500/2000 limit)",
+        "x-ms-pageable": { "nextLinkName": "nextLink", "itemName": "value" },
+        "parameters": [
+          {
+            "name": "$filter",
+            "in": "query",
+            "type": "string",
+            "required": false,
+            "description": "OData filter, e.g. startswith(Title,'REQ-') or request_user eq 'user@example.com'"
+          },
+          {
+            "name": "$top",
+            "in": "query",
+            "type": "integer",
+            "default": 50,
+            "description": "Page size (max 5000). Keep galleries at 50–200."
+          },
+          {
+            "name": "$skip",
+            "in": "query",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "$count",
+            "in": "query",
+            "type": "boolean",
+            "default": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of rows",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Tracking" }
+                },
+                "@odata.count": { "type": "integer" },
+                "@odata.nextLink": { "type": "string" },
+                "nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/odata/Tracking": {
+      "get": {
+        "operationId": "GetTrackingSet",
+        "summary": "OData entity set Tracking",
+        "x-ms-pageable": { "nextLinkName": "@odata.nextLink", "itemName": "value" },
+        "parameters": [
+          { "name": "$filter", "in": "query", "type": "string" },
+          { "name": "$top", "in": "query", "type": "integer", "default": 50 },
+          { "name": "$skip", "in": "query", "type": "integer", "default": 0 },
+          { "name": "$count", "in": "query", "type": "boolean" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "array", "items": { "$ref": "#/definitions/Tracking" } },
+                "@odata.nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "CreateTracking",
+        "summary": "Create Tracking row",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/TrackingWrite" }
+          }
+        ],
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/odata/Tracking({id})": {
+      "get": {
+        "operationId": "GetTracking",
+        "summary": "Get one Tracking row by lom_id",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Tracking" } }
+        }
+      },
+      "patch": {
+        "operationId": "UpdateTracking",
+        "summary": "Patch Tracking fields",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/TrackingWrite" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "DeleteTracking",
+        "summary": "Delete Tracking row",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    },
+
+    "/api/ListApprovals": {
+      "get": {
+        "operationId": "ListApprovals",
+        "summary": "List Approvals with server-side filter and paging (avoids 500/2000 limit)",
+        "x-ms-pageable": { "nextLinkName": "nextLink", "itemName": "value" },
+        "parameters": [
+          {
+            "name": "$filter",
+            "in": "query",
+            "type": "string",
+            "required": false,
+            "description": "OData filter, e.g. RequestID eq 'REQ-0002' or Decision eq 'Approve'"
+          },
+          {
+            "name": "$top",
+            "in": "query",
+            "type": "integer",
+            "default": 50,
+            "description": "Page size (max 5000). Keep galleries at 50–200."
+          },
+          {
+            "name": "$skip",
+            "in": "query",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "$count",
+            "in": "query",
+            "type": "boolean",
+            "default": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of rows",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Approval" }
+                },
+                "@odata.count": { "type": "integer" },
+                "@odata.nextLink": { "type": "string" },
+                "nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/odata/Approvals": {
+      "get": {
+        "operationId": "GetApprovalsSet",
+        "summary": "OData entity set Approvals",
+        "x-ms-pageable": { "nextLinkName": "@odata.nextLink", "itemName": "value" },
+        "parameters": [
+          { "name": "$filter", "in": "query", "type": "string" },
+          { "name": "$top", "in": "query", "type": "integer", "default": 50 },
+          { "name": "$skip", "in": "query", "type": "integer", "default": 0 },
+          { "name": "$count", "in": "query", "type": "boolean" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "array", "items": { "$ref": "#/definitions/Approval" } },
+                "@odata.nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "CreateApproval",
+        "summary": "Create Approval row",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/ApprovalWrite" }
+          }
+        ],
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/odata/Approvals({id})": {
+      "get": {
+        "operationId": "GetApproval",
+        "summary": "Get one Approval by lom_id",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Approval" } }
+        }
+      },
+      "patch": {
+        "operationId": "UpdateApproval",
+        "summary": "Patch Approval fields",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/ApprovalWrite" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "DeleteApproval",
+        "summary": "Delete Approval row",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    },
+
+    "/api/ListLocations": {
+      "get": {
+        "operationId": "ListLocations",
+        "summary": "List Member Locations with server-side filter and paging (avoids 500/2000 limit)",
+        "x-ms-pageable": { "nextLinkName": "nextLink", "itemName": "value" },
+        "parameters": [
+          {
+            "name": "$filter",
+            "in": "query",
+            "type": "string",
+            "required": false,
+            "description": "OData filter, e.g. RequestID eq 'PMR - 0001'"
+          },
+          {
+            "name": "$top",
+            "in": "query",
+            "type": "integer",
+            "default": 50,
+            "description": "Page size (max 5000). Keep galleries at 50–200."
+          },
+          {
+            "name": "$skip",
+            "in": "query",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "$count",
+            "in": "query",
+            "type": "boolean",
+            "default": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of rows",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Location" }
+                },
+                "@odata.count": { "type": "integer" },
+                "@odata.nextLink": { "type": "string" },
+                "nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/odata/Locations": {
+      "get": {
+        "operationId": "GetLocationsSet",
+        "summary": "OData entity set Locations",
+        "x-ms-pageable": { "nextLinkName": "@odata.nextLink", "itemName": "value" },
+        "parameters": [
+          { "name": "$filter", "in": "query", "type": "string" },
+          { "name": "$top", "in": "query", "type": "integer", "default": 50 },
+          { "name": "$skip", "in": "query", "type": "integer", "default": 0 },
+          { "name": "$count", "in": "query", "type": "boolean" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "array", "items": { "$ref": "#/definitions/Location" } },
+                "@odata.nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "CreateLocation",
+        "summary": "Create Location row",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/LocationWrite" }
+          }
+        ],
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/odata/Locations({id})": {
+      "get": {
+        "operationId": "GetLocation",
+        "summary": "Get one Location by lom_id",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Location" } }
+        }
+      },
+      "patch": {
+        "operationId": "UpdateLocation",
+        "summary": "Patch Location fields",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/LocationWrite" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "DeleteLocation",
+        "summary": "Delete Location row",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    },
+
+    "/api/ListUsers": {
+      "get": {
+        "operationId": "ListUsers",
+        "summary": "List App Users with server-side filter and paging (avoids 500/2000 limit)",
+        "x-ms-pageable": { "nextLinkName": "nextLink", "itemName": "value" },
+        "parameters": [
+          {
+            "name": "$filter",
+            "in": "query",
+            "type": "string",
+            "required": false,
+            "description": "OData filter, e.g. Title eq 'user@example.com'"
+          },
+          {
+            "name": "$top",
+            "in": "query",
+            "type": "integer",
+            "default": 50,
+            "description": "Page size (max 5000). Keep galleries at 50–200."
+          },
+          {
+            "name": "$skip",
+            "in": "query",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "$count",
+            "in": "query",
+            "type": "boolean",
+            "default": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of rows",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/User" }
+                },
+                "@odata.count": { "type": "integer" },
+                "@odata.nextLink": { "type": "string" },
+                "nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/odata/Users": {
+      "get": {
+        "operationId": "GetUsersSet",
+        "summary": "OData entity set Users",
+        "x-ms-pageable": { "nextLinkName": "@odata.nextLink", "itemName": "value" },
+        "parameters": [
+          { "name": "$filter", "in": "query", "type": "string" },
+          { "name": "$top", "in": "query", "type": "integer", "default": 50 },
+          { "name": "$skip", "in": "query", "type": "integer", "default": 0 },
+          { "name": "$count", "in": "query", "type": "boolean" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "array", "items": { "$ref": "#/definitions/User" } },
+                "@odata.nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "CreateUser",
+        "summary": "Create User row",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/UserWrite" }
+          }
+        ],
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/odata/Users({id})": {
+      "get": {
+        "operationId": "GetUser",
+        "summary": "Get one User by lom_id",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/User" } }
+        }
+      },
+      "patch": {
+        "operationId": "UpdateUser",
+        "summary": "Patch User fields",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/UserWrite" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "DeleteUser",
+        "summary": "Delete User row",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "Deleted" } }
+      }
+    },
+
+    "/api/ListSettings": {
+      "get": {
+        "operationId": "ListSettings",
+        "summary": "List App Settings with server-side filter and paging",
+        "x-ms-pageable": { "nextLinkName": "nextLink", "itemName": "value" },
+        "parameters": [
+          {
+            "name": "$filter",
+            "in": "query",
+            "type": "string",
+            "required": false
+          },
+          {
+            "name": "$top",
+            "in": "query",
+            "type": "integer",
+            "default": 50
+          },
+          {
+            "name": "$skip",
+            "in": "query",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "name": "$count",
+            "in": "query",
+            "type": "boolean",
+            "default": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of rows",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/Settings" }
+                },
+                "@odata.count": { "type": "integer" },
+                "@odata.nextLink": { "type": "string" },
+                "nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/odata/Settings": {
+      "get": {
+        "operationId": "GetSettingsSet",
+        "summary": "OData entity set Settings",
+        "x-ms-pageable": { "nextLinkName": "@odata.nextLink", "itemName": "value" },
+        "parameters": [
+          { "name": "$filter", "in": "query", "type": "string" },
+          { "name": "$top", "in": "query", "type": "integer", "default": 50 },
+          { "name": "$skip", "in": "query", "type": "integer", "default": 0 },
+          { "name": "$count", "in": "query", "type": "boolean" }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "array", "items": { "$ref": "#/definitions/Settings" } },
+                "@odata.nextLink": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "CreateSettings",
+        "summary": "Create Settings row",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/SettingsWrite" }
+          }
+        ],
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/odata/Settings({id})": {
+      "get": {
+        "operationId": "GetSettings",
+        "summary": "Get one Settings row by lom_id",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": {
+          "200": { "description": "OK", "schema": { "$ref": "#/definitions/Settings" } }
+        }
+      },
+      "patch": {
+        "operationId": "UpdateSettings",
+        "summary": "Patch Settings fields",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/SettingsWrite" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      },
+      "delete": {
+        "operationId": "DeleteSettings",
+        "summary": "Delete Settings row",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "type": "string" }
+        ],
+        "responses": { "204": { "description": "Deleted" } }
+      }
     }
   },
   "definitions": {
@@ -169,6 +793,163 @@
         "name": { "type": "string" },
         "lastname": { "type": "string" },
         "hobby": { "type": "string" }
+      }
+    },
+    "Tracking": {
+      "type": "object",
+      "properties": {
+        "lom_id": { "type": "string" },
+        "Title": { "type": "string" },
+        "request_user": { "type": "string" },
+        "approval_state": { "type": "string" },
+        "time_submitted": { "type": "string" },
+        "Destination": { "type": "string" },
+        "VisitType": { "type": "string" },
+        "Sites": { "type": "string" },
+        "Visitors": { "type": "string" },
+        "VIP": { "type": "string" },
+        "VisitDateFrom": { "type": "string" },
+        "VisitDateTo": { "type": "string" },
+        "Posted": { "type": "string" },
+        "SecurityClassification": { "type": "string" },
+        "L1Organization": { "type": "string" },
+        "L1Acronym": { "type": "string" },
+        "EmerCDLSRef": { "type": "string" },
+        "EmerAcomArray": { "type": "string" },
+        "Annex_1": { "type": "string" },
+        "Annex_2": { "type": "string" },
+        "Subject": { "type": "string" },
+        "Pertinence": { "type": "string" },
+        "InitiativeType": { "type": "string" },
+        "Initiation": { "type": "string" },
+        "spo_pdf_link": { "type": "string" }
+      }
+    },
+    "TrackingWrite": {
+      "type": "object",
+      "properties": {
+        "Title": { "type": "string" },
+        "request_user": { "type": "string" },
+        "approval_state": { "type": "string" },
+        "time_submitted": { "type": "string" },
+        "Destination": { "type": "string" },
+        "VisitType": { "type": "string" },
+        "Sites": { "type": "string" },
+        "Visitors": { "type": "string" },
+        "VIP": { "type": "string" },
+        "VisitDateFrom": { "type": "string" },
+        "VisitDateTo": { "type": "string" },
+        "Posted": { "type": "string" },
+        "SecurityClassification": { "type": "string" },
+        "L1Organization": { "type": "string" },
+        "L1Acronym": { "type": "string" },
+        "EmerCDLSRef": { "type": "string" },
+        "EmerAcomArray": { "type": "string" },
+        "Annex_1": { "type": "string" },
+        "Annex_2": { "type": "string" },
+        "Subject": { "type": "string" },
+        "Pertinence": { "type": "string" },
+        "InitiativeType": { "type": "string" },
+        "Initiation": { "type": "string" },
+        "spo_pdf_link": { "type": "string" }
+      }
+    },
+    "Approval": {
+      "type": "object",
+      "properties": {
+        "lom_id": { "type": "string" },
+        "Title": { "type": "string" },
+        "RequestID": { "type": "string" },
+        "Reviewer": { "type": "string" },
+        "SignedDate": { "type": "string" },
+        "SignedBy": { "type": "string" },
+        "Decision": { "type": "string" },
+        "ReviewerComments": { "type": "string" },
+        "Order": { "type": "string" }
+      }
+    },
+    "ApprovalWrite": {
+      "type": "object",
+      "properties": {
+        "Title": { "type": "string" },
+        "RequestID": { "type": "string" },
+        "Reviewer": { "type": "string" },
+        "SignedDate": { "type": "string" },
+        "SignedBy": { "type": "string" },
+        "Decision": { "type": "string" },
+        "ReviewerComments": { "type": "string" },
+        "Order": { "type": "string" }
+      }
+    },
+    "Location": {
+      "type": "object",
+      "properties": {
+        "lom_id": { "type": "string" },
+        "Title": { "type": "string" },
+        "RequestID": { "type": "string" },
+        "MemberType": { "type": "string" },
+        "Location": { "type": "string" },
+        "StartDate": { "type": "string" },
+        "EndDate": { "type": "string" },
+        "L1": { "type": "string" },
+        "CDLSRefNum": { "type": "string" }
+      }
+    },
+    "LocationWrite": {
+      "type": "object",
+      "properties": {
+        "Title": { "type": "string" },
+        "RequestID": { "type": "string" },
+        "MemberType": { "type": "string" },
+        "Location": { "type": "string" },
+        "StartDate": { "type": "string" },
+        "EndDate": { "type": "string" },
+        "L1": { "type": "string" },
+        "CDLSRefNum": { "type": "string" }
+      }
+    },
+    "User": {
+      "type": "object",
+      "properties": {
+        "lom_id": { "type": "string" },
+        "Title": { "type": "string", "description": "User email" },
+        "Role": { "type": "string" },
+        "Theme": { "type": "string" },
+        "ShowNotifConfirm": { "type": "string" },
+        "ShowDeleteConfirm": { "type": "string" }
+      }
+    },
+    "UserWrite": {
+      "type": "object",
+      "properties": {
+        "Title": { "type": "string", "description": "User email" },
+        "Role": { "type": "string" },
+        "Theme": { "type": "string" },
+        "ShowNotifConfirm": { "type": "string" },
+        "ShowDeleteConfirm": { "type": "string" }
+      }
+    },
+    "Settings": {
+      "type": "object",
+      "properties": {
+        "lom_id": { "type": "string" },
+        "Title": { "type": "string" },
+        "Messages": { "type": "string" },
+        "L1_Data": { "type": "string" },
+        "Default_Approver": { "type": "string" },
+        "Users": { "type": "string" },
+        "App_Version": { "type": "string" }
+      }
+    },
+    "SettingsWrite": {
+      "type": "object",
+      "properties": {
+        "Title": { "type": "string" },
+        "Messages": { "type": "string" },
+        "L1_Data": { "type": "string" },
+        "Default_Approver": { "type": "string" },
+        "Users": { "type": "string" },
+        "App_Version": { "type": "string" }
       }
     }
   }

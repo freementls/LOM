@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // ODataClient talks to lomd over HTTP.
@@ -47,6 +48,51 @@ func (c *ODataClient) ListPeople(filter string, top int) (string, error) {
 		q += "&$filter=" + url.QueryEscape(filter)
 	}
 	return c.get(q)
+}
+
+func (c *ODataClient) send(method, path, body string) (string, error) {
+	if c.HTTP == nil {
+		c.HTTP = http.DefaultClient
+	}
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, stringsTrimSlash(c.BaseURL)+"/"+path, rdr)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Api-Key", c.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	return string(b), nil
+}
+
+func (c *ODataClient) Query(selector string) (string, error) {
+	return c.send(http.MethodPost, "lom/query", `{"selector":"`+selector+`"}`)
+}
+
+func (c *ODataClient) CreatePerson(jsonBody string) (string, error) {
+	return c.send(http.MethodPost, "api/CreatePeople", jsonBody)
+}
+
+func (c *ODataClient) UpdatePerson(id, jsonBody string) (string, error) {
+	return c.send(http.MethodPatch, "odata/People('"+id+"')", jsonBody)
+}
+
+func (c *ODataClient) DeletePerson(id string) (string, error) {
+	return c.send(http.MethodDelete, "odata/People('"+id+"')", "")
 }
 
 func stringsTrimSlash(s string) string {

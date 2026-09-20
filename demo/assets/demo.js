@@ -38,13 +38,16 @@
 
 	function renderMeters(data) {
 		var count = data.count || 0;
-		var ms = typeof data.ms === 'number' ? data.ms : 0;
+		var q = typeof data.query_ms === 'number' ? data.query_ms : (typeof data.ms === 'number' ? data.ms : 0);
+		var c = typeof data.construct_ms === 'number' ? data.construct_ms : 0;
 		var cls = count ? 'meter--cool' : 'meter--hot';
 		var act = data.applied ? (data.action || action) : 'query';
 		metersEl.innerHTML =
 			'<span class="meter ' + cls + '"><strong>' + count + '</strong> match' + (count === 1 ? '' : 'es') + '</span>' +
-			'<span class="meter"><strong>' + ms + '</strong> ms</span>' +
+			'<span class="meter"><strong>' + q + '</strong> ms query</span>' +
+			'<span class="meter"><strong>' + c + '</strong> ms load</span>' +
 			'<span class="meter meter--live">' + (mode === 'tagged' ? 'nodes' : 'values') + '</span>' +
+			'<span class="meter">' + (data.engine || 'php') + '</span>' +
 			'<span class="meter">' + act + '</span>';
 	}
 

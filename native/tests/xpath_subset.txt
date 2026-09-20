@@ -1,0 +1,18 @@
+# LOM XPath subset — expressions that MUST compile.
+# Left of tab is XPath; right is the LOM form (# / sum: / avg: are eval, not match lists).
+//item	item
+/root/item	root_item
+//item[@id='i1']	item@id=i1
+//item[2]	item[1]
+//item/name	item_name
+//item[@id]	item@id
+item | raw	item|raw
+//item/..	item'
+//item/parent::zone	item'zone
+//name/ancestor::region	name"region
+count(//item)	#item
+sum(//item/value)	sum:item_value
+avg(//item/value)	avg:item_value
+//item[last()]	item[$]
+//x:html	x:html
+count(sum(//item))	

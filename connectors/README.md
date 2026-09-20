@@ -3,12 +3,12 @@
 LOM is usable from other languages without rewriting [`O.php`](../O.php). Two contracts:
 
 1. **In-process C ABI** — [`native/include/lom.h`](../native/include/lom.h) / `liblom.so`  
-   Core: `lom_doc_create_file`, `lom_doc_get`, `lom_doc_count`, `lom_doc_set_inner_text`, `lom_doc_new_before_close`, `lom_doc_delete`, `lom_doc_save_file`, `lom_doc_node_slice`. Results are offset pairs (or counts), not a DOM.
+   Core: `lom_doc_create_file`, `lom_doc_get`, `lom_doc_get_ois`, `lom_doc_oi_match`, `lom_doc_count`, `lom_doc_get_parent`, `lom_doc_set_inner_text`, `lom_doc_new_before_close`, `lom_doc_delete`, `lom_doc_save_file`, `lom_doc_wal_persist`, `lom_doc_checkpoint`, `lom_doc_node_slice`, `lom_xpath_to_lom`. Internally hits are open indices (`get_ois`); `get` materializes offset pairs. Not a DOM.
 
 2. **HTTP / OData** — [`lomd`](../native/src/lomd.c) + [`powerapps/openapi.json`](../powerapps/openapi.json)  
    API key header `X-Api-Key`, `$filter` / `$top` / `$skip`. Any language with an HTTP client can connect.
 
-Selector strings are UTF-8. Child axis is `_` / `__`. Regex values (`hobby%=/s.*/i`) work in PHP and in native `liblom` (PCRE2; same operator table: `=` `%=` `^=` `$=` `~=` `!=`). Prefer `lom_doc_count` / `Count` for cardinality on broad selectors.
+Selector strings are UTF-8. Child axis is `_` / `__`. Regex values (`hobby%=/s.*/i`) work in PHP and in native `liblom` (PCRE2; same operator table: `=` `%=` `^=` `$=` `~=` `!=`). Prefer `lom_doc_count` / `Count` for cardinality and `lom_doc_get_ois` / `GetOis` for internal walks on broad selectors. Public `get` still returns offset pairs.
 
 License: **Apache-2.0** — you may publish connectors without asking.
 

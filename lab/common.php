@@ -81,6 +81,10 @@ function lab_write_source($slug, $source) {
 		return 'Could not write the app file. The web server needs write access to lab/apps/.';
 	}
 	@chmod($path, 0666);
+	clearstatcache(true, $path);
+	if(function_exists('opcache_invalidate')) {
+		@opcache_invalidate($path, true);
+	}
 	return true;
 }
 

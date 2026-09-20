@@ -1,0 +1,15 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential libpcre2-dev
+      - name: test-all
+        run: make -C native test-all
+      - name: corpus (small files)
+        run: chmod +x bench_corpus.sh && ./bench_corpus.sh

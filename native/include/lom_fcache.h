@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 typedef struct lom_fcache lom_fcache;
+typedef struct lom_fcache_hold lom_fcache_hold;
 
 lom_fcache *lom_fcache_create(size_t bucket_hint);
 void lom_fcache_free(lom_fcache *c);
@@ -21,6 +22,10 @@ void lom_fcache_free(lom_fcache *c);
 bool lom_fcache_put(lom_fcache *c, const void *key, size_t key_len, const void *val, size_t val_len);
 /* Returns pointer owned by cache, or NULL. Sets *out_len when found. */
 const void *lom_fcache_get(lom_fcache *c, const void *key, size_t key_len, size_t *out_len);
+/* Borrow a cache blob. Caller must lom_fcache_hold_release() — safe across clear(). */
+const void *lom_fcache_borrow(lom_fcache *c, const void *key, size_t key_len, size_t *out_len,
+	lom_fcache_hold **out_hold);
+void lom_fcache_hold_release(lom_fcache_hold *h);
 
 size_t lom_fcache_hits(const lom_fcache *c);
 size_t lom_fcache_misses(const lom_fcache *c);

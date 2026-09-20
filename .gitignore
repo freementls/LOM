@@ -14,3 +14,9 @@ O-*.php
 old/
 *.7z
 *.zip
+*.lomidx
+*.lomidx.tmp
+*.lomopens
+*.lomopens.tmp
+powerapps/vcr.xml
+powerapps/vcr.xml.written.xml

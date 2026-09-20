@@ -113,8 +113,17 @@ If further tuning is needed:
 - PHP: `/pattern/flags` after any comparison operator; `/` is no longer a child-path alias.
 - `php regex_selector_test.php` — operator × attribute coverage.
 - `php gen_perf_fixture.php [size] [out]` and `./bench_large.sh 100MB` — opt-in large profiles (`LOM_ALLOW_HUGE=1` for ≥10GB).
-- `php bench_vs_tools.php` — personal LOM vs DOM/XPath/XMLReader bake-off (not the paper main table).
+- `php bench_vs_tools.php` — lab LOM vs DOM/XPath/XMLReader (not a paper table).
+- `./bench_vs_basex.sh` — lab BaseX on the same corpus (fetches `.bench_out/basex`; not a paper table).
 - Native: `lom_fmem` / `lom_fcache` + tag-aligned `lom_piece_boundaries` (`make -C native test-fmem`).
+- `ver≥0.2.43-fastpath`: zero-copy fcache borrow; `lom_doc_count` / `lom_doc_get_ois` for huge descendant; `.lomidx` sidecar; `LOM_PARALLEL` default on; tile census (`LOM_TILE`). `make -C native test-fastpath`.
+- `ver≥0.2.44-sidemap`: sidecar is mmap'd (no memcpy). Opens &gt;512 MiB go to `*.lomopens` so 20 GB can persist. 100 MB reload **~57 ms**; 1 GB **~315 ms**; **20 GB first construct ~363 s** (tile + 23 GiB sidecar write), reload **~0.4 s / ~6 MB**, descendant count **~32.5 s** (n=66.3 M).
+- `ver≥0.2.45-openlink`: split persist hard-links the live file-backed opens fd (`linkat` / `/proc/self/fd`) instead of rewriting `.lomopens`. `lom_doc_from_sidecar()`, `lomc --construct-only`. 1 GB construct **~7.2–7.7 s**, reload **~250–321 ms / ~7 MB**. 20 GB first **~292 s** (was ~363 s with a 20 GiB opens copy), reload **~261 ms / ~7 MB** (`sidecar=1`).
+- `ver≥0.2.46-fractal`: fractal construct persists a recipe (prefix + one tile template + depth-1 ranges) instead of 882 M open rows. `LOM_FRACTAL=0` keeps wholesale tile replay. 1 GB first **~1.4 s** / reload **~241 ms**. 20 GB first **~40 s** (census ~39 s, persist ~23 ms, **26 MB** `.lomidx`) / reload **~303 ms / ~6.5 MB**. Descendant count **~0.002 ms** (n=66.3 M; was ~32.5 s). Non-tiling docs stay on the 0.2.45 path.
+- `ver≥0.2.47-namedcensus`: depth-1 census is `memmem` of `<name` / `</name>` (skip `find_tag_close` on inner tags), parallel over byte slices without the 2×-open HW gate. 1 GB first **~0.47 s** (census **~93 ms**). 20 GB first **~2.2 s** (census **~1.8 s**). Same recipe counts (1.66 M / 66.3 M).
+- `ver≥0.2.48-parlit`: exact text / `>lit<` regex probes run `memmem` in parallel (≥64 MiB). 20 GB `entity_meta_name=Entity_42` **~2.0 s** (was ~6.7 s). After recipe construct, `madvise(DONTNEED)` drops the XML so idle RSS stays sidecar-sized until a byte query faults pages.
+- `ver≥0.2.49-lazymap`: sidecar reload keeps the XML **unmapped** (fd only). Tile instantiate / exact `Name_N` text and `>lit<` regex `pread` one ~13 KiB range (stride from tile 0/1). 1 GB reload **~0.07 ms**; 20 GB reload **~0.12 ms / ~5.5 MB** (was ~324 ms). 20 GB `Entity_42` **~0.3 ms** (was ~2.0 s). After recipe construct the 21 GiB map is `munmap`'d; idle RSS **~30 MB**.
+- `ver≥0.2.50-steady`: keep the XML mapped after first construct (no `munmap`/`DONTNEED` tax — warm 20 GB create **~2.7 s**). Reload still lazy. First write maps RW once. `Name_N` stride is cached; 4 parked tiles. `lom_doc_save_file` maps before write. `lomc --sel` / `--count` / `--json` for the local large demo.
 
 
 - `liblom` + `lomc`: full in-process get/set/new_

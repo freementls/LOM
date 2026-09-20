@@ -24,6 +24,8 @@ int main(void) {
 		return 1;
 	}
 	int fails = 0;
+	fails += expect(d, "hobby=/^ski/i", 1);
+	fails += expect(d, "hobby=/^ski$/i", 0);
 	fails += expect(d, "hobby%=/s\\w+/", 3);
 	fails += expect(d, "hobby^=/s/", 3);
 	fails += expect(d, "hobby$=/ing/", 3);

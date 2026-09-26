@@ -4,11 +4,11 @@
 
 ## Abstract
 
-Living Object Model (LOM) is an in-process string-resident XML engine: the document remains contiguous source text; query results are `(substring, offset)` pairs; writes splice the string and patch indexes instead of rebuilding a DOM. On this host it stays cheap on both **regular** (tiled 1–20 GB fixture) and **irregular** documents for selective query and incremental mutation, with optional XPath/CSS facades that compile to LOM selectors and a durable overlay (`pwrite` / `path.lomwal`) so a multi-GB file need not be rewritten on every edit. Novelty is the *combination* of (1) conversational / dynamic context across queries, (2) incremental string-resident mutation, (3) bidirectional “fractal” selection (selective end first), and (4) living named selections—not regex-on-XML per se. Compatibility facades and the WAL are engineering, not a novelty claim. The tables in this paper are LOM scaling, irregular corpora, and mechanism ablations — not head-to-head bake-offs.
+Living Object Model (LOM) is an in-process string-resident XML engine: the document remains contiguous source text; query results are `(substring, offset)` pairs; writes splice the string and patch indexes instead of rebuilding a DOM. On this host it stays cheap on both **regular** (tiled 1–20 GB fixture) and **irregular** documents for selective query and incremental mutation, with optional XPath/CSS facades that compile to LOM selectors and a durable overlay (`pwrite` / `path.lomwal`) so a multi-GB file need not be rewritten on every edit. Novelty is the *combination* of (1) conversational / dynamic context across queries, (2) incremental string-resident mutation, (3) bidirectional “fractal” selection (selective end first), and (4) living named selections—not regex-on-XML per se. Each property appears in prior work; §2.1 records that no cited line of work provides all four on one in-process string. Compatibility facades and the WAL are engineering, not a novelty claim. The tables in this paper are LOM scaling, irregular corpora, and mechanism ablations — not head-to-head bake-offs.
 
 ## 1. Introduction
 
-XML tooling is dominated by extractive trees (DOM), streaming (SAX/XMLReader), and non-extractive token tables (VTD-XML). Query languages (XPath/XQuery, CSS) evaluate each expression against a static context item. Interactive editing and conversational follow-ups—“who was that person again?”—do not map cleanly onto static expressions.
+XML tooling is dominated by extractive trees (DOM), streaming (SAX/XMLReader), and non-extractive token tables (VTD-XML). Query languages (XPath/XQuery, CSS) evaluate each expression against a static context item. Interactive editing and conversational follow-ups—“who was that person again?”—do not map cleanly onto static expressions. Section 2.1 states the gap: each ingredient exists somewhere in the literature; the combination on one in-process string does not.
 
 LOM keeps the document as one mutable string, answers selectors with offset-backed matches, and carries a **dynamic context** from prior results into later queries. A **fractal** path can start at a selective tag value or attribute and walk parents, analogous in spirit to semi-join reduction rather than only top-down tree walks.
 
@@ -32,7 +32,25 @@ LOM keeps the document as one mutable string, answers selectors with offset-back
 
 **Incremental view / index maintenance.** Parent/tag/attribute index patches after `replace` resemble incremental view maintenance; the interesting LOM claim is doing that on a string-resident document while preserving living variables and context.
 
-**What we do not claim.** Regex on XML; inventing PCRE; that LOM is a drop-in XPath/XQuery engine or a multi-document DBMS.
+### 2.1 Gap
+
+The lines above each solve a real problem. They do not solve them together.
+
+| | Bytes stay the document | Context survives the next call | Splice patches indexes | Selective end first | Names stay live across splices |
+|--|--|--|--|--|--|
+| DOM | tree, not the string | the node the caller passes | tree mutation | top-down | no |
+| SAX / XMLReader | one pass | no retained selection | not an editor | no | no |
+| VTD-XML | yes | context item of one XPath eval | `XMLModifier` rewrites a document; the index is not a carried selection | navigation / XPath | no |
+| XPath / XQuery / CSS | not the model | one expression | not the model | axes from a context node | bindings die with the query |
+| BaseX / eXist | database pages | one query, or whatever the app stores | `UPDINDEX` inside the DBMS | XPath / XQuery | query-scoped |
+| Yannakakis / SIP | not a document | not a session | not a splice | semi-join reduction | not a document |
+| **LOM** | yes | prior hits are the next scope | yes | fractal get | `$var` patched with the string |
+
+Read the rows as coverage, not as a race. DOM and SAX answer different jobs (a tree, a stream). VTD-XML already keeps the source bytes and speaks XPath; it does not keep a selection alive as the scope of the next selector, and it does not define named selections that remain valid after a splice. XPath’s context item is real, and it is rebound by the expression, not by the previous answer. BaseX will maintain indexes across updates; that maintenance lives in a multi-document store, not in the string a process just edited. Yannakakis explains why a selective end is worth resolving first; it is not an XML engine.
+
+What is missing is one in-process object where those four properties hold at once: the document is still \(C\), the last successful selection is the context of the next selector, a named selection is updated by the same splice that changes \(C\), and a selective leaf may be resolved before the ancestor walk. That is the claim. Facades, the WAL, and regex-as-a-value are how the engine is used, not additional holes in the literature.
+
+**What we do not claim.** Regex on XML; inventing PCRE; that LOM is a drop-in XPath/XQuery engine or a multi-document DBMS; that the table above is a performance comparison.
 
 ## 3. Model
 
@@ -228,7 +246,7 @@ Apache License 2.0. Source: repository artifacts include `O.php`, `native/liblom
 
 ## 8. Conclusion
 
-LOM’s publishable core is conversational context + string-resident incremental mutation + fractal selection + living variables, with regex as an operator value form and fmem/fcache/pieces as measurable accelerators. Empirically, **fcache borrow** takes warm descendant to ~0.01 ms (100 MB) / ~6 ms (1 GB); **tile census** plus default-on parallel cut first construct on the regular fixture; **tag-class recipes** help real files (UniProt P53 **~3.9 ms**, generated mix **~0.89 ms**; leftover intern is shared across tile gaps); wholesale UniProt×50 is **~10 ms**; **checkpoint** rewrites those XML files in **0.4–2.4 ms** and the 20 GB tiled fixture in **35.0 s / ~31 MB**; **sidecar** skips the byte scan on recipe reload; **count / open-index APIs** avoid allocating offset pairs on huge hits; **CSR + packed opens** cut RAM sharply; **overlay + WAL/`pwrite` + tombstone delete** keep tiny edits durable without rewriting the XML; PHP remains the full-language reference for smaller documents. XPath/CSS facades are compilers, not a second engine.
+The gap in §2.1 is the publishable claim: conversational context, string-resident incremental mutation, fractal selection, and living variables, together, on one in-process string. Regex is an operator value form; fmem/fcache/pieces are measurable accelerators. Empirically, **fcache borrow** takes warm descendant to ~0.01 ms (100 MB) / ~6 ms (1 GB); **tile census** plus default-on parallel cut first construct on the regular fixture; **tag-class recipes** help real files (UniProt P53 **~3.9 ms**, generated mix **~0.89 ms**; leftover intern is shared across tile gaps); wholesale UniProt×50 is **~10 ms**; **checkpoint** rewrites those XML files in **0.4–2.4 ms** and the 20 GB tiled fixture in **35.0 s / ~31 MB**; **sidecar** skips the byte scan on recipe reload; **count / open-index APIs** avoid allocating offset pairs on huge hits; **CSR + packed opens** cut RAM sharply; **overlay + WAL/`pwrite` + tombstone delete** keep tiny edits durable without rewriting the XML; PHP remains the full-language reference for smaller documents. XPath/CSS facades are compilers, not a second engine.
 
 ## 9. Competing interests / conflict of interest
 
